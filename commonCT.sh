@@ -68,6 +68,7 @@
 #   SCRIPT_DIR             Directory containing the calling script
 #   CONFIG_FILE            Path to commonCT.json
 #   CT_MAP                 Associative array: CTID -> hostname
+#   CT_STATUS              Associative array: CTID -> status (running/stopped)
 #   CT_LIST                Array of CTIDs
 #   CTID                   Selected container ID
 #   CT_HOSTNAME            Selected container hostname
@@ -93,6 +94,7 @@ SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)}"
 CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/commonCT.json}"
 
 declare -A CT_MAP
+declare -A CT_STATUS
 declare -a CT_LIST
 CTID=""
 CT_HOSTNAME=""
@@ -1075,19 +1077,25 @@ check_dns_health() {
 # -----------------------------
 
 # Build list of all containers
-# Populates CT_MAP (CTID -> hostname) and CT_LIST (array of CTIDs)
+# Populates CT_MAP (CTID -> hostname), CT_STATUS (CTID -> status), and CT_LIST (array of CTIDs)
 build_ct_list() {
   CT_MAP=()
   CT_LIST=()
+  CT_STATUS=()
   
+  # Parse pct list output: VMID, Status, Lock, Name
+  # Skip header line, extract all info in one pass
+  # Use $NF for Name (last field) since Lock column may be empty
   while IFS= read -r line; do
-    local id
+    local id status name
     id=$(echo "$line" | awk '{print $1}')
     [[ "$id" =~ ^[0-9]+$ ]] || continue
     
-    local ct_hostname
-    ct_hostname=$(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}')
-    CT_MAP["$id"]="$ct_hostname"
+    status=$(echo "$line" | awk '{print $2}')
+    name=$(echo "$line" | awk '{print $NF}')
+    
+    CT_MAP["$id"]="$name"
+    CT_STATUS["$id"]="$status"
     CT_LIST+=("$id")
   done < <(pct list)
 }
@@ -1104,28 +1112,39 @@ select_ct_interactive_single() {
     return 1
   fi
   
-  # Build whiptail menu arguments
-  local menu_args=()
+  # Build whiptail radiolist arguments
+  local radio_args=()
+  local width=60
+  local item_width=$((width - 16))  # Account for borders, tag column, and radio button
+  local first=true
+  
   for id in "${CT_LIST[@]}"; do
-    local status hostname
-    status=$(pct status "$id" 2>/dev/null | awk '{print $2}')
+    local status hostname item_text selected
+    status="${CT_STATUS[$id]}"
     hostname="${CT_MAP[$id]}"
-    # Format: "CTID" "hostname [status]"
-    menu_args+=("$id" "${hostname} [${status}]")
+    # Pad text to fixed width for consistent listbox appearance
+    item_text=$(printf "%-${item_width}s" "${hostname} [${status}]")
+    # Pre-select first item
+    if [[ "$first" == "true" ]]; then
+      selected="ON"
+      first=false
+    else
+      selected="OFF"
+    fi
+    radio_args+=("$id" "$item_text" "$selected")
   done
   
   # Calculate dialog dimensions
   local height=$((${#CT_LIST[@]} + 8))
   [[ $height -gt 20 ]] && height=20
-  local width=60
   local list_height=$((height - 6))
   
-  # Show whiptail menu and capture selection
+  # Show whiptail radiolist and capture selection
   local selection
   selection=$(whiptail --title "Container Selection" \
-    --menu "Select container to ${action}:" \
+    --radiolist "Select container to ${action}:" \
     "$height" "$width" "$list_height" \
-    "${menu_args[@]}" \
+    "${radio_args[@]}" \
     3>&1 1>&2 2>&3) || return 1
   
   if [[ -z "$selection" ]]; then
@@ -1152,18 +1171,21 @@ select_ct_interactive_multi() {
   
   # Build whiptail checklist arguments
   local checklist_args=()
+  local width=60
+  local item_width=$((width - 16))  # Account for borders, tag column, and checkbox
+  
   for id in "${CT_LIST[@]}"; do
-    local status hostname
-    status=$(pct status "$id" 2>/dev/null | awk '{print $2}')
+    local status hostname item_text
+    status="${CT_STATUS[$id]}"
     hostname="${CT_MAP[$id]}"
-    # Format: "CTID" "hostname [status]" "OFF"
-    checklist_args+=("$id" "${hostname} [${status}]" "OFF")
+    # Pad text to fixed width for consistent listbox appearance
+    item_text=$(printf "%-${item_width}s" "${hostname} [${status}]")
+    checklist_args+=("$id" "$item_text" "OFF")
   done
   
   # Calculate dialog dimensions
   local height=$((${#CT_LIST[@]} + 8))
   [[ $height -gt 20 ]] && height=20
-  local width=60
   local list_height=$((height - 6))
   
   # Show whiptail checklist with --separate-output for easier parsing

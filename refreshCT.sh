@@ -27,6 +27,7 @@
 #
 # EXAMPLES:
 #   ./refreshCT.sh                           # Interactive multi-select
+#   ./refreshCT.sh --gpu                     # Interactive single-select + GPU
 #   ./refreshCT.sh 2100                      # Refresh by CTID
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
@@ -34,8 +35,9 @@
 #   ./refreshCT.sh 2600 --gpu                # Enable GPU passthrough
 #
 # BEHAVIOR:
-#   - Without arguments: displays list of containers to choose from
-#   - With argument: looks up container by CTID (numeric) or hostname
+#   - Without arguments: multi-select dialog to choose multiple containers
+#   - With options only (--gpu, --size, --monitor): single-select dialog
+#   - With CTID/hostname: operates on that specific container
 #   - All configuration functions are idempotent (safe to run repeatedly)
 #   - Docker Compose services are pulled and restarted
 #
@@ -238,20 +240,24 @@ resize_ct() {
 # -----------------------------
 main() {
   local ct_arg=""
+  local has_options=false
   
   # Parse arguments
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --monitor|-m)
         MONITOR_AFTER=true
+        has_options=true
         shift
         ;;
       --size|-s)
         CT_SIZE="$2"
+        has_options=true
         shift 2
         ;;
       --gpu)
         GPU_PASSTHROUGH=true
+        has_options=true
         shift
         ;;
       -*)
@@ -273,11 +279,17 @@ main() {
   fi
   
   # Build list of CTs to process
+  # Multi-select only when no arguments provided; single-select if any options given
   local cts_to_process=()
   
   if [[ -z "$ct_arg" ]]; then
-    select_ct_interactive_multi "refresh" || exit 1
-    cts_to_process=("${SELECTED_CTS[@]}")
+    if [[ "$has_options" == "true" ]]; then
+      select_ct_interactive_single "refresh" || exit 1
+      cts_to_process=("$CTID")
+    else
+      select_ct_interactive_multi "refresh" || exit 1
+      cts_to_process=("${SELECTED_CTS[@]}")
+    fi
   else
     resolve_ct_from_input "$ct_arg" || exit 1
     cts_to_process=("$CTID")

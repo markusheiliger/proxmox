@@ -72,6 +72,40 @@ while IFS= read -r line; do
 done <<< "$selections"
 ```
 
+## Interactive Selection Patterns
+
+Scripts support two selection modes for containers:
+
+- `select_ct_interactive_single` - whiptail `--menu` for single selection
+- `select_ct_interactive_multi` - whiptail `--checklist` for multi-selection
+
+**When to use which:**
+- **Multi-select**: Only when NO arguments/options provided (batch operations)
+- **Single-select**: When options like `--gpu`, `--size`, `--monitor` are given
+
+```bash
+# Pattern: track if options were provided
+local has_options=false
+
+case "$1" in
+  --gpu)
+    GPU_PASSTHROUGH=true
+    has_options=true
+    ;;
+esac
+
+# Select based on context
+if [[ -z "$ct_arg" ]]; then
+  if [[ "$has_options" == "true" ]]; then
+    select_ct_interactive_single "action" || exit 1
+  else
+    select_ct_interactive_multi "action" || exit 1
+  fi
+fi
+```
+
+**Rationale**: Options like `--monitor` only make sense for single CTs. Multi-select is for bulk operations with default settings.
+
 ## Idempotent Functions
 
 All configuration functions must be idempotent:

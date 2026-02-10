@@ -493,6 +493,7 @@ configure_telegraf() {
 [[inputs.diskio]]
 
 [[inputs.net]]
+  ignore_protocol_stats = true
 
 [[inputs.system]]
 
@@ -527,7 +528,7 @@ TELEGRAF_EOF
   "
   
   # Wait for service to stabilize
-  sleep 2
+  sleep 4
   
   # Verify service is running
   local service_status

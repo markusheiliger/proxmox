@@ -156,7 +156,7 @@ main() {
   fi
   
   if [[ -z "$CT_ARG" ]]; then
-    select_ct_interactive "monitor" || exit 1
+    select_ct_interactive_single "monitor" || exit 1
   else
     resolve_ct_from_input "$CT_ARG" || exit 1
   fi

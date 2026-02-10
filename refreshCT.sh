@@ -26,7 +26,7 @@
 #   ./refreshCT.sh [CTID or hostname] [--size S|M|L] [--gpu] [--monitor]
 #
 # EXAMPLES:
-#   ./refreshCT.sh                           # Interactive selection
+#   ./refreshCT.sh                           # Interactive multi-select
 #   ./refreshCT.sh 2100                      # Refresh by CTID
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
@@ -272,40 +272,56 @@ main() {
     exit 0
   fi
   
+  # Build list of CTs to process
+  local cts_to_process=()
+  
   if [[ -z "$ct_arg" ]]; then
-    select_ct_interactive "refresh" || exit 1
+    select_ct_interactive_multi "refresh" || exit 1
+    cts_to_process=("${SELECTED_CTS[@]}")
   else
     resolve_ct_from_input "$ct_arg" || exit 1
+    cts_to_process=("$CTID")
   fi
   
-  echo ""
-  echo "Refreshing: CT ${CTID} (${CT_HOSTNAME})"
-  echo ""
+  # Process each selected CT
+  local total=${#cts_to_process[@]}
+  local current=0
   
-  ensure_ct_running || exit 1
-  resize_ct
-  update_packages
-  configure_timezone
-  configure_docker_logging "${CT_HOSTNAME}"
-  configure_telegraf "${CT_HOSTNAME}"
-  configure_syslog_forwarding "${CT_HOSTNAME}"
-  configure_registry_logins
-  configure_step_ca "${CT_HOSTNAME}"
-  
-  # Configure GPU passthrough if requested
-  if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
-    configure_gpu_passthrough
-  fi
-  
-  reset_docker
-  reboot_ct
-  print_summary
+  for CTID in "${cts_to_process[@]}"; do
+    current=$((current + 1))
+    CT_HOSTNAME="${CT_MAP[$CTID]}"
+    
+    echo ""
+    echo "=============================================="
+    echo "Refreshing: CT ${CTID} (${CT_HOSTNAME}) [${current}/${total}]"
+    echo "=============================================="
+    echo ""
+    
+    ensure_ct_running || continue
+    resize_ct
+    update_packages
+    configure_timezone
+    configure_docker_logging "${CT_HOSTNAME}"
+    configure_telegraf "${CT_HOSTNAME}"
+    configure_syslog_forwarding "${CT_HOSTNAME}"
+    configure_registry_logins
+    configure_step_ca "${CT_HOSTNAME}"
+    
+    # Configure GPU passthrough if requested
+    if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
+      configure_gpu_passthrough
+    fi
+    
+    reset_docker
+    reboot_ct
+    print_summary
+  done
 
-  # Optionally start monitoring
-  if [[ "$MONITOR_AFTER" == "true" ]]; then
+  # Optionally start monitoring (only for single CT)
+  if [[ "$MONITOR_AFTER" == "true" && $total -eq 1 ]]; then
     echo ""
     echo "Starting log monitor..."
-    exec "${SCRIPT_DIR}/monitorCT.sh" "$CTID"
+    exec "${SCRIPT_DIR}/monitorCT.sh" "${cts_to_process[0]}"
   fi
 }
 

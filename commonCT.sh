@@ -33,7 +33,8 @@
 #
 # UTILITY FUNCTIONS:
 #   build_ct_list          Build list of all containers into CT_MAP and CT_LIST
-#   select_ct_interactive  Display menu to select a container
+#   select_ct_interactive_single  Display whiptail menu to select one container
+#   select_ct_interactive_multi   Display whiptail checklist to select multiple containers
 #   resolve_ct_from_input  Resolve CTID/hostname from user input
 #   ensure_ct_running      Ensure container is running (starts if stopped)
 #   ensure_ct_stopped      Verify container is stopped
@@ -800,7 +801,7 @@ configure_registry_logins() {
     # Always re-authenticate to ensure token is valid
     pct exec "${CTID}" -- sh -c "echo '${password}' | docker login '${registry}' -u '${username}' --password-stdin >/dev/null 2>&1"
     
-    ((count++))
+    count=$((count + 1))
   done <<< "$registries"
   
   echo "  [✓] ${count} container registry(s) configured"
@@ -946,10 +947,11 @@ build_ct_list() {
   done < <(pct list)
 }
 
-# Display interactive container selection menu
+# Display interactive single-select container menu using whiptail
 # Args: $1 = action verb (e.g., "delete", "refresh", "select")
 # Sets: CTID, CT_HOSTNAME
-select_ct_interactive() {
+# Returns: 0 on success, 1 on failure/cancel
+select_ct_interactive_single() {
   local action="${1:-select}"
   
   if [[ ${#CT_LIST[@]} -eq 0 ]]; then
@@ -957,27 +959,94 @@ select_ct_interactive() {
     return 1
   fi
   
-  echo "Available containers:"
-  echo ""
-  
-  local idx=1
+  # Build whiptail menu arguments
+  local menu_args=()
   for id in "${CT_LIST[@]}"; do
-    local status
+    local status hostname
     status=$(pct status "$id" 2>/dev/null | awk '{print $2}')
-    printf "  %2d) CT %s - %s [%s]\n" "$idx" "$id" "${CT_MAP[$id]}" "$status"
-    ((idx++))
+    hostname="${CT_MAP[$id]}"
+    # Format: "CTID" "hostname [status]"
+    menu_args+=("$id" "${hostname} [${status}]")
   done
   
-  echo ""
-  read -p "Select container to ${action} (1-${#CT_LIST[@]}): " SELECTION
+  # Calculate dialog dimensions
+  local height=$((${#CT_LIST[@]} + 8))
+  [[ $height -gt 20 ]] && height=20
+  local width=60
+  local list_height=$((height - 6))
   
-  if ! [[ "$SELECTION" =~ ^[0-9]+$ ]] || [[ "$SELECTION" -lt 1 ]] || [[ "$SELECTION" -gt ${#CT_LIST[@]} ]]; then
-    echo "Invalid selection."
+  # Show whiptail menu and capture selection
+  local selection
+  selection=$(whiptail --title "Container Selection" \
+    --menu "Select container to ${action}:" \
+    "$height" "$width" "$list_height" \
+    "${menu_args[@]}" \
+    3>&1 1>&2 2>&3) || return 1
+  
+  if [[ -z "$selection" ]]; then
+    echo "No container selected."
     return 1
   fi
   
-  CTID="${CT_LIST[$((SELECTION-1))]}"
+  CTID="$selection"
   CT_HOSTNAME="${CT_MAP[$CTID]}"
+  return 0
+}
+
+# Display interactive multi-select container menu using whiptail
+# Args: $1 = action verb (e.g., "delete", "refresh", "select")
+# Sets: SELECTED_CTS (array of CTIDs)
+# Returns: 0 on success, 1 on failure/cancel
+select_ct_interactive_multi() {
+  local action="${1:-select}"
+  
+  if [[ ${#CT_LIST[@]} -eq 0 ]]; then
+    echo "No containers found."
+    return 1
+  fi
+  
+  # Build whiptail checklist arguments
+  local checklist_args=()
+  for id in "${CT_LIST[@]}"; do
+    local status hostname
+    status=$(pct status "$id" 2>/dev/null | awk '{print $2}')
+    hostname="${CT_MAP[$id]}"
+    # Format: "CTID" "hostname [status]" "OFF"
+    checklist_args+=("$id" "${hostname} [${status}]" "OFF")
+  done
+  
+  # Calculate dialog dimensions
+  local height=$((${#CT_LIST[@]} + 8))
+  [[ $height -gt 20 ]] && height=20
+  local width=60
+  local list_height=$((height - 6))
+  
+  # Show whiptail checklist with --separate-output for easier parsing
+  local selections
+  selections=$(whiptail --title "Container Selection" \
+    --separate-output \
+    --checklist "Select container(s) to ${action} (SPACE to toggle, ENTER to confirm):" \
+    "$height" "$width" "$list_height" \
+    "${checklist_args[@]}" \
+    3>&1 1>&2 2>&3)
+  
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]]; then
+    echo "Selection cancelled."
+    return 1
+  fi
+  
+  # Parse selections into array (--separate-output gives one item per line)
+  SELECTED_CTS=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && SELECTED_CTS+=("$line")
+  done <<< "$selections"
+
+  if [[ ${#SELECTED_CTS[@]} -eq 0 ]]; then
+    echo "No containers selected."
+    return 1
+  fi
+  
   return 0
 }
 

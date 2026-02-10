@@ -100,7 +100,7 @@ main() {
   fi
   
   if [[ $# -lt 1 ]]; then
-    select_ct_interactive "delete" || exit 1
+    select_ct_interactive_single "delete" || exit 1
   else
     resolve_ct_from_input "$1" || exit 1
   fi

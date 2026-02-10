@@ -992,6 +992,84 @@ reboot_ct() {
   return 0
 }
 
+# Check if DNS resolves hostname to the same IP as the CT reports
+# Args:
+#   $1 - CTID (optional, defaults to global CTID)
+#   $2 - hostname (optional, defaults to global CT_HOSTNAME)
+# Returns: 0 if DNS matches, 1 if mismatch or error
+check_dns_health() {
+  local ctid="${1:-${CTID}}"
+  local hostname="${2:-${CT_HOSTNAME}}"
+  
+  echo "Checking DNS health for ${hostname}..."
+  
+  # Get IP from inside the CT using ip command (most reliable)
+  local ct_ip
+  ct_ip=$(pct exec "${ctid}" -- sh -c "ip -4 addr show eth0 2>/dev/null | awk '/inet / {split(\$2, a, \"/\"); print a[1]}'" 2>/dev/null)
+  
+  if [[ -z "$ct_ip" ]]; then
+    echo "  [!] Could not get IP from CT ${ctid}"
+    return 1
+  fi
+  
+  echo "  CT reports IP: ${ct_ip}"
+  
+  # Resolve hostname via DNS from host
+  local dns_ip
+  dns_ip=$(getent hosts "${hostname}" 2>/dev/null | awk '{print $1}')
+  
+  if [[ -z "$dns_ip" ]]; then
+    echo "  [!] DNS lookup failed for ${hostname}"
+    return 1
+  fi
+  
+  echo "  DNS resolves to: ${dns_ip}"
+  
+  # Compare
+  if [[ "$ct_ip" == "$dns_ip" ]]; then
+    echo "  [✓] DNS matches CT IP"
+    return 0
+  else
+    echo "  [!] DNS mismatch: CT=${ct_ip}, DNS=${dns_ip}"
+    
+    # Diagnostic: check if stale DNS IP is reachable
+    echo "  Diagnosing stale IP ${dns_ip}..."
+    
+    if ping -c 1 -W 1 "${dns_ip}" >/dev/null 2>&1; then
+      echo "    ${dns_ip} responds to ping - another device has this IP"
+      
+      # Check ARP cache for MAC address
+      local arp_mac
+      arp_mac=$(arp -n "${dns_ip}" 2>/dev/null | awk 'NR==2 {print $3}')
+      if [[ -n "$arp_mac" && "$arp_mac" != "(incomplete)" ]]; then
+        echo "    MAC at ${dns_ip}: ${arp_mac}"
+        
+        # Try to identify if it's one of our CTs
+        local matching_ct=""
+        for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
+          local ct_mac
+          ct_mac=$(pct config "$id" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
+          if [[ "${ct_mac}" == "${arp_mac,,}" ]]; then
+            matching_ct="$id ($(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}'))"
+            break
+          fi
+        done
+        
+        if [[ -n "$matching_ct" ]]; then
+          echo "    Belongs to CT: ${matching_ct}"
+        else
+          echo "    MAC not found in CTs - external device or VM"
+        fi
+      fi
+    else
+      echo "    ${dns_ip} not responding - stale DNS record"
+    fi
+    
+    echo "  Action: Update DHCP reservation or DNS record for ${hostname}"
+    return 1
+  fi
+}
+
 # -----------------------------
 # CONTAINER FUNCTIONS
 # -----------------------------

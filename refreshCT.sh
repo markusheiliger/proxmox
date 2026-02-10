@@ -352,6 +352,9 @@ main() {
     status_progress "$current" "$total" "CT ${CTID}: Rebooting..."
     reboot_ct
     
+    status_progress "$current" "$total" "CT ${CTID}: Checking DNS..."
+    check_dns_health
+    
     print_summary
   done
   

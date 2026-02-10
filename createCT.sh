@@ -568,7 +568,7 @@ main() {
   done
 
   # Execute provisioning steps
-  local total_steps=15
+  local total_steps=16
   local step=0
   
   status_bar_init
@@ -626,6 +626,9 @@ main() {
   verify_setup
   start_compose
   reboot_ct
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Checking DNS..."
+  check_dns_health "$CTID" "$HOSTNAME"
   
   status_bar_cleanup
   

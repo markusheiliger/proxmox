@@ -106,6 +106,36 @@ fi
 
 **Rationale**: Options like `--monitor` only make sense for single CTs. Multi-select is for bulk operations with default settings.
 
+## Status Bar Progress
+
+Scripts use ANSI escape codes to display a persistent status bar at the bottom of the terminal while output scrolls above.
+
+**Functions (in commonCT.sh):**
+- `status_bar_init()` - Initialize status bar, reserve bottom line
+- `status_update "message"` - Update status text
+- `status_progress current total "message"` - Show `[N/total] X% - message`
+- `status_bar_cleanup()` - Restore normal terminal (also in EXIT trap)
+
+**Usage pattern:**
+```bash
+status_bar_init
+
+status_progress 1 5 "Step one..."
+do_step_one
+
+status_progress 2 5 "Step two..."
+do_step_two
+
+status_bar_cleanup
+```
+
+**IMPORTANT: When adding new steps to a script, always:**
+1. Update `total_steps` count in scripts using numbered progress
+2. Add corresponding `status_progress` call before the new operation
+3. Verify step numbers are sequential and total is correct
+
+This ensures the progress percentage remains accurate.
+
 ## Idempotent Functions
 
 All configuration functions must be idempotent:

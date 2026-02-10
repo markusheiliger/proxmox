@@ -299,6 +299,9 @@ main() {
   local total=${#cts_to_process[@]}
   local current=0
   
+  # Initialize status bar for progress tracking
+  status_bar_init
+  
   for CTID in "${cts_to_process[@]}"; do
     current=$((current + 1))
     CT_HOSTNAME="${CT_MAP[$CTID]}"
@@ -309,25 +312,54 @@ main() {
     echo "=============================================="
     echo ""
     
+    status_progress "$current" "$total" "CT ${CTID}: Starting..."
+    
     ensure_ct_running || continue
+    
+    status_progress "$current" "$total" "CT ${CTID}: Resizing..."
     resize_ct
+    
+    status_progress "$current" "$total" "CT ${CTID}: Updating packages..."
     update_packages
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring timezone..."
     configure_timezone
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring Docker logging..."
     configure_docker_logging "${CT_HOSTNAME}"
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring Telegraf..."
     configure_telegraf "${CT_HOSTNAME}"
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring syslog..."
     configure_syslog_forwarding "${CT_HOSTNAME}"
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring registries..."
     configure_registry_logins
+    
+    status_progress "$current" "$total" "CT ${CTID}: Configuring Step CA..."
     configure_step_ca "${CT_HOSTNAME}"
     
     # Configure GPU passthrough if requested
     if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
+      status_progress "$current" "$total" "CT ${CTID}: Configuring GPU..."
       configure_gpu_passthrough
     fi
     
+    status_progress "$current" "$total" "CT ${CTID}: Restarting Docker..."
     reset_docker
+    
+    status_progress "$current" "$total" "CT ${CTID}: Rebooting..."
     reboot_ct
+    
     print_summary
   done
+  
+  # Clean up status bar
+  status_bar_cleanup
+  
+  echo ""
+  echo "All ${total} container(s) refreshed."
 
   # Optionally start monitoring (only for single CT)
   if [[ "$MONITOR_AFTER" == "true" && $total -eq 1 ]]; then

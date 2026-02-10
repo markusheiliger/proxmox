@@ -97,6 +97,72 @@ declare -a CT_LIST
 CTID=""
 CT_HOSTNAME=""
 
+# Status bar state
+STATUS_BAR_ENABLED=false
+STATUS_BAR_TEXT=""
+
+# -----------------------------
+# STATUS BAR FUNCTIONS
+# -----------------------------
+
+# Initialize status bar (reserves bottom line of terminal)
+# Call this before starting operations that use status_update
+status_bar_init() {
+  STATUS_BAR_ENABLED=true
+  local rows
+  rows=$(tput lines)
+  # Clear screen first
+  clear
+  # Set scroll region to exclude last line
+  printf '\e[1;%dr' "$((rows-1))"
+  # Move cursor to top-left of scroll region
+  printf '\e[1;1H'
+  # Clear the status line and set initial text
+  printf '\e[%d;1H\e[0;7m Starting...\e[K\e[0m' "$rows"
+  # Move cursor back to scroll region
+  printf '\e[1;1H'
+}
+
+# Update the status bar text
+# Args: $1 = status text
+status_update() {
+  [[ "$STATUS_BAR_ENABLED" != "true" ]] && return
+  STATUS_BAR_TEXT="$1"
+  local rows cols
+  rows=$(tput lines)
+  cols=$(tput cols)
+  # Truncate text if too long
+  local text="${1:0:$((cols-2))}"
+  # Save cursor, move to status line (outside scroll region), print, restore
+  printf '\e7\e[%d;1H\e[0;7m %s\e[K\e[0m\e8' "$rows" "$text"
+}
+
+# Update status bar with progress info
+# Args: $1 = current, $2 = total, $3 = message
+status_progress() {
+  local current="$1" total="$2" msg="$3"
+  local pct=$((current * 100 / total))
+  status_update "[${current}/${total}] ${pct}% - ${msg}"
+}
+
+# Clean up status bar (restore full scroll region)
+status_bar_cleanup() {
+  if [[ "$STATUS_BAR_ENABLED" == "true" ]]; then
+    local rows
+    rows=$(tput lines)
+    # Restore full scroll region
+    printf '\e[1;%dr' "$rows"
+    # Clear status line
+    printf '\e[%d;1H\e[K' "$rows"
+    # Move cursor to bottom of restored region
+    printf '\e[%d;1H' "$((rows-1))"
+    STATUS_BAR_ENABLED=false
+  fi
+}
+
+# Trap to ensure cleanup on exit
+trap 'status_bar_cleanup' EXIT
+
 # -----------------------------
 # CONFIGURATION FUNCTIONS
 # -----------------------------

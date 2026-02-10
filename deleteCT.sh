@@ -106,8 +106,16 @@ main() {
   fi
   
   confirm_destruction
+  
+  status_bar_init
+  
+  status_update "Destroying CT ${CTID}..."
   destroy_ct
+  
+  status_update "Cleaning up folders..."
   cleanup_folders
+  
+  status_bar_cleanup
   
   echo ""
   echo "Done."

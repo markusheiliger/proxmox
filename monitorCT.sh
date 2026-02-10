@@ -161,8 +161,18 @@ main() {
     resolve_ct_from_input "$CT_ARG" || exit 1
   fi
   
+  status_bar_init
+  
+  status_update "Checking CT ${CTID} is running..."
   ensure_ct_running
+  
+  status_update "Verifying Docker Compose setup..."
   verify_compose
+  
+  status_bar_cleanup
+  
+  echo "Streaming logs for CT ${CTID} (${CT_HOSTNAME})..."
+  echo ""
   stream_logs
 }
 

@@ -568,30 +568,67 @@ main() {
   done
 
   # Execute provisioning steps
+  local total_steps=15
+  local step=0
+  
+  status_bar_init
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Validating hostname..."
   validate_hostname
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Preparing template..."
   prepare_template
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Creating container..."
   create_ct
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring LXC for Docker..."
   configure_lxc_docker
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Starting container..."
   start_ct
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Installing Docker..."
   install_docker
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring timezone..."
   configure_timezone
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Docker logging..."
   configure_docker_logging "${HOSTNAME}"
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Telegraf..."
   configure_telegraf "${HOSTNAME}"
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring syslog..."
   configure_syslog_forwarding "${HOSTNAME}"
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring registries..."
   configure_registry_logins
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Step CA..."
   configure_step_ca "${HOSTNAME}"
+  
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints
   reboot_ct
   
   # Configure GPU passthrough if requested
   if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
+    status_progress "$step" "$total_steps" "Configuring GPU passthrough..."
     configure_gpu_passthrough
   fi
   
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Verifying setup..."
   verify_setup
   start_compose
   reboot_ct
+  
+  status_bar_cleanup
+  
   print_summary
 
   # Optionally start monitoring

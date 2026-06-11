@@ -4,40 +4,79 @@
 
 Bash scripts for managing Proxmox LXC containers with Docker. Scripts use `set -euo pipefail` for strict error handling.
 
-## Critical: Arithmetic with `set -e`
+## Critical: Strict Mode (`set -euo pipefail`)
 
-### Problem
-When `set -e` is enabled, `((expr))` returns exit code 1 if the result is 0 (falsy), causing immediate script termination.
+All generated bash code MUST handle the strict mode requirements:
+
+### `set -e` - Exit on Error
+
+Commands that may fail must be handled explicitly:
+
+```bash
+# BAD - exits script if grep finds nothing
+result=$(grep "pattern" file.txt)
+
+# GOOD - handle failure explicitly
+result=$(grep "pattern" file.txt || true)
+
+# GOOD - check return code
+if grep -q "pattern" file.txt; then
+  # found
+fi
+```
+
+### `set -u` - Unset Variables are Errors
+
+All variables must be defined or have defaults:
+
+```bash
+# BAD - exits if $1 not provided
+local value="$1"
+
+# GOOD - provide default
+local value="${1:-}"
+local value="${1:-default}"
+```
+
+### `set -o pipefail` - Pipeline Failures
+
+Any command in a pipeline can cause exit:
+
+```bash
+# BAD - exits if getent returns non-zero (not found)
+local ip=$(getent hosts example.com | awk '{print $1}')
+
+# GOOD - suppress failure
+local ip=$(getent hosts example.com 2>/dev/null | awk '{print $1}' || true)
+```
+
+### Functions Returning Non-Zero
+
+Functions that fail will exit the entire script:
+
+```bash
+# BAD - if bootstrap fails, script exits
+pct exec "${CTID}" -- step ca bootstrap --install --force
+
+# GOOD - catch failure, warn, continue
+if ! pct exec "${CTID}" -- step ca bootstrap --install --force 2>&1; then
+  echo "Warning: bootstrap failed"
+  return 0  # Non-fatal, continue
+fi
+```
+
+### Arithmetic with `set -e`
+
+`((expr))` returns exit code 1 if result is 0, causing script termination:
 
 ```bash
 # BAD - exits script when count=0 because ((0)) returns exit code 1
 local count=0
 ((count++))  # Script exits here!
 
-# BAD - same issue
-local current=0
-((current++))  # Script exits here!
-```
-
-### Solution
-Use `$((expr))` assignment syntax instead:
-
-```bash
 # GOOD - always succeeds
 local count=0
 count=$((count + 1))
-
-# GOOD - alternative with || true (less clean)
-((count++)) || true
-```
-
-### Safe Uses
-`for` loops with arithmetic are safe:
-```bash
-# SAFE - part of loop syntax, not standalone statement
-for ((i=1; i<=timeout; i++)); do
-  ...
-done
 ```
 
 ## Script Structure
@@ -52,6 +91,49 @@ done
 
 - `commonCT.json` - Contains secrets (gitignored)
 - Required sections: `step_ca`, `registries`, `sizes`, `newt`
+
+## Docker Volume Mounts
+
+**IMPORTANT**: Each CT instance has bind mounts that point to hostname-specific folders:
+- `/mnt/docker` in CT → `/mnt/docker/[hostname]` on host
+- `/mnt/docker-data` in CT → `/mnt/docker-data/[hostname]` on host
+
+**This means docker-compose volume paths should NOT include the hostname:**
+
+```yaml
+# WRONG - hostname is redundant, creates nested folder
+volumes:
+  - /mnt/docker-data/oidc.thesaints.home/postgresql:/var/lib/postgresql/data
+
+# CORRECT - CT already resolves to hostname folder
+volumes:
+  - /mnt/docker-data/postgresql:/var/lib/postgresql/data
+```
+
+### Storage Characteristics
+
+Choose the appropriate mount based on service requirements:
+
+| Mount | Storage | Best For |
+|-------|---------|----------|
+| `/mnt/docker` | **SSD** | Low volume, fast IO (configs, small DBs, app state) |
+| `/mnt/docker-data` | **HDD** | Large volume, slow IO (media, recordings, backups, large DBs) |
+
+**Always add a comment explaining the mount choice:**
+
+```yaml
+volumes:
+  # SSD: fast IO for database operations
+  - /mnt/docker/postgresql:/var/lib/postgresql/data
+  # HDD: large media storage
+  - /mnt/docker-data/media:/media
+  # HDD: video recordings (large files)
+  - /mnt/docker-data/recordings:/recordings
+```
+
+### Hard Rules
+
+- **Caddy**: Always uses `/mnt/docker/caddy` - certificates and config require fast IO
 
 ## Whiptail UI
 

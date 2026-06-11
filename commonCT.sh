@@ -41,28 +41,38 @@
 #   get_ct_status          Get container status
 #   ct_exec                Execute command in container
 #   reboot_ct              Reboot container and wait for it to come back up
+#   ensure_swap            Ensure swap is half of memory
 #   compose_up             Start Docker Compose services in CT
 #   compose_down           Stop Docker Compose services in CT
 #   extract_domain_from_hostname  Extract domain from hostname
+#   resolve_dns_with_retry Resolve DNS with retry loop (sets DNS_RESOLVED_IP)
+#   check_dns_health       Check and auto-fix DNS via UDM Pro API
 #
 # CONFIG FUNCTIONS (read from commonCT.json):
 #   config_exists          Check if config file exists
 #   config_get_domains     Get list of configured domains
 #   config_domain_exists   Check if domain is configured
-#   config_get_fingerprint Get Step CA fingerprint for domain
+#   config_get_fingerprint Get SSL fingerprint for domain
 #   config_get_email       Get email for domain
 #   config_get_ca_name     Get CA name for domain
+#   config_get_compose_template  Get compose template path for domain
 #   config_size_exists     Check if size is defined
 #   config_get_sizes       Get list of available sizes
 #   config_get_size_cores  Get cores for size
 #   config_get_size_memory Get memory for size
 #   validate_size          Validate size and set SIZE_CORES/SIZE_MEMORY
+#   validate_priority      Validate priority and set PRIORITY_CPUUNITS
+#   validate_hostname      Validate hostname format and domain config
 #   config_get_newt_id     Get newt ID for hostname
 #   config_get_newt_secret Get newt secret for hostname
 #   config_get_newt_endpoint Get newt endpoint (global or per-site)
 #   config_get_registries  Get list of configured container registries
 #   config_get_registry_username Get username for registry
 #   config_get_registry_password Get password for registry
+#   config_get_udmpro_host Get UDM Pro host address
+#   config_get_udmpro_apikey Get UDM Pro API key
+#   config_udmpro_configured Check if UDM Pro is configured
+#   udmpro_make_static    Set static IP and local DNS on UDM Pro client
 #
 # PROVIDED VARIABLES:
 #   SCRIPT_DIR             Directory containing the calling script
@@ -181,7 +191,7 @@ config_get_domains() {
   if ! config_exists; then
     return 1
   fi
-  grep -oP '"[^"]+"\s*:\s*\{' "${CONFIG_FILE}" | grep -v step_ca | sed 's/[":{}]//g' | tr -d ' '
+  jq -r '.domains[]' "${CONFIG_FILE}"
 }
 
 # Check if domain is configured
@@ -192,10 +202,10 @@ config_domain_exists() {
   if ! config_exists; then
     return 1
   fi
-  grep -q "\"${domain}\"" "${CONFIG_FILE}"
+  jq -e --arg d "$domain" '.domains | index($d)' "${CONFIG_FILE}" >/dev/null 2>&1
 }
 
-# Get Step CA fingerprint for domain
+# Get SSL fingerprint for domain
 # Args: $1 = domain name
 # Returns: fingerprint string (or empty if not found)
 config_get_fingerprint() {
@@ -203,7 +213,7 @@ config_get_fingerprint() {
   if ! config_exists; then
     return 1
   fi
-  grep -A2 "\"${domain}\"" "${CONFIG_FILE}" | grep fingerprint | sed 's/.*"fingerprint"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+  jq -r --arg d "$domain" '.ssl[$d].fingerprint // empty' "${CONFIG_FILE}"
 }
 
 # Get email for domain
@@ -214,7 +224,7 @@ config_get_email() {
   if ! config_exists; then
     return 1
   fi
-  grep -A3 "\"${domain}\"" "${CONFIG_FILE}" | grep email | sed 's/.*"email"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+  jq -r --arg d "$domain" '.ssl[$d].email // empty' "${CONFIG_FILE}"
 }
 
 # Get CA name for domain
@@ -223,6 +233,19 @@ config_get_email() {
 config_get_ca_name() {
   local domain="$1"
   echo "ca.${domain}"
+}
+
+# Get compose template path for domain
+# Args: $1 = domain name (e.g., thesaints.home)
+# Returns: path to compose template file (or error if not found)
+config_get_compose_template() {
+  local domain="$1"
+  local template="${SCRIPT_DIR}/compose/${domain}.yaml"
+  if [[ ! -f "$template" ]]; then
+    echo "ERROR: Compose template not found: ${template}" >&2
+    return 1
+  fi
+  echo "$template"
 }
 
 # Extract domain from hostname
@@ -294,6 +317,73 @@ validate_size() {
   if [[ -z "$SIZE_CORES" || -z "$SIZE_MEMORY" ]]; then
     echo "ERROR: Size '${size}' is missing cores or memory definition"
     return 1
+  fi
+  
+  return 0
+}
+
+# Validate priority and return CPU units value
+# Args: $1 = priority name (low, mid, high)
+# Sets: PRIORITY_CPUUNITS (global)
+# Returns: 0 if valid, 1 if invalid (with error message)
+validate_priority() {
+  local priority="${1:-mid}"
+  
+  case "${priority,,}" in
+    low)  PRIORITY_CPUUNITS=512 ;;
+    mid)  PRIORITY_CPUUNITS=1024 ;;
+    high) PRIORITY_CPUUNITS=2048 ;;
+    *)
+      echo "ERROR: Invalid priority '${priority}'. Use: low, mid, high"
+      return 1
+      ;;
+  esac
+  
+  return 0
+}
+
+# Validate hostname against config
+# Args: $1 = hostname (e.g., app.thesaints.home)
+# Returns: 0 if valid, 1 if invalid (with error message)
+# Validation rules:
+#   - CA hosts (ca.*): must be fully qualified (at least 3 parts: ca.domain.tld)
+#   - Regular hosts: domain must exist in commonCT.json
+validate_hostname() {
+  local hostname="$1"
+  
+  if [[ -z "$hostname" ]]; then
+    echo "ERROR: No hostname provided"
+    return 1
+  fi
+  
+  if ! config_exists; then
+    echo "ERROR: Config file not found: ${CONFIG_FILE}"
+    return 1
+  fi
+
+  local hostname_parts
+  hostname_parts=$(echo "${hostname}" | tr '.' '\n' | wc -l)
+
+  if [[ "${hostname}" =~ ^ca\. ]]; then
+    # CA host: must be fully qualified (at least 3 parts: ca.domain.tld)
+    if [[ ${hostname_parts} -lt 3 ]]; then
+      echo "ERROR: CA hostname must be fully qualified (e.g., ca.domain.tld)"
+      echo "  Provided: ${hostname}"
+      return 1
+    fi
+    echo "Hostname validated: CA host"
+  else
+    # Regular host: domain must be in config
+    local domain
+    domain=$(extract_domain_from_hostname "${hostname}")
+    
+    if ! config_domain_exists "${domain}"; then
+      echo "ERROR: Domain '${domain}' not configured in ${CONFIG_FILE}"
+      echo "  Configured domains:"
+      config_get_domains | sed 's/^/    /'
+      return 1
+    fi
+    echo "Hostname validated: domain '${domain}' found in config"
   fi
   
   return 0
@@ -379,6 +469,194 @@ config_get_registry_password() {
   jq -r ".registries.\"${registry}\".password // empty" "${CONFIG_FILE}" 2>/dev/null
 }
 
+# -----------------------------
+# UDM PRO CONFIGURATION FUNCTIONS
+# -----------------------------
+
+# Get UDM Pro host
+# Returns: host address or empty
+config_get_udmpro_host() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.udmpro.host // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get UDM Pro API key
+# Returns: API key or empty
+config_get_udmpro_apikey() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.udmpro.apikey // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Check if UDM Pro is configured
+# Returns: 0 if configured (host and apikey set), 1 if not
+config_udmpro_configured() {
+  local host apikey
+  host=$(config_get_udmpro_host)
+  apikey=$(config_get_udmpro_apikey)
+  [[ -n "$host" && -n "$apikey" ]]
+}
+
+# -----------------------------
+# AUTHENTIK CONFIGURATION FUNCTIONS
+# -----------------------------
+
+# Get Authentik host
+# Returns: host address or empty
+config_get_authentik_host() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.authentik.host // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get Authentik API token
+# Returns: API token or empty
+config_get_authentik_token() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.authentik.apitoken // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get Authentik outpost name
+# Returns: outpost name or empty
+config_get_authentik_outpost() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.authentik.outpost_name // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get Authentik authorization flow slug
+# Returns: flow slug or empty
+config_get_authentik_authorization_flow() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.authentik.authorization_flow_slug // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get Authentik invalidation flow slug
+# Returns: flow slug or empty
+config_get_authentik_invalidation_flow() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.authentik.invalidation_flow_slug // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Check if Authentik is configured
+# Returns: 0 if configured (host and apitoken set), 1 if not
+config_authentik_configured() {
+  local host token
+  host=$(config_get_authentik_host)
+  token=$(config_get_authentik_token)
+  [[ -n "$host" && -n "$token" ]]
+}
+
+# Set static IP and local DNS record on UDM Pro client
+# Finds client by MAC address and configures fixed IP + local DNS name
+#
+# Args:
+#   $1 - CT MAC address
+#   $2 - CT IP address
+#   $3 - CT hostname (FQDN for local DNS record)
+# Returns: 0 on success, 1 on error (client not found or API failure)
+udmpro_make_static() {
+  local ct_mac="$1"
+  local ct_ip="$2"
+  local ct_hostname="$3"
+  
+  if ! config_udmpro_configured; then
+    echo "  [!] UDM Pro not configured"
+    return 1
+  fi
+  
+  local udm_host udm_apikey
+  udm_host=$(config_get_udmpro_host)
+  udm_apikey=$(config_get_udmpro_apikey)
+  
+  echo "  Looking up client in UDM Pro..."
+  
+  # Normalize MAC for comparison (lowercase)
+  local ct_mac_normalized="${ct_mac,,}"
+  
+  # Get all known clients
+  local all_clients
+  all_clients=$(curl -sk -H "X-API-KEY: ${udm_apikey}" \
+    "https://${udm_host}/proxy/network/api/s/default/rest/user" 2>/dev/null || true)
+  
+  if [[ -z "$all_clients" ]] || ! echo "$all_clients" | jq -e '.data' >/dev/null 2>&1; then
+    echo "  [!] Failed to query UDM Pro API"
+    return 1
+  fi
+  
+  # Find client by MAC
+  local client_id
+  client_id=$(echo "$all_clients" | jq -r --arg mac "$ct_mac_normalized" \
+    '.data[] | select((.mac | ascii_downcase) == $mac) | ._id' 2>/dev/null | head -1 || true)
+  
+  if [[ -z "$client_id" || "$client_id" == "null" ]]; then
+    echo "  [!] Client with MAC ${ct_mac} not found in UDM Pro"
+    return 1
+  fi
+  
+  # Clear conflicting DNS record from other clients (e.g., stale entries after CT recreation)
+  local conflicting_ids
+  conflicting_ids=$(echo "$all_clients" | jq -r --arg dns "$ct_hostname" --arg self "$client_id" \
+    '.data[] | select(.local_dns_record == $dns and .local_dns_record_enabled == true and ._id != $self) | ._id' 2>/dev/null || true)
+  
+  if [[ -n "$conflicting_ids" ]]; then
+    while IFS= read -r stale_id; do
+      [[ -z "$stale_id" ]] && continue
+      local stale_mac
+      stale_mac=$(echo "$all_clients" | jq -r --arg id "$stale_id" '.data[] | select(._id == $id) | .mac' 2>/dev/null || true)
+      echo "    Clearing stale DNS record from client ${stale_id} (MAC: ${stale_mac})"
+      curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
+        "https://${udm_host}/proxy/network/api/s/default/rest/user/${stale_id}" \
+        -d '{"local_dns_record_enabled": false, "local_dns_record": ""}' >/dev/null 2>&1 || true
+    done <<< "$conflicting_ids"
+  fi
+  
+  echo "    Client ID: ${client_id}"
+  echo "    Setting static IP: ${ct_ip}"
+  echo "    Setting local DNS: ${ct_hostname}"
+  echo "    Setting alias: ${ct_hostname}"
+  
+  # Update client with fixed IP, local DNS record, and alias name
+  local update_payload
+  update_payload=$(jq -n \
+    --arg ip "$ct_ip" \
+    --arg dns "$ct_hostname" \
+    --arg name "$ct_hostname" \
+    '{
+      use_fixedip: true,
+      fixed_ip: $ip,
+      local_dns_record_enabled: true,
+      local_dns_record: $dns,
+      name: $name
+    }')
+  
+  local update_result
+  update_result=$(curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
+    "https://${udm_host}/proxy/network/api/s/default/rest/user/${client_id}" \
+    -d "$update_payload" 2>/dev/null || true)
+  
+  if echo "$update_result" | jq -e '.meta.rc == "ok"' >/dev/null 2>&1; then
+    echo "  [✓] UDM Pro client configured"
+    return 0
+  else
+    local error_msg
+    error_msg=$(echo "$update_result" | jq -r '.meta.msg // "unknown error"' 2>/dev/null || echo "unknown error")
+    echo "  [!] Failed to update client: ${error_msg}"
+    return 1
+  fi
+}
+
 # Configure timezone in CT
 # Installs tzdata and sets /etc/localtime to Europe/Berlin
 # Idempotent: safe to run multiple times
@@ -393,17 +671,17 @@ configure_timezone() {
   
   # Check if tzdata needs to be installed
   local tzdata_installed
-  tzdata_installed=$(pct exec "${CTID}" -- sh -c 'apk info -e tzdata >/dev/null 2>&1 && echo "yes" || echo "no"')
+  tzdata_installed=$(ct_exec --timeout 15 'apk info -e tzdata >/dev/null 2>&1 && echo "yes" || echo "no"')
   
   if [[ "$tzdata_installed" != "yes" ]]; then
     echo "  Installing tzdata..."
-    pct exec "${CTID}" -- apk add --no-cache tzdata >/dev/null
+    ct_exec --timeout 120 'apk add --no-cache tzdata >/dev/null'
   else
     echo "  tzdata already installed"
   fi
   
   # Fix /etc/localtime
-  pct exec "${CTID}" -- sh -c "
+  ct_exec --timeout 15 "
     # Remove if directory (corrupted state)
     if [ -d /etc/localtime ]; then
       rm -rf /etc/localtime
@@ -472,7 +750,7 @@ configure_docker_logging() {
       }
     }')
 
-  pct exec "${CTID}" -- sh -c "
+  ct_exec --timeout 15 "
     mkdir -p /etc/docker
     echo '${daemon_json}' > /etc/docker/daemon.json
   "
@@ -504,23 +782,21 @@ configure_telegraf() {
 
   # Check if telegraf is installed
   local telegraf_installed
-  telegraf_installed=$(pct exec "${CTID}" -- sh -c 'command -v telegraf >/dev/null 2>&1 && echo "yes" || echo "no"')
+  telegraf_installed=$(ct_exec --timeout 15 'command -v telegraf >/dev/null 2>&1 && echo "yes" || echo "no"')
   
   if [[ "$telegraf_installed" != "yes" ]]; then
     echo "  Installing telegraf..."
-    pct exec "${CTID}" -- sh -c '
-      apk add --no-cache telegraf
-    '
+    ct_exec --timeout 120 'apk add --no-cache telegraf'
   else
     echo "  Telegraf already installed"
   fi
 
   # Ensure telegraf user can access docker socket
   local in_docker_group
-  in_docker_group=$(pct exec "${CTID}" -- sh -c 'groups telegraf 2>/dev/null | grep -q docker && echo "yes" || echo "no"')
+  in_docker_group=$(ct_exec --timeout 15 'groups telegraf 2>/dev/null | grep -q docker && echo "yes" || echo "no"')
   if [[ "$in_docker_group" != "yes" ]]; then
     echo "  Adding telegraf user to docker group..."
-    pct exec "${CTID}" -- adduser telegraf docker 2>/dev/null || true
+    ct_exec --timeout 15 'adduser telegraf docker 2>/dev/null || true'
   fi
 
   # Build telegraf config
@@ -575,7 +851,7 @@ configure_telegraf() {
 "
 
   # Write config and ensure service is enabled
-  pct exec "${CTID}" -- sh -c "
+  ct_exec --timeout 30 "
     mkdir -p /etc/telegraf
     cat > /etc/telegraf/telegraf.conf << 'TELEGRAF_EOF'
 ${telegraf_conf}
@@ -600,7 +876,7 @@ TELEGRAF_EOF
   
   # Verify service is running
   local service_status
-  service_status=$(pct exec "${CTID}" -- rc-service telegraf status 2>&1 || true)
+  service_status=$(ct_exec --timeout 15 'rc-service telegraf status 2>&1 || true')
   if echo "$service_status" | grep -q "started"; then
     echo "  [✓] Telegraf configured and running"
   elif echo "$service_status" | grep -q "crashed"; then
@@ -639,7 +915,7 @@ configure_syslog_forwarding() {
   echo "  Syslog target: ${otel_host}:514"
 
   # Alpine uses busybox syslogd - configure remote logging
-  pct exec "${CTID}" -- sh -c "
+  ct_exec --timeout 30 "
     # Check current config
     current_opts=\$(grep '^SYSLOGD_OPTS=' /etc/conf.d/syslog 2>/dev/null || echo '')
     expected_opts='SYSLOGD_OPTS=\"-t -L -R ${otel_host}:514\"'
@@ -653,8 +929,8 @@ configure_syslog_forwarding() {
       else
         echo 'SYSLOGD_OPTS=\"-t -L -R ${otel_host}:514\"' >> /etc/conf.d/syslog
       fi
-      # Restart syslog service
-      service syslog restart >/dev/null 2>&1 || true
+      # Restart syslog service (backgrounded to avoid blocking on DNS resolution)
+      service syslog restart >/dev/null 2>&1 &
       echo '  Syslog config updated'
     fi
   "
@@ -689,22 +965,330 @@ configure_step_ca() {
 
   # Check if step-cli is installed
   local step_installed
-  step_installed=$(pct exec "${CTID}" -- sh -c 'command -v step >/dev/null 2>&1 && echo "yes" || echo "no"')
+  step_installed=$(ct_exec --timeout 15 'command -v step >/dev/null 2>&1 && echo "yes" || echo "no"')
   
   if [[ "$step_installed" != "yes" ]]; then
     echo "  Installing step-cli..."
-    pct exec "${CTID}" -- apk add --no-cache step-cli >/dev/null
+    ct_exec --timeout 120 'apk add --no-cache step-cli >/dev/null'
   else
     echo "  step-cli already installed"
   fi
 
   # Bootstrap CA trust (--force makes it idempotent)
-  pct exec "${CTID}" -- step ca bootstrap \
-    --ca-url "https://${ca_name}" \
-    --fingerprint "${fingerprint}" \
-    --install --force >/dev/null 2>&1
+  echo "  Bootstrapping CA trust..."
+  if ! ct_exec --timeout 60 "step ca bootstrap \
+    --ca-url 'https://${ca_name}' \
+    --fingerprint '${fingerprint}' \
+    --install --force" 2>&1; then
+    echo "  [!] Warning: step ca bootstrap failed (CA may be unreachable)"
+    return 0  # Non-fatal - continue with refresh
+  fi
+
+  # Install root CA to system trust store (for Docker containers)
+  echo "  Installing root CA to system trust store..."
+  if ct_exec --timeout 30 "cp /root/.step/certs/root_ca.crt /usr/local/share/ca-certificates/step-ca-root.crt && update-ca-certificates" >/dev/null 2>&1; then
+    echo "  [✓] Root CA added to system trust store"
+  else
+    echo "  [!] Warning: Failed to add root CA to system trust store"
+  fi
   
   echo "  [✓] Step CA trust configured"
+}
+
+# Configure a scheduled arping on the default gateway every minute
+# Ensures the CT remains reachable by refreshing the ARP table on the gateway
+# Idempotent: overwrites cron entry or unit files (safe to run repeatedly)
+# Supports both OpenRC (Alpine/crond) and systemd (Debian/RHEL)
+# Args:
+#   $1 - hostname (optional, defaults to CT_HOSTNAME or HOSTNAME)
+# Requires: CTID to be set
+configure_arping_service() {
+  local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
+  local arping_cmd='GW=$(ip route | awk '"'"'/default/ {print $3}'"'"'); [ -n "$GW" ] && arping -c 1 -A -I eth0 $GW >/dev/null 2>&1 || true'
+
+  echo "Configuring arping gateway service..."
+
+  # Ensure arping is installed
+  local has_arping
+  has_arping=$(ct_exec --timeout 15 'command -v arping >/dev/null 2>&1 && echo yes || echo no')
+  if [[ "$has_arping" != "yes" ]]; then
+    echo "  Installing arping..."
+    ct_exec --timeout 120 '
+      if command -v apk >/dev/null 2>&1; then
+        apk add --no-cache iputils >/dev/null
+      elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq iputils-arping >/dev/null
+      elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q iputils >/dev/null
+      else
+        echo "  [!] Unknown package manager, cannot install arping" >&2
+        exit 1
+      fi
+    '
+  else
+    echo "  arping already installed"
+  fi
+
+  # Detect init system and configure accordingly
+  if ct_exec --timeout 15 '[ -d /run/systemd/system ]' 2>/dev/null; then
+    # systemd: use a timer unit
+    echo "  Using systemd timer..."
+
+    ct_exec --timeout 15 'cat > /etc/systemd/system/arping-gateway.service << "UNIT"
+[Unit]
+Description=ARP announce on default gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '"'"'GW=$(ip route | awk "/default/ {print \\$3}"); [ -n "$GW" ] && arping -c 1 -A -I eth0 $GW || true'"'"'
+UNIT'
+
+    ct_exec --timeout 15 'cat > /etc/systemd/system/arping-gateway.timer << "UNIT"
+[Unit]
+Description=ARP announce on default gateway every minute
+
+[Timer]
+OnBootSec=0
+OnUnitActiveSec=60
+
+[Install]
+WantedBy=timers.target
+UNIT'
+
+    ct_exec --timeout 30 '
+      systemctl daemon-reload
+      systemctl enable --now arping-gateway.timer >/dev/null 2>&1
+    '
+  else
+    # OpenRC/crond: use a cron job
+    echo "  Using crond..."
+
+    # Ensure crond is enabled and running
+    ct_exec --timeout 30 '
+      if command -v rc-update >/dev/null 2>&1; then
+        rc-update add crond default 2>/dev/null || true
+        service crond start 2>/dev/null || true
+      fi
+    '
+
+    # Write arping script and cron entry idempotently
+    # Uses a wrapper script to avoid awk/dollar-sign quoting issues in ct_exec
+    pct exec "${CTID}" -- sh -c 'cat > /usr/local/bin/arping-gw.sh << '"'"'SCRIPT'"'"'
+#!/bin/sh
+GW=$(ip route | awk '"'"'"'"'"'"'"'"'/default/ {print $3}'"'"'"'"'"'"'"'"')
+[ -n "$GW" ] && arping -c 1 -A -I eth0 $GW >/dev/null 2>&1 || true
+SCRIPT
+chmod +x /usr/local/bin/arping-gw.sh
+sed -i "/arping/d" /etc/crontabs/root
+echo "* * * * * /usr/local/bin/arping-gw.sh" >> /etc/crontabs/root'
+  fi
+
+  echo "  [✓] Arping gateway service configured"
+}
+
+# Configure Authentik forward auth for a CT
+# Detects caddy.forward_auth labels in the CT's docker-compose.yaml and
+# auto-provisions a domain-level forward auth setup in Authentik via REST API:
+#   1. Proxy Provider (mode: forward_domain, one per domain)
+#   2. Application (linked to the provider)
+#   3. Outpost assignment (adds provider to the configured outpost)
+# Domain-level: one provider covers all services under the same parent domain.
+# Individual apps handle their own authorization; Authentik only authenticates.
+# Idempotent: skips if domain application already exists with a provider attached
+# Args:
+#   $1 - CT hostname (e.g., rust.thesaints.home)
+# Returns: 0 on success or skip, 1 on error
+configure_authentik_forward_auth() {
+  local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
+
+  # Check if Authentik is configured
+  if ! config_authentik_configured; then
+    echo "  [!] Authentik not configured (missing host or apitoken in commonCT.json)"
+    return 0
+  fi
+
+  # Check if docker-compose.yaml has forward_auth labels
+  local hostname_lower
+  hostname_lower=$(echo "$ct_hostname" | tr '[:upper:]' '[:lower:]')
+  local compose_file="/mnt/docker/${hostname_lower}/docker-compose.yaml"
+
+  if [[ ! -f "$compose_file" ]]; then
+    return 0
+  fi
+
+  if ! grep -q 'caddy\.forward_auth' "$compose_file" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Configuring Authentik forward auth..."
+
+  local ak_host ak_token ak_outpost auth_flow_slug inval_flow_slug
+  ak_host=$(config_get_authentik_host)
+  ak_token=$(config_get_authentik_token)
+  ak_outpost=$(config_get_authentik_outpost)
+  auth_flow_slug=$(config_get_authentik_authorization_flow)
+  inval_flow_slug=$(config_get_authentik_invalidation_flow)
+
+  local ak_api="https://${ak_host}/api/v3"
+
+  # Domain-level: one provider per domain, not per hostname
+  local domain
+  domain=$(extract_domain_from_hostname "$ct_hostname")
+  local slug
+  slug=$(echo "$domain" | tr '.' '-')
+
+  # Helper: Authentik API GET
+  ak_get() {
+    curl -sk -H "Authorization: Bearer ${ak_token}" -H "Accept: application/json" \
+      "${ak_api}${1}" 2>/dev/null
+  }
+
+  # Helper: Authentik API POST
+  ak_post() {
+    curl -sk -X POST -H "Authorization: Bearer ${ak_token}" \
+      -H "Content-Type: application/json" -H "Accept: application/json" \
+      "${ak_api}${1}" -d "${2}" 2>/dev/null
+  }
+
+  # Helper: Authentik API PATCH
+  ak_patch() {
+    curl -sk -X PATCH -H "Authorization: Bearer ${ak_token}" \
+      -H "Content-Type: application/json" -H "Accept: application/json" \
+      "${ak_api}${1}" -d "${2}" 2>/dev/null
+  }
+
+  # Step 1: Check if domain application already exists with a provider
+  local existing_app
+  existing_app=$(ak_get "/core/applications/?slug=${slug}")
+
+  if echo "$existing_app" | jq -e --arg s "$slug" '.results[] | select(.slug == $s) | .provider != null' >/dev/null 2>&1; then
+    echo "  [✓] Authentik: domain '${domain}' already configured"
+    return 0
+  fi
+
+  # Step 2: Look up flow UUIDs by slug
+  echo "  Looking up authorization flow: ${auth_flow_slug}"
+  local auth_flow_uuid
+  auth_flow_uuid=$(ak_get "/flows/instances/?slug=${auth_flow_slug}" | \
+    jq -r '.results[0].pk // empty' 2>/dev/null)
+
+  if [[ -z "$auth_flow_uuid" ]]; then
+    echo "  [!] Authorization flow '${auth_flow_slug}' not found in Authentik"
+    return 1
+  fi
+
+  echo "  Looking up invalidation flow: ${inval_flow_slug}"
+  local inval_flow_uuid
+  inval_flow_uuid=$(ak_get "/flows/instances/?slug=${inval_flow_slug}" | \
+    jq -r '.results[0].pk // empty' 2>/dev/null)
+
+  if [[ -z "$inval_flow_uuid" ]]; then
+    echo "  [!] Invalidation flow '${inval_flow_slug}' not found in Authentik"
+    return 1
+  fi
+
+  # Step 3: Create domain-level Proxy Provider
+  echo "  Creating domain-level proxy provider: ${domain}"
+  local provider_payload
+  provider_payload=$(jq -n \
+    --arg name "${domain}" \
+    --arg auth_flow "$auth_flow_uuid" \
+    --arg inval_flow "$inval_flow_uuid" \
+    --arg ext_host "https://${ak_host}" \
+    --arg cookie_domain "$domain" \
+    '{
+      name: $name,
+      authorization_flow: $auth_flow,
+      invalidation_flow: $inval_flow,
+      external_host: $ext_host,
+      mode: "forward_domain",
+      cookie_domain: $cookie_domain
+    }')
+
+  local provider_result
+  provider_result=$(ak_post "/providers/proxy/" "$provider_payload")
+
+  local provider_pk
+  provider_pk=$(echo "$provider_result" | jq -r '.pk // empty' 2>/dev/null)
+
+  if [[ -z "$provider_pk" ]]; then
+    local error_detail
+    error_detail=$(echo "$provider_result" | jq -r 'if .detail then .detail elif .name then .name[0] else "unknown error" end' 2>/dev/null || echo "unknown error")
+    echo "  [!] Failed to create proxy provider: ${error_detail}"
+    return 1
+  fi
+  echo "    Provider ID: ${provider_pk}"
+
+  # Step 4: Create Application
+  echo "  Creating application: ${slug}"
+  local app_payload
+  app_payload=$(jq -n \
+    --arg name "${domain}" \
+    --arg slug "$slug" \
+    --argjson provider "$provider_pk" \
+    --arg launch_url "https://${ak_host}" \
+    '{
+      name: $name,
+      slug: $slug,
+      provider: $provider,
+      meta_launch_url: $launch_url
+    }')
+
+  local app_result
+  app_result=$(ak_post "/core/applications/" "$app_payload")
+
+  if ! echo "$app_result" | jq -e '.pk' >/dev/null 2>&1; then
+    local error_detail
+    error_detail=$(echo "$app_result" | jq -r 'if .detail then .detail elif .slug then .slug[0] else "unknown error" end' 2>/dev/null || echo "unknown error")
+    echo "  [!] Failed to create application: ${error_detail}"
+    return 1
+  fi
+  echo "    Application slug: ${slug}"
+
+  # Step 5: Assign provider to outpost
+  if [[ -n "$ak_outpost" ]]; then
+    echo "  Assigning to outpost: ${ak_outpost}"
+
+    local outpost_result
+    outpost_result=$(ak_get "/outposts/instances/?name__iexact=$(printf '%s' "$ak_outpost" | jq -sRr @uri)")
+
+    local outpost_uuid
+    outpost_uuid=$(echo "$outpost_result" | jq -r '.results[0].pk // empty' 2>/dev/null)
+
+    if [[ -z "$outpost_uuid" ]]; then
+      echo "  [!] Outpost '${ak_outpost}' not found — provider created but not assigned to outpost"
+      return 0
+    fi
+
+    # Get current providers list and append new provider
+    local current_providers
+    current_providers=$(echo "$outpost_result" | jq -r '[.results[0].providers[]]' 2>/dev/null)
+
+    # Check if provider already assigned
+    if echo "$current_providers" | jq -e --argjson pk "$provider_pk" 'index($pk) != null' >/dev/null 2>&1; then
+      echo "    Provider already assigned to outpost"
+    else
+      local updated_providers
+      updated_providers=$(echo "$current_providers" | jq --argjson pk "$provider_pk" '. + [$pk]')
+
+      local patch_payload
+      patch_payload=$(jq -n --argjson providers "$updated_providers" '{providers: $providers}')
+
+      local patch_result
+      patch_result=$(ak_patch "/outposts/instances/${outpost_uuid}/" "$patch_payload")
+
+      if echo "$patch_result" | jq -e '.pk' >/dev/null 2>&1; then
+        echo "    [✓] Provider assigned to outpost"
+      else
+        echo "    [!] Failed to assign provider to outpost"
+      fi
+    fi
+  fi
+
+  echo "  [✓] Authentik forward auth configured (domain: ${domain})"
+  return 0
 }
 
 # Configure GPU passthrough for hardware acceleration (e.g., VAAPI)
@@ -743,7 +1327,7 @@ configure_gpu_passthrough() {
   if [[ "$needs_config" == "false" ]]; then
     echo "  GPU passthrough already configured"
     # Still ensure render group exists inside CT
-    pct exec "${ctid}" -- sh -c "
+    ct_exec --timeout 15 "${ctid}" "
       addgroup -g ${render_gid} render 2>/dev/null || true
       addgroup root render 2>/dev/null || true
     " 2>/dev/null
@@ -813,13 +1397,13 @@ configure_gpu_passthrough() {
   
   # Add render group inside CT with matching GID
   echo "  Configuring render group inside CT..."
-  pct exec "${ctid}" -- sh -c "
+  ct_exec --timeout 15 "${ctid}" "
     addgroup -g ${render_gid} render 2>/dev/null || true
     addgroup root render 2>/dev/null || true
   "
   
   # Verify device is accessible
-  if pct exec "${ctid}" -- test -e /dev/dri/renderD128 2>/dev/null; then
+  if ct_exec --timeout 15 "${ctid}" 'test -e /dev/dri/renderD128' 2>/dev/null; then
     echo "  [✓] GPU passthrough configured successfully"
   else
     echo "  [!] Warning: /dev/dri/renderD128 not accessible in CT"
@@ -859,16 +1443,21 @@ configure_registry_logins() {
     
     # Check if already logged in
     local already_logged_in
-    already_logged_in=$(pct exec "${CTID}" -- sh -c "cat ~/.docker/config.json 2>/dev/null | grep -q '${registry}' && echo 'yes' || echo 'no'")
+    already_logged_in=$(ct_exec --timeout 15 "cat ~/.docker/config.json 2>/dev/null | grep -q '${registry}' && echo 'yes' || echo 'no'")
     
     if [[ "$already_logged_in" == "yes" ]]; then
       echo "  ${registry}: already authenticated"
-    else
-      echo "  ${registry}: logging in..."
+      count=$((count + 1))
+      continue
     fi
     
-    # Always re-authenticate to ensure token is valid
-    pct exec "${CTID}" -- sh -c "echo '${password}' | docker login '${registry}' -u '${username}' --password-stdin >/dev/null 2>&1"
+    # Authenticate
+    echo "  ${registry}: logging in..."
+    local login_output
+    if ! login_output=$(ct_exec --timeout 60 "echo '${password}' | docker login '${registry}' -u '${username}' --password-stdin" 2>&1); then
+      echo "  [!] ${registry}: login failed: ${login_output}"
+      return 1
+    fi
     
     count=$((count + 1))
   done <<< "$registries"
@@ -928,7 +1517,7 @@ compose_up() {
     echo "  Newt tunnel enabled (published profile)"
   fi
   
-  pct exec "${ctid}" -- sh -c "cd /mnt/docker && docker compose ${profile_flag} up -d --pull always --remove-orphans"
+  ct_exec --timeout 300 "${ctid}" "cd /mnt/docker && docker compose ${profile_flag} up -d --pull always --remove-orphans"
 }
 
 # Stop Docker Compose services in a CT
@@ -941,10 +1530,10 @@ compose_down() {
   
   # Get all profiles defined in the compose file and build --profile flags
   local profile_flags
-  profile_flags=$(pct exec "${ctid}" -- sh -c 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
+  profile_flags=$(ct_exec --timeout 30 "${ctid}" 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
     while read -r profile; do echo -n "--profile $profile "; done)
   
-  pct exec "${ctid}" -- sh -c "cd /mnt/docker && docker compose ${profile_flags} down"
+  ct_exec --timeout 120 "${ctid}" "cd /mnt/docker && docker compose ${profile_flags} down"
 }
 
 # Reboot a container
@@ -994,87 +1583,159 @@ reboot_ct() {
   return 0
 }
 
-# Check if DNS resolves hostname to the same IP as the CT reports
+# Resolve DNS with retry loop
+# Attempts to resolve hostname via DNS, retrying for up to timeout seconds.
+# If expected_ip is provided, only succeeds if resolved IP matches.
+#
+# Args:
+#   $1 - hostname to resolve
+#   $2 - expected IP (optional, if provided must match for success)
+#   $3 - timeout in seconds (optional, default 60)
+#   $4 - interval between retries (optional, default 5)
+# Sets: DNS_RESOLVED_IP (global) - the resolved IP or empty
+# Returns: 0 if resolved (and matches expected_ip if provided), 1 otherwise
+resolve_dns_with_retry() {
+  local hostname="$1"
+  local expected_ip="${2:-}"
+  local timeout="${3:-60}"
+  local interval="${4:-5}"
+  local quiet="${5:-false}"
+  
+  DNS_RESOLVED_IP=""
+  
+  for ((i=0; i<=timeout; i+=interval)); do
+    # Use dig for pure DNS lookup (bypasses /etc/hosts)
+    # +time=2 +tries=1 prevents dig from hanging on unresponsive DNS
+    DNS_RESOLVED_IP=$(dig +short +time=2 +tries=1 "${hostname}" A 2>/dev/null | grep -E '^[0-9.]+$' | head -1 || true)
+    
+    if [[ -n "$DNS_RESOLVED_IP" ]]; then
+      # End the line (caller used echo -n)
+      [[ "$quiet" != "true" ]] && echo ""
+      
+      # If no expected IP, any resolution is success
+      if [[ -z "$expected_ip" ]]; then
+        return 0
+      fi
+      # If expected IP provided, check if it matches
+      if [[ "$DNS_RESOLVED_IP" == "$expected_ip" ]]; then
+        return 0
+      fi
+      # Resolved but to wrong IP - return immediately (no point retrying)
+      return 1
+    fi
+    
+    # Show progress dot for each retry
+    [[ "$quiet" != "true" ]] && echo -n "."
+    
+    # Don't sleep on last iteration
+    [[ $i -lt $timeout ]] && sleep "$interval"
+  done
+  
+  # End the line (caller used echo -n)
+  [[ "$quiet" != "true" ]] && echo ""
+  
+  # Never resolved
+  return 1
+}
+
+# Check DNS configuration for a CT, configure static IP/DNS if needed
+# 
+# Flow:
+#   Step 1: Get CT hostname, IP, and MAC address
+#   Step 2: Resolve hostname via DNS
+#     - DNS matches CT IP → SUCCESS
+#     - DNS fails/mismatches → configure static IP and local DNS on UDM Pro
+#
 # Args:
 #   $1 - CTID (optional, defaults to global CTID)
 #   $2 - hostname (optional, defaults to global CT_HOSTNAME)
-# Returns: 0 if DNS matches, 1 if mismatch or error
+# Returns: 0 if DNS is healthy, 1 on error
 check_dns_health() {
   local ctid="${1:-${CTID}}"
   local hostname="${2:-${CT_HOSTNAME}}"
   
   echo "Checking DNS health for ${hostname}..."
   
-  # Get IP from inside the CT using ip command (most reliable)
-  local ct_ip
-  ct_ip=$(pct exec "${ctid}" -- sh -c "ip -4 addr show eth0 2>/dev/null | awk '/inet / {split(\$2, a, \"/\"); print a[1]}'" 2>/dev/null)
+  # -------------------------
+  # Get CT info
+  # -------------------------
+  local ct_ip ct_mac
   
+  # Get IP from inside the CT (uses grep+tr+cut for BusyBox compatibility)
+  ct_ip=$(ct_exec --timeout 15 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
   if [[ -z "$ct_ip" ]]; then
     echo "  [!] Could not get IP from CT ${ctid}"
     return 1
   fi
   
-  echo "  CT reports IP: ${ct_ip}"
-  
-  # Resolve hostname via DNS from host
-  local dns_ip
-  dns_ip=$(getent hosts "${hostname}" 2>/dev/null | awk '{print $1}')
-  
-  if [[ -z "$dns_ip" ]]; then
-    echo "  [!] DNS lookup failed for ${hostname}"
+  # Get MAC from CT config
+  ct_mac=$(pct config "${ctid}" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
+  if [[ -z "$ct_mac" ]]; then
+    echo "  [!] Could not get MAC from CT ${ctid}"
     return 1
   fi
   
-  echo "  DNS resolves to: ${dns_ip}"
+  echo "  CT IP:  ${ct_ip}"
+  echo "  CT MAC: ${ct_mac}"
   
-  # Compare
-  if [[ "$ct_ip" == "$dns_ip" ]]; then
+  # -------------------------
+  # Ensure UDM Pro has fixed IP and local DNS record
+  # Always run (idempotent) to ensure device properties are set
+  # -------------------------
+  udmpro_make_static "$ct_mac" "$ct_ip" "$hostname" || true
+  
+  # -------------------------
+  # Check DNS
+  # -------------------------
+  echo -n "  Checking DNS resolution..."
+  
+  if resolve_dns_with_retry "$hostname" "$ct_ip"; then
+    echo "  DNS IP: ${DNS_RESOLVED_IP}"
     echo "  [✓] DNS matches CT IP"
     return 0
-  else
-    echo "  [!] DNS mismatch: CT=${ct_ip}, DNS=${dns_ip}"
-    
-    # Diagnostic: check if stale DNS IP is reachable
-    echo "  Diagnosing stale IP ${dns_ip}..."
-    
-    if ping -c 1 -W 1 "${dns_ip}" >/dev/null 2>&1; then
-      echo "    ${dns_ip} responds to ping - another device has this IP"
-      
-      # Check ARP cache for MAC address
-      local arp_mac
-      arp_mac=$(arp -n "${dns_ip}" 2>/dev/null | awk 'NR==2 {print $3}')
-      if [[ -n "$arp_mac" && "$arp_mac" != "(incomplete)" ]]; then
-        echo "    MAC at ${dns_ip}: ${arp_mac}"
-        
-        # Try to identify if it's one of our CTs
-        local matching_ct=""
-        for id in $(pct list 2>/dev/null | awk 'NR>1 {print $1}'); do
-          local ct_mac
-          ct_mac=$(pct config "$id" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
-          if [[ "${ct_mac}" == "${arp_mac,,}" ]]; then
-            matching_ct="$id ($(pct config "$id" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}'))"
-            break
-          fi
-        done
-        
-        if [[ -n "$matching_ct" ]]; then
-          echo "    Belongs to CT: ${matching_ct}"
-        else
-          echo "    MAC not found in CTs - external device or VM"
-        fi
-      fi
-    else
-      echo "    ${dns_ip} not responding - stale DNS record"
-    fi
-    
-    echo "  Action: Update DHCP reservation or DNS record for ${hostname}"
-    return 1
   fi
+  
+  # DNS check failed - either wrong IP or not found
+  if [[ -n "$DNS_RESOLVED_IP" ]]; then
+    echo "  DNS IP: ${DNS_RESOLVED_IP}"
+    echo "  [!] DNS mismatch: expected ${ct_ip}, got ${DNS_RESOLVED_IP}"
+  else
+    echo "  DNS IP: (not found after 60s)"
+  fi
+  
+  echo -n "  Waiting for DNS propagation..."
+  
+  # Wait for DNS to propagate and verify it matches
+  if resolve_dns_with_retry "$hostname" "$ct_ip"; then
+    echo "  [✓] DNS resolves correctly"
+    return 0
+  fi
+  
+  echo "  [!] DNS did not propagate within 60s"
+  return 1
 }
 
 # -----------------------------
 # CONTAINER FUNCTIONS
 # -----------------------------
+
+# Ensure swap is half of memory
+# Checks current CT config and adjusts swap if needed
+# Requires: CTID to be set
+ensure_swap() {
+  local current_memory current_swap expected_swap
+  
+  # Get current memory and swap from CT config
+  current_memory=$(pct config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "0")
+  current_swap=$(pct config "${CTID}" 2>/dev/null | grep -oP '^swap:\s*\K\d+' || echo "0")
+  expected_swap=$((current_memory / 2))
+  
+  if [[ "$current_swap" -ne "$expected_swap" ]]; then
+    echo "Adjusting swap: ${current_swap} MB -> ${expected_swap} MB (half of ${current_memory} MB RAM)"
+    pct set "${CTID}" -swap "${expected_swap}"
+    echo "  [\u2713] Swap adjusted"
+  fi
+}
 
 # Build list of all containers
 # Populates CT_MAP (CTID -> hostname), CT_STATUS (CTID -> status), and CT_LIST (array of CTIDs)
@@ -1312,10 +1973,25 @@ ensure_ct_stopped() {
   return 0
 }
 
-# Execute command in container
-# Args: $1 = CTID (optional if $CTID is set), remaining args = command
-# Usage: ct_exec "command" or ct_exec 2100 "command"
+# Execute command in container with optional timeout
+# Args:
+#   --timeout N  Maximum seconds before killing the command (optional, default: no timeout)
+#   $1           CTID (optional if $CTID is set), detected when first arg is numeric
+#   remaining    Command string to execute via sh -c
+# Usage:
+#   ct_exec "command"
+#   ct_exec 2100 "command"
+#   ct_exec --timeout 30 "command"
+#   ct_exec --timeout 60 2100 "command"
+# Returns: exit code of the command, or 124 on timeout
 ct_exec() {
+  local ct_timeout=""
+  
+  if [[ "$1" == "--timeout" ]]; then
+    ct_timeout="$2"
+    shift 2
+  fi
+  
   local ctid
   local cmd
   
@@ -1328,7 +2004,16 @@ ct_exec() {
     cmd="$*"
   fi
   
-  pct exec "$ctid" -- sh -c "$cmd"
+  if [[ -n "$ct_timeout" ]]; then
+    local rc=0
+    timeout "${ct_timeout}" pct exec "$ctid" -- sh -c "$cmd" || rc=$?
+    if [[ $rc -eq 124 ]]; then
+      echo "  [!] Timeout: command exceeded ${ct_timeout}s in CT ${ctid}" >&2
+    fi
+    return $rc
+  else
+    pct exec "$ctid" -- sh -c "$cmd"
+  fi
 }
 
 # Check if container exists
@@ -1337,6 +2022,79 @@ ct_exec() {
 ct_exists() {
   local ctid="$1"
   pct status "$ctid" &>/dev/null
+}
+
+# Run per-CT configure.sh script (if present)
+# Looks for ${DIR_DOCKER}/configure.sh on the Proxmox host and runs it
+# inside the CT via ct_exec. The script must be idempotent.
+#
+# If ${DIR_DOCKER}/configure.env exists, each line maps an env var name to
+# a jq path in commonCT.json. Resolved values are injected as environment
+# variables into the ct_exec call (secrets never touch CT disk).
+#
+# configure.env format (lines starting with # are ignored):
+#   ENV_VAR_NAME=jq.dot.path
+#   AUTHENTIK_API_TOKEN=authentik.apitoken
+#
+# Args: none (uses global CTID, CT_HOSTNAME, DIR_DOCKER)
+# Returns: 0 on success or if no script exists, 1 on failure (non-fatal)
+run_configure_script() {
+  local configure_script="${DIR_DOCKER}/_config/configure.sh"
+
+  if [[ ! -f "$configure_script" ]]; then
+    return 0
+  fi
+
+  echo "Running per-CT configure script..."
+
+  # Ensure the script is executable
+  chmod +x "$configure_script"
+
+  # Build env var prefix from configure.env mappings
+  local env_prefix=""
+  local configure_env="${DIR_DOCKER}/_config/configure.env"
+
+  if [[ -f "$configure_env" ]] && config_exists; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      # Skip comments and blank lines
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// /}" ]] && continue
+
+      local var_name="${line%%=*}"
+      local jq_path="${line#*=}"
+
+      # Convert dot path to jq filter: authentik.apitoken -> .authentik.apitoken
+      local jq_filter=".${jq_path}"
+      local value
+      value=$(jq -r "${jq_filter} // empty" "${CONFIG_FILE}" 2>/dev/null)
+
+      if [[ -n "$value" ]]; then
+        # Escape single quotes in value for safe shell injection
+        value="${value//\'/\'\\\'\'}"
+        env_prefix="${env_prefix}${var_name}='${value}' "
+      fi
+    done < "$configure_env"
+  fi
+
+  # Wait for Docker containers to be healthy (up to 120s)
+  echo "  Waiting for containers to be healthy..."
+  local retries=24
+  while ! ct_exec --timeout 10 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | head -1 | grep -q .' 2>/dev/null; do
+    retries=$((retries - 1))
+    if [[ $retries -le 0 ]]; then
+      echo "  [!] Containers not healthy after 120s, running configure.sh anyway"
+      break
+    fi
+    sleep 5
+  done
+
+  # Run the script inside the CT with injected env vars
+  if ct_exec --timeout 120 "cd /mnt/docker && ${env_prefix}bash ./_config/configure.sh '${CT_HOSTNAME}'" 2>&1; then
+    echo "  [✓] Configure script completed"
+  else
+    echo "  [!] Configure script failed (exit code $?) — continuing"
+    return 0  # Non-fatal
+  fi
 }
 
 # Get hostname-based directory paths

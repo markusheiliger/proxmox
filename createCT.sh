@@ -18,13 +18,14 @@
 #   meaning the same configuration can be re-applied to update existing CTs.
 #
 # USAGE:
-#   ./createCT.sh <hostname> [--size S|M|L] [--gpu] [key=value overrides...]
+#   ./createCT.sh <hostname> [--size S|M|L] [--priority low|mid|high] [--gpu] [key=value overrides...]
 #
 # EXAMPLES:
-#   ./createCT.sh app.thesaints.home           # Default size S
-#   ./createCT.sh app.thesaints.home --size M  # Medium size
-#   ./createCT.sh app.thesaints.home --size L  # Large size (e.g., Seafile)
-#   ./createCT.sh nvr.thesaints.home --gpu     # Enable GPU passthrough
+#   ./createCT.sh app.thesaints.home                   # Default size S, priority mid
+#   ./createCT.sh app.thesaints.home --size M          # Medium size
+#   ./createCT.sh app.thesaints.home --priority low    # Low priority (background)
+#   ./createCT.sh app.thesaints.home --size L          # Large size (e.g., Seafile)
+#   ./createCT.sh nvr.thesaints.home --gpu --priority high  # GPU + high priority
 #   ./createCT.sh app.thesaints.home IP=10.0.0.50/24 GW=10.0.0.1
 #   ./createCT.sh ca.thesaints.home CTID=2000
 #   ./createCT.sh app.thesaints.home --monitor
@@ -95,6 +96,7 @@ ENV_FILE=""
 MONITOR_AFTER=false
 GPU_PASSTHROUGH=false
 CT_SIZE="S"
+CT_PRIORITY="mid"
 
 # -----------------------------
 # FUNCTIONS
@@ -102,68 +104,58 @@ CT_SIZE="S"
 
 # Show usage and exit
 usage() {
-  echo "Usage: $0 <hostname> [--size S|M|L] [--gpu] [key=value overrides]"
+  echo "Usage: $0 <hostname> [--size S|M|L] [--priority low|mid|high] [--gpu] [key=value overrides]"
   echo ""
   echo "Options:"
-  echo "  --size S|M|L    T-shirt size (default: S)"
-  echo "  --gpu           Enable GPU passthrough (VAAPI)"
-  echo "  --monitor       Start log monitor after creation"
+  echo "  --size S|M|L             T-shirt size (default: S)"
+  echo "  --priority low|mid|high  CPU priority (default: mid)"
+  echo "  --gpu                    Enable GPU passthrough (VAAPI)"
+  echo "  --monitor                Start log monitor after creation"
   echo ""
   echo "Sizes (defined in commonCT.json):"
   echo "  S = Small  ($(config_get_size_cores S) cores, $(config_get_size_memory S) MB)"
   echo "  M = Medium ($(config_get_size_cores M) cores, $(config_get_size_memory M) MB)"
   echo "  L = Large  ($(config_get_size_cores L) cores, $(config_get_size_memory L) MB)"
+  echo ""
+  echo "Priority (CPU units):"
+  echo "  low  = 512  (background tasks)"
+  echo "  mid  = 1024 (standard workloads)"
+  echo "  high = 2048 (critical services)"
   exit 1
 }
 
-# Allocate next available CTID (2000 + n*100)
+# Allocate next available CTID
+# Strategy:
+#   1. Start at base 1000, step by 100 (1000, 1100, 1200, ..., 2900)
+#   2. If no free ID found below 3000, restart at 1000 with step 10
 next_ctid() {
   local base=2000
-  local step=100
+  local max=10000
   local used
   used=$(pct list | awk '{print $1}' | grep -E '^[0-9]+$' | sort -n)
 
+  # First pass: step by 100
   local candidate=$base
-  while true; do
+  while [[ $candidate -lt $max ]]; do
     if ! echo "$used" | grep -qx "$candidate"; then
       echo "$candidate"
       return 0
     fi
-    candidate=$((candidate + step))
+    candidate=$((candidate + 100))
   done
-}
 
-# Validate hostname against config
-validate_hostname() {
-  if ! config_exists; then
-    echo "ERROR: Config file not found: ${CONFIG_FILE}"
-    exit 1
-  fi
-
-  local hostname_parts
-  hostname_parts=$(echo "${HOSTNAME}" | tr '.' '\n' | wc -l)
-
-  if [[ "${HOSTNAME}" =~ ^ca\. ]]; then
-    # CA host: must be fully qualified (at least 3 parts: ca.domain.tld)
-    if [[ ${hostname_parts} -lt 3 ]]; then
-      echo "ERROR: CA hostname must be fully qualified (e.g., ca.domain.tld)"
-      echo "  Provided: ${HOSTNAME}"
-      exit 1
+  # Second pass: step by 10 (denser allocation)
+  candidate=$base
+  while [[ $candidate -lt $max ]]; do
+    if ! echo "$used" | grep -qx "$candidate"; then
+      echo "$candidate"
+      return 0
     fi
-    echo "Hostname validated: CA host"
-  else
-    # Regular host: domain must be in config
-    local domain
-    domain=$(extract_domain_from_hostname "${HOSTNAME}")
-    
-    if ! config_domain_exists "${domain}"; then
-      echo "ERROR: Domain '${domain}' not configured in ${CONFIG_FILE}"
-      echo "  Configured domains:"
-      config_get_domains | sed 's/^/    /'
-      exit 1
-    fi
-    echo "Hostname validated: domain '${domain}' found in config"
-  fi
+    candidate=$((candidate + 10))
+  done
+
+  echo "Error: No free CTID available (range ${base}-${max})" >&2
+  return 1
 }
 
 # Set configuration defaults
@@ -226,11 +218,15 @@ create_ct() {
   local net0="name=eth0,bridge=${BRIDGE},ip=${IP}"
   [[ -n "${GW}" ]] && net0="${net0},gw=${GW}"
 
+  # Validate and get CPU units for priority
+  validate_priority "${CT_PRIORITY}" || exit 1
+  
   pct create "${CTID}" "${TEMPLATE_PATH}" \
     --hostname "${HOSTNAME}" \
     --cores "${CORES}" \
     --memory "${MEMORY}" \
-    --swap 0 \
+    --swap "$((MEMORY / 2))" \
+    --cpuunits "${PRIORITY_CPUUNITS}" \
     --rootfs "${STORAGE}:${DISK}" \
     --net0 "${net0}" \
     --unprivileged 0 \
@@ -284,7 +280,7 @@ start_ct() {
 install_docker() {
   echo "Installing Docker inside CT ${CTID}..."
 
-  pct exec "${CTID}" -- sh -c '
+  ct_exec --timeout 120 '
     set -e
     apk update
     apk add docker docker-cli-compose
@@ -298,50 +294,9 @@ create_compose_template() {
   local compose_file="$1"
   local domain
   domain=$(extract_domain_from_hostname "${HOSTNAME}")
-  local ca_url="https://$(config_get_ca_name "${domain}")/acme/acme/directory"
-  
-  cat > "$compose_file" << 'COMPOSE_EOF'
-services:
-  # Hello World service - replace with your actual application
-  hello:
-    container_name: hello
-    restart: unless-stopped
-    image: traefik/whoami:latest
-    labels:
-      caddy: ${HOSTNAME}
-      caddy.reverse_proxy: "{{upstreams 80}}"
-
-  # Caddy reverse proxy with automatic SSL
-  caddy:
-    container_name: caddy
-    restart: unless-stopped
-    image: ghcr.io/thesaints-de/caddy
-    ports:
-      - 80:80
-      - 443:443
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /mnt/docker/caddy/data:/data
-    environment:
-      STEP_CA_URL: ${STEP_CA_URL}
-      STEP_CA_FINGERPRINT: ${STEP_CA_FINGERPRINT}
-    labels:
-      caddy.email: ${CADDY_EMAIL}
-      caddy.acme_ca: ${STEP_CA_URL}
-      caddy.acme_ca_root: /root/.step/certs/root_ca.crt
-
-  # Newt tunnel for external access via Pangolin
-  newt:
-    container_name: newt
-    restart: unless-stopped
-    image: fosrl/newt
-    profiles:
-      - published
-    environment:
-      NEWT_ID: ${NEWT_ID}
-      NEWT_SECRET: ${NEWT_SECRET}
-      NEWT_ENDPOINT: ${NEWT_ENDPOINT}
-COMPOSE_EOF
+  local template
+  template=$(config_get_compose_template "${domain}") || return 1
+  cp "$template" "$compose_file"
 }
 
 # Update or create .env file with required configuration values
@@ -350,8 +305,8 @@ COMPOSE_EOF
 # Values and their sources:
 #   HOSTNAME            - Argument passed to createCT.sh (e.g., app.thesaints.home)
 #   STEP_CA_URL         - Constructed from domain: https://ca.<domain>/acme/acme/directory
-#   STEP_CA_FINGERPRINT - From commonCT.json: step_ca.<domain>.fingerprint
-#   CADDY_EMAIL         - From commonCT.json: step_ca.<domain>.email
+#   STEP_CA_FINGERPRINT - From commonCT.json: ssl.<domain>.fingerprint
+#   CADDY_EMAIL         - From commonCT.json: ssl.<domain>.email
 #
 update_env_file() {
   local env_file="$1"
@@ -472,25 +427,25 @@ verify_setup() {
   echo "  [✓] CT is running"
 
   # Wait for Docker daemon
-  if ! wait_for "Docker daemon" "pct exec '${CTID}' -- docker info &>/dev/null" 30; then
+  if ! wait_for "Docker daemon" "ct_exec --timeout 15 'docker info &>/dev/null'" 30; then
     echo "ERROR: Docker daemon not responding in CT ${CTID}."
     exit 1
   fi
   echo "  [✓] Docker daemon is running"
 
   # Verify docker compose
-  if ! pct exec "${CTID}" -- docker compose version &>/dev/null; then
+  if ! ct_exec --timeout 15 'docker compose version &>/dev/null'; then
     echo "ERROR: Docker Compose not available in CT ${CTID}."
     exit 1
   fi
   echo "  [✓] Docker Compose is available"
 
   # Verify mountpoints
-  if ! pct exec "${CTID}" -- test -d /mnt/docker; then
+  if ! ct_exec --timeout 15 'test -d /mnt/docker'; then
     echo "ERROR: /mnt/docker not mounted in CT ${CTID}."
     exit 1
   fi
-  if ! pct exec "${CTID}" -- test -d /mnt/docker-data; then
+  if ! ct_exec --timeout 15 'test -d /mnt/docker-data'; then
     echo "ERROR: /mnt/docker-data not mounted in CT ${CTID}."
     exit 1
   fi
@@ -514,7 +469,7 @@ start_compose() {
     
     # Validate compose file first
     echo "  Validating docker-compose.yaml..."
-    if ! pct exec "${CTID}" -- sh -c 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
+    if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
       echo "  [!] Warning: docker-compose.yaml validation failed, skipping start"
       echo "      Fix the compose file and run: pct exec ${CTID} -- sh -c 'cd /mnt/docker && docker compose up -d'"
       return
@@ -556,6 +511,10 @@ main() {
         GPU_PASSTHROUGH=true
         shift
         ;;
+      --priority|-p)
+        CT_PRIORITY="$2"
+        shift 2
+        ;;
       *=*)
         eval "$1"
         shift
@@ -568,13 +527,13 @@ main() {
   done
 
   # Execute provisioning steps
-  local total_steps=16
+  local total_steps=17
   local step=0
   
   status_bar_init
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Validating hostname..."
-  validate_hostname
+  validate_hostname "${HOSTNAME}" || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
@@ -590,6 +549,7 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Starting container..."
   start_ct
+  ensure_swap
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Installing Docker..."
   install_docker
@@ -612,6 +572,9 @@ main() {
   step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Step CA..."
   configure_step_ca "${HOSTNAME}"
   
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring arping service..."
+  configure_arping_service "${HOSTNAME}"
+  
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints
   reboot_ct
@@ -629,6 +592,9 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Checking DNS..."
   check_dns_health "$CTID" "$HOSTNAME"
+  
+  status_progress "$step" "$total_steps" "Running configure script..."
+  run_configure_script
   
   status_bar_cleanup
   

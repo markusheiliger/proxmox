@@ -1,0 +1,40 @@
+services:
+  # Hello World service - replace with your actual application
+  hello:
+    container_name: hello
+    restart: unless-stopped
+    image: traefik/whoami:latest
+    labels:
+      caddy: ${HOSTNAME}
+      caddy.reverse_proxy: "{{upstreams 80}}"
+
+  # Caddy reverse proxy with automatic SSL
+  caddy:
+    container_name: caddy
+    restart: unless-stopped
+    image: ghcr.io/thesaints-de/caddy
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /mnt/docker/caddy/data:/data
+    environment:
+      STEP_CA_URL: ${STEP_CA_URL}
+      STEP_CA_FINGERPRINT: ${STEP_CA_FINGERPRINT}
+    labels:
+      caddy.email: ${CADDY_EMAIL}
+      caddy.acme_ca: ${STEP_CA_URL}
+      caddy.acme_ca_root: /root/.step/certs/root_ca.crt
+
+  # Newt tunnel for external access via Pangolin
+  newt:
+    container_name: newt
+    restart: unless-stopped
+    image: fosrl/newt
+    profiles:
+      - published
+    environment:
+      NEWT_ID: ${NEWT_ID}
+      NEWT_SECRET: ${NEWT_SECRET}
+      NEWT_ENDPOINT: ${NEWT_ENDPOINT}

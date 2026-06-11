@@ -23,7 +23,7 @@
 #   - OTEL hosts (otel.*): Skip logging, syslog (would loop)
 #
 # USAGE:
-#   ./refreshCT.sh [CTID or hostname] [--size S|M|L] [--gpu] [--monitor]
+#   ./refreshCT.sh [CTID or hostname] [--size S|M|L] [--priority low|mid|high] [--gpu] [--monitor]
 #
 # EXAMPLES:
 #   ./refreshCT.sh                           # Interactive multi-select
@@ -32,6 +32,7 @@
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
 #   ./refreshCT.sh 2100 --size L             # Resize to Large and refresh
+#   ./refreshCT.sh 2100 --priority high      # Set high priority
 #   ./refreshCT.sh 2600 --gpu                # Enable GPU passthrough
 #
 # BEHAVIOR:
@@ -60,6 +61,7 @@ source "${SCRIPT_DIR}/commonCT.sh"
 MONITOR_AFTER=false
 GPU_PASSTHROUGH=false
 CT_SIZE=""
+CT_PRIORITY=""
 
 # -----------------------------
 # FUNCTIONS
@@ -84,7 +86,7 @@ update_packages() {
 reset_docker() {
   echo "Checking for docker-compose.yaml..."
   
-  if ! pct exec "${CTID}" -- test -s /mnt/docker/docker-compose.yaml 2>/dev/null; then
+  if ! ct_exec --timeout 15 'test -s /mnt/docker/docker-compose.yaml' 2>/dev/null; then
     echo "  No docker-compose.yaml found, skipping Docker reset"
     return
   fi
@@ -93,7 +95,7 @@ reset_docker() {
   
   # Validate compose file
   echo "  Validating docker-compose.yaml..."
-  if ! pct exec "${CTID}" -- sh -c 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
+  if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
     echo "  [!] Warning: docker-compose.yaml validation failed, skipping start"
     echo "      Fix the compose file and run: pct exec ${CTID} -- sh -c 'cd /mnt/docker && docker compose up -d'"
     return
@@ -102,7 +104,7 @@ reset_docker() {
   
   # Restart Docker to apply any daemon.json changes
   echo "  Restarting Docker daemon..."
-  pct exec "${CTID}" -- service docker restart 2>/dev/null || true
+  ct_exec --timeout 30 'service docker restart >/dev/null 2>&1 || true'
   sleep 2
   
   # Pull and deploy
@@ -113,11 +115,11 @@ reset_docker() {
   fix_mount_permissions
   
   # Restart to apply permission fixes
-  pct exec "${CTID}" -- sh -c 'cd /mnt/docker && docker compose restart' 2>/dev/null || true
+  ct_exec --timeout 60 'cd /mnt/docker && docker compose restart' 2>/dev/null || true
   
   # Cleanup unused images
   echo "  Cleaning up unused images..."
-  pct exec "${CTID}" -- docker image prune -f 2>/dev/null || true
+  ct_exec --timeout 30 'docker image prune -f' 2>/dev/null || true
   
   echo "  [✓] Docker Compose services running"
 }
@@ -128,7 +130,7 @@ fix_mount_permissions() {
   
   # Get compose config as JSON from CT
   local compose_json
-  compose_json=$(pct exec "${CTID}" -- sh -c 'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
+  compose_json=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
     echo "  [!] Could not get compose config"
     return
   }
@@ -145,7 +147,7 @@ fix_mount_permissions() {
     
     # Get UID from image metadata (no container run needed)
     local user_spec uid
-    user_spec=$(pct exec "${CTID}" -- docker image inspect --format '{{.Config.User}}' "$image" 2>/dev/null) || user_spec=""
+    user_spec=$(ct_exec --timeout 30 "docker image inspect --format '{{.Config.User}}' '$image'" 2>/dev/null) || user_spec=""
     
     # Parse user spec: could be "uid", "uid:gid", "username", or empty
     if [[ -z "$user_spec" ]]; then
@@ -154,7 +156,7 @@ fix_mount_permissions() {
       uid="${user_spec%%:*}"  # Extract UID from "uid" or "uid:gid"
     else
       # Username specified - try to resolve, fallback to 0
-      uid=$(pct exec "${CTID}" -- docker run --rm --entrypoint id "$image" -u 2>/dev/null) || uid="0"
+      uid=$(ct_exec --timeout 60 "docker run --rm --entrypoint id '$image' -u" 2>/dev/null) || uid="0"
     fi
     [ -z "$uid" ] && uid="0"
     
@@ -204,6 +206,7 @@ print_summary() {
   echo "Done. CT ${CTID} (${CT_HOSTNAME}) has been refreshed."
 }
 
+
 # Resize CT resources based on size
 resize_ct() {
   if [[ -z "$CT_SIZE" ]]; then
@@ -223,9 +226,10 @@ resize_ct() {
     sleep 2
   fi
   
-  # Apply new resource settings
-  pct set "${CTID}" -cores "${SIZE_CORES}" -memory "${SIZE_MEMORY}"
-  echo "  [✓] CT resized to ${SIZE_CORES} cores, ${SIZE_MEMORY} MB RAM"
+  # Apply new resource settings (swap = half of memory)
+  local swap_size=$((SIZE_MEMORY / 2))
+  pct set "${CTID}" -cores "${SIZE_CORES}" -memory "${SIZE_MEMORY}" -swap "${swap_size}"
+  echo "  [✓] CT resized to ${SIZE_CORES} cores, ${SIZE_MEMORY} MB RAM, ${swap_size} MB swap"
   
   # Restart if it was running
   if [[ "$was_running" == "true" ]]; then
@@ -233,6 +237,21 @@ resize_ct() {
     pct start "${CTID}"
     sleep 3
   fi
+}
+
+# Apply priority (CPU units) if specified
+apply_priority() {
+  if [[ -z "$CT_PRIORITY" ]]; then
+    local current_units
+    current_units=$(pct config "${CTID}" | grep -oP 'cpuunits:\s*\K\d+' || echo "1024")
+    echo "  [i] Priority unchanged (current: ${current_units} CPU units)"
+    return
+  fi
+  
+  echo "Setting priority to ${CT_PRIORITY}..."
+  validate_priority "${CT_PRIORITY}" || exit 1
+  pct set "${CTID}" -cpuunits "${PRIORITY_CPUUNITS}"
+  echo "  [✓] Priority set to ${CT_PRIORITY} (${PRIORITY_CPUUNITS} CPU units)"
 }
 
 # -----------------------------
@@ -259,6 +278,11 @@ main() {
         GPU_PASSTHROUGH=true
         has_options=true
         shift
+        ;;
+      --priority|-p)
+        CT_PRIORITY="$2"
+        has_options=true
+        shift 2
         ;;
       -*)
         echo "Unknown option: $1"
@@ -318,6 +342,8 @@ main() {
     
     status_progress "$current" "$total" "CT ${CTID}: Resizing..."
     resize_ct
+    ensure_swap
+    apply_priority
     
     status_progress "$current" "$total" "CT ${CTID}: Updating packages..."
     update_packages
@@ -340,6 +366,9 @@ main() {
     status_progress "$current" "$total" "CT ${CTID}: Configuring Step CA..."
     configure_step_ca "${CT_HOSTNAME}"
     
+    status_progress "$current" "$total" "CT ${CTID}: Configuring arping service..."
+    configure_arping_service "${CT_HOSTNAME}"
+    
     # Configure GPU passthrough if requested
     if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
       status_progress "$current" "$total" "CT ${CTID}: Configuring GPU..."
@@ -354,6 +383,9 @@ main() {
     
     status_progress "$current" "$total" "CT ${CTID}: Checking DNS..."
     check_dns_health
+    
+    status_progress "$current" "$total" "CT ${CTID}: Running configure script..."
+    run_configure_script
     
     print_summary
   done

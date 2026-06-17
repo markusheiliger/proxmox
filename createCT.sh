@@ -283,21 +283,14 @@ install_docker() {
   ct_exec --timeout 120 '
     set -e
     apk update
-    apk add docker docker-cli-compose
+    apk add docker docker-cli-compose ca-certificates
     rc-update add docker boot
     service docker start || true
   '
 }
 
 # Create docker-compose.yaml template
-create_compose_template() {
-  local compose_file="$1"
-  local domain
-  domain=$(extract_domain_from_hostname "${HOSTNAME}")
-  local template
-  template=$(config_get_compose_template "${domain}") || return 1
-  cp "$template" "$compose_file"
-}
+# create_compose_template is now in commonCT.sh (shared between createCT and refreshCT)
 
 # Update or create .env file with required configuration values
 # Merges values from commonCT.json while preserving user-defined variables
@@ -307,111 +300,31 @@ create_compose_template() {
 #   STEP_CA_URL         - Constructed from domain: https://ca.<domain>/acme/acme/directory
 #   STEP_CA_FINGERPRINT - From commonCT.json: ssl.<domain>.fingerprint
 #   CADDY_EMAIL         - From commonCT.json: ssl.<domain>.email
+#   DNSIMPLE_API_ACCESS_TOKEN - From commonCT.json: ssl.<domain>.dns_api_token (for letsencrypt+dnsimple)
 #
-update_env_file() {
-  local env_file="$1"
-  local domain
-  domain=$(extract_domain_from_hostname "${HOSTNAME}")
-  local ca_name
-  ca_name=$(config_get_ca_name "${domain}")
-  local fingerprint
-  fingerprint=$(config_get_fingerprint "${domain}")
-  local email
-  email=$(config_get_email "${domain}")
-  
-  # Create file if it doesn't exist
-  touch "$env_file"
-  
-  # Function to set or update a key in the .env file
-  set_env_value() {
-    local key="$1"
-    local value="$2"
-    local comment="$3"
-    
-    if grep -q "^${key}=" "$env_file"; then
-      # Update existing key
-      sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
-    else
-      # Add new key with optional comment
-      if [[ -n "$comment" ]]; then
-        echo -e "\n# ${comment}" >> "$env_file"
-      fi
-      echo "${key}=${value}" >> "$env_file"
-    fi
-  }
-  
-  # Update required configuration values
-  set_env_value "HOSTNAME" "${HOSTNAME}" "Site hostname (from CT container)"
-  set_env_value "STEP_CA_URL" "https://${ca_name}/acme/acme/directory" "Step CA configuration (from commonCT.json)"
-  set_env_value "STEP_CA_FINGERPRINT" "${fingerprint}" ""
-  set_env_value "CADDY_EMAIL" "${email}" "Caddy email for ACME (from commonCT.json)"
-  
-  # Add Newt/Pangolin placeholders if not already present
-  if ! grep -q "^NEWT_ID=" "$env_file"; then
-    echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
-    echo "NEWT_ID=" >> "$env_file"
-    echo "NEWT_SECRET=" >> "$env_file"
-    echo "NEWT_ENDPOINT=" >> "$env_file"
-  fi
-  
-  # Clean up multiple blank lines
-  sed -i '/^$/N;/^\n$/d' "$env_file"
-}
+# update_env_file is now in commonCT.sh (shared between createCT and refreshCT)
 
 # Setup bind mounts
-setup_mountpoints() {
-  echo "Registering mountpoints for CT ${CTID}..."
-
-  local hostname_lower
-  hostname_lower=$(echo "$HOSTNAME" | tr '[:upper:]' '[:lower:]')
-
-  DIR_DOCKER="/mnt/docker/${hostname_lower}"
-  DIR_DOCKER_DATA="/mnt/docker-data/${hostname_lower}"
-
-  mkdir -p "$DIR_DOCKER"
-  mkdir -p "$DIR_DOCKER_DATA"
-  mkdir -p "$DIR_DOCKER/caddy/data"
-
-  echo "Created:"
-  echo "  $DIR_DOCKER"
-  echo "  $DIR_DOCKER_DATA"
-
-  COMPOSE_FILE="${DIR_DOCKER}/docker-compose.yaml"
-  ENV_FILE="${DIR_DOCKER}/.env"
-
-  if [[ ! -f "$COMPOSE_FILE" ]]; then
-    echo "Creating template docker-compose.yaml at $COMPOSE_FILE"
-    create_compose_template "$COMPOSE_FILE"
-  fi
-
-  echo "Updating .env at $ENV_FILE"
-  update_env_file "$ENV_FILE"
-
-  echo "Removing existing mountpoints..."
-  for mp in $(pct config "$CTID" | awk -F: '/^mp[0-9]+/ {print $1}'); do
-    echo "  deleting $mp"
-    pct set "$CTID" -delete "$mp"
-  done
-
-  echo "Adding new bind mounts..."
-  pct set "$CTID" -mp0 "${DIR_DOCKER},mp=/mnt/docker"
-  pct set "$CTID" -mp1 "${DIR_DOCKER_DATA},mp=/mnt/docker-data"
-
-  echo "Mountpoints updated."
-}
+# setup_mountpoints is now in commonCT.sh (shared between createCT and refreshCT)
 
 # Wait for condition with timeout
+# Displays a spinning progress indicator while waiting
+# Args: $1 = description, $2 = check command, $3 = timeout (default 30)
 wait_for() {
   local description="$1"
   local check_cmd="$2"
   local timeout="${3:-30}"
+  local spin=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
   for ((i=1; i<=timeout; i++)); do
-    if eval "$check_cmd"; then
+    if eval "$check_cmd" 2>/dev/null; then
+      printf "\r  %s... done.%s\n" "$description" "$(printf ' %.0s' {1..20})"
       return 0
     fi
+    printf "\r  Waiting for %s... %s (%ds/%ds)" "$description" "${spin[$((i % ${#spin[@]}))]}" "$i" "$timeout"
     sleep 1
   done
+  printf "\r  %s... timed out.%s\n" "$description" "$(printf ' %.0s' {1..20})"
   return 1
 }
 
@@ -427,7 +340,7 @@ verify_setup() {
   echo "  [✓] CT is running"
 
   # Wait for Docker daemon
-  if ! wait_for "Docker daemon" "ct_exec --timeout 15 'docker info &>/dev/null'" 30; then
+  if ! wait_for "Docker daemon" "ct_exec --timeout 5 'docker info &>/dev/null'" 300; then
     echo "ERROR: Docker daemon not responding in CT ${CTID}."
     exit 1
   fi
@@ -527,13 +440,42 @@ main() {
   done
 
   # Execute provisioning steps
-  local total_steps=17
+  local total_steps=11
   local step=0
   
   status_bar_init
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Validating hostname..."
   validate_hostname "${HOSTNAME}" || exit 1
+  
+  # Check if a CT with this hostname already exists
+  build_ct_list
+  local existing_ctid=""
+  for id in "${CT_LIST[@]}"; do
+    if [[ "${CT_MAP[$id]}" == "${HOSTNAME}" ]]; then
+      existing_ctid="$id"
+      break
+    fi
+  done
+  
+  if [[ -n "$existing_ctid" ]]; then
+    status_bar_cleanup
+    echo "CT ${existing_ctid} already exists with hostname '${HOSTNAME}'."
+    local answer
+    read -rp "Run refreshCT instead? [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+      # Forward compatible flags to refreshCT.sh
+      local refresh_args=("${existing_ctid}")
+      [[ "$MONITOR_AFTER" == "true" ]] && refresh_args+=("--monitor")
+      [[ -n "$CT_SIZE" ]] && refresh_args+=("--size" "$CT_SIZE")
+      [[ "$GPU_PASSTHROUGH" == "true" ]] && refresh_args+=("--gpu")
+      [[ -n "$CT_PRIORITY" ]] && refresh_args+=("--priority" "$CT_PRIORITY")
+      exec "${SCRIPT_DIR}/refreshCT.sh" "${refresh_args[@]}"
+    else
+      echo "Aborted."
+      exit 0
+    fi
+  fi
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
@@ -551,47 +493,46 @@ main() {
   start_ct
   ensure_swap
   
+  # Wait for network connectivity before installing packages
+  local net_targets=("https://dl-cdn.alpinelinux.org" "https://registry-1.docker.io" "https://ghcr.io")
+  local net_ok=() net_fail=()
+  for target in "${net_targets[@]}"; do
+    local host="${target#https://}"
+    if wait_for "${host}" "ct_exec --timeout 5 'wget --spider -q ${target}'" 30; then
+      net_ok+=("$host")
+    else
+      net_fail+=("$host")
+    fi
+  done
+  if [[ ${#net_ok[@]} -gt 0 ]]; then
+    echo "  [✓] Reachable: ${net_ok[*]}"
+  fi
+  for host in "${net_fail[@]}"; do
+    echo "  [!] Warning: ${host} is not reachable — image pulls may fail"
+  done
+  # Alpine CDN is required for package installation
+  if [[ " ${net_fail[*]} " == *" dl-cdn.alpinelinux.org "* ]]; then
+    echo "ERROR: No network connectivity to Alpine package CDN in CT ${CTID}."
+    exit 1
+  fi
+
   step=$((step + 1)); status_progress "$step" "$total_steps" "Installing Docker..."
   install_docker
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring timezone..."
-  configure_timezone
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Docker logging..."
-  configure_docker_logging "${HOSTNAME}"
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Telegraf..."
-  configure_telegraf "${HOSTNAME}"
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring syslog..."
-  configure_syslog_forwarding "${HOSTNAME}"
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring registries..."
-  configure_registry_logins
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring Step CA..."
-  configure_step_ca "${HOSTNAME}"
-  
-  step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring arping service..."
-  configure_arping_service "${HOSTNAME}"
-  
+
+  step=$((step + 1)); status_progress "$step" "$total_steps" "Applying configuration..."
+  apply_ct_configuration "${CTID}" "${HOSTNAME}" "${GPU_PASSTHROUGH}"
+
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints
-  reboot_ct
-  
-  # Configure GPU passthrough if requested
-  if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
-    status_progress "$step" "$total_steps" "Configuring GPU passthrough..."
-    configure_gpu_passthrough
-  fi
+  reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Verifying setup..."
   verify_setup
   start_compose
-  reboot_ct
+  reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Checking DNS..."
-  check_dns_health "$CTID" "$HOSTNAME"
+  check_dns_health "$CTID" "$HOSTNAME" || echo "  [!] DNS health check failed (non-fatal)"
   
   status_progress "$step" "$total_steps" "Running configure script..."
   run_configure_script

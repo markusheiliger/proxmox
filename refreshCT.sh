@@ -67,20 +67,8 @@ CT_PRIORITY=""
 # FUNCTIONS
 # -----------------------------
 
-# Update and upgrade all packages
-update_packages() {
-  echo "Updating packages in CT ${CTID}..."
-  
-  ct_exec '
-    set -e
-    echo "  Updating package index..."
-    apk update
-    echo "  Upgrading packages..."
-    apk upgrade --no-cache
-  '
-  
-  echo "  [✓] Packages updated"
-}
+# Note: update_packages is now provided by ensure_packages_and_ca in commonCT.sh
+# This legacy function is kept for reference but is no longer called
 
 # Reset Docker and restart compose services
 reset_docker() {
@@ -93,6 +81,32 @@ reset_docker() {
   
   echo "  Found docker-compose.yaml"
   
+  # Ensure Docker daemon is running and responsive.
+  # configure_step_ca may have already restarted Docker, so check first.
+  # If Docker is already responsive, restart to apply daemon.json changes.
+  # If not, wait for the in-progress restart to finish (up to 120s).
+  # Alpine's supervise-daemon uses --retry TERM/60/KILL/10 for the stop phase;
+  # container restoration with cgroupv2 in LXC adds another 30-50s.
+  echo "  Ensuring Docker daemon is ready..."
+  if ct_exec --timeout 10 'docker info >/dev/null 2>&1' 2>/dev/null; then
+    # Docker is responsive — restart to apply any daemon.json changes
+    echo "  Restarting Docker daemon..."
+    ct_exec --timeout 120 'service docker restart >/dev/null 2>&1 || true'
+  fi
+  
+  # Wait for Docker daemon to be responsive (compose config needs it)
+  local max_wait=120
+  local waited=0
+  while ! ct_exec --timeout 10 'docker info >/dev/null 2>&1' 2>/dev/null; do
+    waited=$((waited + 10))
+    if [[ $waited -ge $max_wait ]]; then
+      echo "  [!] Warning: Docker daemon not responding after ${max_wait}s, skipping"
+      return
+    fi
+    sleep 5
+  done
+  echo "  [✓] Docker daemon ready"
+  
   # Validate compose file
   echo "  Validating docker-compose.yaml..."
   if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
@@ -101,11 +115,6 @@ reset_docker() {
     return
   fi
   echo "  [✓] Compose file is valid"
-  
-  # Restart Docker to apply any daemon.json changes
-  echo "  Restarting Docker daemon..."
-  ct_exec --timeout 30 'service docker restart >/dev/null 2>&1 || true'
-  sleep 2
   
   # Pull and deploy
   echo "  Pulling images and deploying..."
@@ -324,11 +333,16 @@ main() {
   local current=0
   
   # Initialize status bar for progress tracking
+  local steps_per_ct=7
+  local total_steps=$((total * steps_per_ct))
+  local overall_step=0
+  
   status_bar_init
   
   for CTID in "${cts_to_process[@]}"; do
     current=$((current + 1))
     CT_HOSTNAME="${CT_MAP[$CTID]}"
+    local base_step=$(( (current - 1) * steps_per_ct ))
     
     echo ""
     echo "=============================================="
@@ -336,55 +350,30 @@ main() {
     echo "=============================================="
     echo ""
     
-    status_progress "$current" "$total" "CT ${CTID}: Starting..."
+    ensure_ct_running || { overall_step=$((base_step + steps_per_ct)); continue; }
     
-    ensure_ct_running || continue
-    
-    status_progress "$current" "$total" "CT ${CTID}: Resizing..."
+    overall_step=$((base_step + 1)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Resizing..."
     resize_ct
     ensure_swap
     apply_priority
     
-    status_progress "$current" "$total" "CT ${CTID}: Updating packages..."
-    update_packages
+    overall_step=$((base_step + 2)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Verifying mountpoints..."
+    setup_mountpoints
     
-    status_progress "$current" "$total" "CT ${CTID}: Configuring timezone..."
-    configure_timezone
+    overall_step=$((base_step + 3)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Applying configuration..."
+    apply_ct_configuration "${CTID}" "${CT_HOSTNAME}" "${GPU_PASSTHROUGH}"
     
-    status_progress "$current" "$total" "CT ${CTID}: Configuring Docker logging..."
-    configure_docker_logging "${CT_HOSTNAME}"
+    overall_step=$((base_step + 4)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Restarting Docker..."
+    reset_docker || echo "  [!] Docker reset failed (non-fatal)"
     
-    status_progress "$current" "$total" "CT ${CTID}: Configuring Telegraf..."
-    configure_telegraf "${CT_HOSTNAME}"
+    overall_step=$((base_step + 5)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Rebooting..."
+    reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
     
-    status_progress "$current" "$total" "CT ${CTID}: Configuring syslog..."
-    configure_syslog_forwarding "${CT_HOSTNAME}"
+    overall_step=$((base_step + 6)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Checking DNS..."
+    check_dns_health || echo "  [!] DNS health check failed (non-fatal)"
     
-    status_progress "$current" "$total" "CT ${CTID}: Configuring registries..."
-    configure_registry_logins
-    
-    status_progress "$current" "$total" "CT ${CTID}: Configuring Step CA..."
-    configure_step_ca "${CT_HOSTNAME}"
-    
-    status_progress "$current" "$total" "CT ${CTID}: Configuring arping service..."
-    configure_arping_service "${CT_HOSTNAME}"
-    
-    # Configure GPU passthrough if requested
-    if [[ "$GPU_PASSTHROUGH" == "true" ]]; then
-      status_progress "$current" "$total" "CT ${CTID}: Configuring GPU..."
-      configure_gpu_passthrough
-    fi
-    
-    status_progress "$current" "$total" "CT ${CTID}: Restarting Docker..."
-    reset_docker
-    
-    status_progress "$current" "$total" "CT ${CTID}: Rebooting..."
-    reboot_ct
-    
-    status_progress "$current" "$total" "CT ${CTID}: Checking DNS..."
-    check_dns_health
-    
-    status_progress "$current" "$total" "CT ${CTID}: Running configure script..."
+    overall_step=$((base_step + 7)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Running configure script..."
+    get_ct_dirs
     run_configure_script
     
     print_summary

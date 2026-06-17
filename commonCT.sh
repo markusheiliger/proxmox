@@ -45,15 +45,21 @@
 #   compose_up             Start Docker Compose services in CT
 #   compose_down           Stop Docker Compose services in CT
 #   extract_domain_from_hostname  Extract domain from hostname
+#   flush_local_dns_cache  Flush host local DNS resolver cache (best effort)
 #   resolve_dns_with_retry Resolve DNS with retry loop (sets DNS_RESOLVED_IP)
 #   check_dns_health       Check and auto-fix DNS via UDM Pro API
 #
 # CONFIG FUNCTIONS (read from commonCT.json):
 #   config_exists          Check if config file exists
 #   config_get_domains     Get list of configured domains
+#   config_get_primary_domain Get primary domain (first domain in config)
 #   config_domain_exists   Check if domain is configured
 #   config_get_fingerprint Get SSL fingerprint for domain
 #   config_get_email       Get email for domain
+#   config_get_ssl_type    Get SSL type for domain (step_ca, letsencrypt)
+#   config_get_dns_provider Get DNS provider for domain SSL config
+#   config_get_dns_api_token Get DNS API token for domain SSL config
+#   config_get_dns_account_id Get DNS account id for domain SSL config
 #   config_get_ca_name     Get CA name for domain
 #   config_get_compose_template  Get compose template path for domain
 #   config_size_exists     Check if size is defined
@@ -72,6 +78,8 @@
 #   config_get_udmpro_host Get UDM Pro host address
 #   config_get_udmpro_apikey Get UDM Pro API key
 #   config_udmpro_configured Check if UDM Pro is configured
+#   config_get_splitdns_hostname Get split DNS CT hostname
+#   config_splitdns_configured Check if split DNS is configured
 #   udmpro_make_static    Set static IP and local DNS on UDM Pro client
 #
 # PROVIDED VARIABLES:
@@ -194,6 +202,15 @@ config_get_domains() {
   jq -r '.domains[]' "${CONFIG_FILE}"
 }
 
+# Get primary domain (first domain in config)
+# Returns: domain string or empty
+config_get_primary_domain() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.domains[0] // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
 # Check if domain is configured
 # Args: $1 = domain name
 # Returns: 0 if configured, 1 if not
@@ -225,6 +242,50 @@ config_get_email() {
     return 1
   fi
   jq -r --arg d "$domain" '.ssl[$d].email // empty' "${CONFIG_FILE}"
+}
+
+# Get SSL type for domain
+# Args: $1 = domain name
+# Returns: SSL type string (e.g., step_ca, letsencrypt) or empty if not found
+config_get_ssl_type() {
+  local domain="$1"
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r --arg d "$domain" '.ssl[$d].type // empty' "${CONFIG_FILE}"
+}
+
+# Get DNS provider for domain
+# Args: $1 = domain name
+# Returns: provider string (e.g., dnsimple) or empty if not found
+config_get_dns_provider() {
+  local domain="$1"
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r --arg d "$domain" '.ssl[$d].dns_provider // empty' "${CONFIG_FILE}"
+}
+
+# Get DNS API token for domain
+# Args: $1 = domain name
+# Returns: token string or empty if not found
+config_get_dns_api_token() {
+  local domain="$1"
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r --arg d "$domain" '.ssl[$d].dns_api_token // empty' "${CONFIG_FILE}"
+}
+
+# Get DNS account id for domain
+# Args: $1 = domain name
+# Returns: account id string or empty if not found
+config_get_dns_account_id() {
+  local domain="$1"
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r --arg d "$domain" '.ssl[$d].dns_account_id // empty' "${CONFIG_FILE}"
 }
 
 # Get CA name for domain
@@ -500,6 +561,23 @@ config_udmpro_configured() {
   [[ -n "$host" && -n "$apikey" ]]
 }
 
+# Get split DNS CT hostname
+# Returns: hostname or empty
+config_get_splitdns_hostname() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.splitdns.hostname // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Check if split DNS is configured
+# Returns: 0 if configured (hostname set), 1 if not
+config_splitdns_configured() {
+  local hostname
+  hostname=$(config_get_splitdns_hostname)
+  [[ -n "$hostname" ]]
+}
+
 # -----------------------------
 # AUTHENTIK CONFIGURATION FUNCTIONS
 # -----------------------------
@@ -558,13 +636,62 @@ config_authentik_configured() {
   [[ -n "$host" && -n "$token" ]]
 }
 
-# Set static IP and local DNS record on UDM Pro client
-# Finds client by MAC address and configures fixed IP + local DNS name
+# -----------------------------
+# TELEMETRY CONFIGURATION FUNCTIONS
+# -----------------------------
+
+# Get telemetry hostname
+# Returns: hostname or empty
+config_get_telemetry_hostname() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.telemetry.hostname // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get telemetry fluentd port
+# Returns: port number or empty
+config_get_telemetry_fluentd_port() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.telemetry.fluentd_port // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get telemetry OTLP port
+# Returns: port number or empty
+config_get_telemetry_otlp_port() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.telemetry.otlp_port // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get telemetry syslog port
+# Returns: port number or empty
+config_get_telemetry_syslog_port() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.telemetry.syslog_port // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Check if telemetry is configured
+# Returns: 0 if configured (hostname set), 1 if not
+config_telemetry_configured() {
+  local hostname
+  hostname=$(config_get_telemetry_hostname)
+  [[ -n "$hostname" ]]
+}
+
+# Set static IP and alias on UDM Pro for all CTs.
+# Set local DNS record only when CT domain matches the primary domain
+# (first entry in .domains[] in commonCT.json, case-insensitive).
 #
 # Args:
 #   $1 - CT MAC address
 #   $2 - CT IP address
-#   $3 - CT hostname (FQDN for local DNS record)
+#   $3 - CT hostname (FQDN, also used as alias)
 # Returns: 0 on success, 1 on error (client not found or API failure)
 udmpro_make_static() {
   local ct_mac="$1"
@@ -604,42 +731,69 @@ udmpro_make_static() {
     echo "  [!] Client with MAC ${ct_mac} not found in UDM Pro"
     return 1
   fi
+
+  local ct_domain primary_domain set_local_dns
+  ct_domain="${ct_hostname#*.}"
+  primary_domain=$(config_get_primary_domain)
+  set_local_dns=true
+  if [[ -n "$primary_domain" && "${ct_domain,,}" != "${primary_domain,,}" ]]; then
+    set_local_dns=false
+  fi
   
-  # Clear conflicting DNS record from other clients (e.g., stale entries after CT recreation)
-  local conflicting_ids
-  conflicting_ids=$(echo "$all_clients" | jq -r --arg dns "$ct_hostname" --arg self "$client_id" \
-    '.data[] | select(.local_dns_record == $dns and .local_dns_record_enabled == true and ._id != $self) | ._id' 2>/dev/null || true)
-  
-  if [[ -n "$conflicting_ids" ]]; then
-    while IFS= read -r stale_id; do
-      [[ -z "$stale_id" ]] && continue
-      local stale_mac
-      stale_mac=$(echo "$all_clients" | jq -r --arg id "$stale_id" '.data[] | select(._id == $id) | .mac' 2>/dev/null || true)
-      echo "    Clearing stale DNS record from client ${stale_id} (MAC: ${stale_mac})"
-      curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
-        "https://${udm_host}/proxy/network/api/s/default/rest/user/${stale_id}" \
-        -d '{"local_dns_record_enabled": false, "local_dns_record": ""}' >/dev/null 2>&1 || true
-    done <<< "$conflicting_ids"
+  # Clear conflicting DNS record from other clients only when we set local DNS.
+  if [[ "$set_local_dns" == "true" ]]; then
+    local conflicting_ids
+    conflicting_ids=$(echo "$all_clients" | jq -r --arg dns "$ct_hostname" --arg self "$client_id" \
+      '.data[] | select(.local_dns_record == $dns and .local_dns_record_enabled == true and ._id != $self) | ._id' 2>/dev/null || true)
+
+    if [[ -n "$conflicting_ids" ]]; then
+      while IFS= read -r stale_id; do
+        [[ -z "$stale_id" ]] && continue
+        local stale_mac
+        stale_mac=$(echo "$all_clients" | jq -r --arg id "$stale_id" '.data[] | select(._id == $id) | .mac' 2>/dev/null || true)
+        echo "    Clearing stale DNS record from client ${stale_id} (MAC: ${stale_mac})"
+        curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
+          "https://${udm_host}/proxy/network/api/s/default/rest/user/${stale_id}" \
+          -d '{"local_dns_record_enabled": false, "local_dns_record": ""}' >/dev/null 2>&1 || true
+      done <<< "$conflicting_ids"
+    fi
   fi
   
   echo "    Client ID: ${client_id}"
   echo "    Setting static IP: ${ct_ip}"
-  echo "    Setting local DNS: ${ct_hostname}"
   echo "    Setting alias: ${ct_hostname}"
+  if [[ "$set_local_dns" == "true" ]]; then
+    echo "    Setting local DNS: ${ct_hostname} (primary domain)"
+  else
+    echo "    Skipping local DNS record on UDM Pro (non-primary domain; expects domain forwarding)"
+  fi
   
-  # Update client with fixed IP, local DNS record, and alias name
+  # Update client with fixed IP and alias. Local DNS is conditional by domain.
   local update_payload
-  update_payload=$(jq -n \
-    --arg ip "$ct_ip" \
-    --arg dns "$ct_hostname" \
-    --arg name "$ct_hostname" \
-    '{
-      use_fixedip: true,
-      fixed_ip: $ip,
-      local_dns_record_enabled: true,
-      local_dns_record: $dns,
-      name: $name
-    }')
+  if [[ "$set_local_dns" == "true" ]]; then
+    update_payload=$(jq -n \
+      --arg ip "$ct_ip" \
+      --arg dns "$ct_hostname" \
+      --arg name "$ct_hostname" \
+      '{
+        use_fixedip: true,
+        fixed_ip: $ip,
+        local_dns_record_enabled: true,
+        local_dns_record: $dns,
+        name: $name
+      }')
+  else
+    update_payload=$(jq -n \
+      --arg ip "$ct_ip" \
+      --arg name "$ct_hostname" \
+      '{
+        use_fixedip: true,
+        fixed_ip: $ip,
+        local_dns_record_enabled: false,
+        local_dns_record: "",
+        name: $name
+      }')
+  fi
   
   local update_result
   update_result=$(curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
@@ -719,26 +873,31 @@ configure_docker_logging() {
     return
   fi
 
-  # Skip for otel host itself (avoid loop)
-  if [[ "${ct_hostname}" =~ ^otel\. ]]; then
-    echo "Skipping log forwarding for OTEL host (would loop)."
+  # Skip for telemetry host itself (avoid loop)
+  local telemetry_host
+  telemetry_host=$(config_get_telemetry_hostname)
+  if [[ "${ct_hostname}" == "${telemetry_host}" ]]; then
+    echo "Skipping log forwarding for telemetry host (would loop)."
     return
   fi
 
+  if ! config_telemetry_configured; then
+    echo "  [!] Telemetry not configured, skipping log forwarding"
+    return
+  fi
+
+  local fluentd_port
+  fluentd_port=$(config_get_telemetry_fluentd_port)
+
   echo "Configuring Docker log forwarding to OTEL..."
-
-  local domain otel_host
-  domain=$(extract_domain_from_hostname "${ct_hostname}")
-  otel_host="otel.${domain}"
-
-  echo "  Log target: ${otel_host}:24224"
+  echo "  Log target: ${telemetry_host}:${fluentd_port}"
   echo "  Tag format: ${ct_hostname}.{{.Name}}"
 
   # Build daemon.json using jq
   # Tag format: hostname.containername (e.g., seafile.thesaints.home.seafile-db)
   local daemon_json
   daemon_json=$(jq -n \
-    --arg addr "${otel_host}:24224" \
+    --arg addr "${telemetry_host}:${fluentd_port}" \
     --arg hostname "${ct_hostname}" \
     '{
       "log-driver": "fluentd",
@@ -772,13 +931,32 @@ configure_telegraf() {
     return
   fi
 
-  echo "Configuring Telegraf metrics collection..."
+  # Disable Telegraf on the telemetry host itself (avoid self-reporting)
+  local telemetry_host
+  telemetry_host=$(config_get_telemetry_hostname)
+  if [[ "${ct_hostname}" == "${telemetry_host}" ]]; then
+    echo "Disabling Telegraf on telemetry host (avoid self-reporting)..."
+    ct_exec --timeout 15 '
+      rc-service telegraf stop >/dev/null 2>&1 || true
+      rc-update del telegraf default >/dev/null 2>&1 || true
+    '
+    echo "  [✓] Telegraf disabled on telemetry host"
+    return
+  fi
 
-  local domain otel_host
+  if ! config_telemetry_configured; then
+    echo "  [!] Telemetry not configured, skipping Telegraf"
+    return
+  fi
+
+  local otlp_port
+  otlp_port=$(config_get_telemetry_otlp_port)
+
+  local domain
   domain=$(extract_domain_from_hostname "${ct_hostname}")
-  otel_host="otel.${domain}"
 
-  echo "  Metrics target: ${otel_host}:4317"
+  echo "Configuring Telegraf metrics collection..."
+  echo "  Metrics target: ${telemetry_host}:${otlp_port}"
 
   # Check if telegraf is installed
   local telegraf_installed
@@ -817,7 +995,7 @@ configure_telegraf() {
   omit_hostname = false
 
 [[outputs.opentelemetry]]
-  service_address = \"${otel_host}:4317\"
+  service_address = \"${telemetry_host}:${otlp_port}\"
   [outputs.opentelemetry.attributes]
     \"service.name\" = \"${ct_hostname}\"
     \"service.namespace\" = \"${domain}\"
@@ -900,34 +1078,39 @@ configure_syslog_forwarding() {
     return
   fi
 
-  # Skip for otel host itself (avoid loop)
-  if [[ "${ct_hostname}" =~ ^otel\. ]]; then
-    echo "Skipping syslog forwarding for OTEL host (would loop)."
+  # Skip for telemetry host itself (avoid loop)
+  local telemetry_host
+  telemetry_host=$(config_get_telemetry_hostname)
+  if [[ "${ct_hostname}" == "${telemetry_host}" ]]; then
+    echo "Skipping syslog forwarding for telemetry host (would loop)."
     return
   fi
 
+  if ! config_telemetry_configured; then
+    echo "  [!] Telemetry not configured, skipping syslog forwarding"
+    return
+  fi
+
+  local syslog_port
+  syslog_port=$(config_get_telemetry_syslog_port)
+
   echo "Configuring syslog forwarding..."
-
-  local domain otel_host
-  domain=$(extract_domain_from_hostname "${ct_hostname}")
-  otel_host="otel.${domain}"
-
-  echo "  Syslog target: ${otel_host}:514"
+  echo "  Syslog target: ${telemetry_host}:${syslog_port}"
 
   # Alpine uses busybox syslogd - configure remote logging
   ct_exec --timeout 30 "
     # Check current config
     current_opts=\$(grep '^SYSLOGD_OPTS=' /etc/conf.d/syslog 2>/dev/null || echo '')
-    expected_opts='SYSLOGD_OPTS=\"-t -L -R ${otel_host}:514\"'
+    expected_opts='SYSLOGD_OPTS=\"-t -L -R ${telemetry_host}:${syslog_port}\"'
     
     if [ \"\$current_opts\" = \"\$expected_opts\" ]; then
       echo '  Syslog already configured correctly'
     else
       # Update syslogd config to forward to remote
       if grep -q '^SYSLOGD_OPTS=' /etc/conf.d/syslog 2>/dev/null; then
-        sed -i 's|^SYSLOGD_OPTS=.*|SYSLOGD_OPTS=\"-t -L -R ${otel_host}:514\"|' /etc/conf.d/syslog
+        sed -i 's|^SYSLOGD_OPTS=.*|SYSLOGD_OPTS=\"-t -L -R ${telemetry_host}:${syslog_port}\"|' /etc/conf.d/syslog
       else
-        echo 'SYSLOGD_OPTS=\"-t -L -R ${otel_host}:514\"' >> /etc/conf.d/syslog
+        echo 'SYSLOGD_OPTS=\"-t -L -R ${telemetry_host}:${syslog_port}\"' >> /etc/conf.d/syslog
       fi
       # Restart syslog service (backgrounded to avoid blocking on DNS resolution)
       service syslog restart >/dev/null 2>&1 &
@@ -936,6 +1119,60 @@ configure_syslog_forwarding() {
   "
   
   echo "  [✓] Syslog forwarding configured"
+}
+
+# Ensure system packages and CA certificates are current
+# Detects package manager (apk/apt-get/dnf) and runs full update/upgrade
+# Ensures ca-certificates package is installed and trust store is refreshed
+# Idempotent: safe to run multiple times
+# Args:
+#   $1 - CTID (optional, defaults to global CTID)
+# Returns: 0 on success, 1 on error (non-fatal)
+ensure_packages_and_ca() {
+  local ctid="${1:-${CTID}}"
+  
+  echo "Ensuring packages and CA certificates are current..."
+  
+  if ! ct_exec --timeout 180 "${ctid}" '
+    set -e
+    
+    # Detect package manager and update
+    if command -v apk >/dev/null 2>&1; then
+      echo "  Using Alpine Linux (apk)"
+      apk update
+      apk upgrade --no-cache
+      # Ensure ca-certificates and jq are installed
+      apk add --no-cache ca-certificates jq 2>/dev/null || true
+    elif command -v apt-get >/dev/null 2>&1; then
+      echo "  Using Debian/Ubuntu (apt-get)"
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
+      # Ensure ca-certificates and jq are installed
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates jq 2>/dev/null || true
+    elif command -v dnf >/dev/null 2>&1; then
+      echo "  Using RHEL/Fedora (dnf)"
+      dnf check-update -q || true
+      dnf upgrade -y -q
+      # Ensure ca-certificates and jq are installed
+      dnf install -y -q ca-certificates jq 2>/dev/null || true
+    else
+      echo "  [!] Unknown package manager"
+      exit 1
+    fi
+    
+    # Refresh CA trust store (distro-agnostic)
+    if command -v update-ca-certificates >/dev/null 2>&1; then
+      update-ca-certificates
+    elif command -v update-ca-trust >/dev/null 2>&1; then
+      update-ca-trust
+    fi
+  ' 2>/dev/null; then
+    echo "  [!] Warning: Package/CA update failed (continuing)"
+    return 0  # Non-fatal - continue provisioning
+  fi
+  
+  echo "  [✓] Packages and CA certificates current"
+  return 0
 }
 
 # Configure Step CA root certificate trust
@@ -953,10 +1190,20 @@ configure_step_ca() {
     return
   fi
 
+  local domain
+  domain=$(extract_domain_from_hostname "${ct_hostname}")
+
+  # Skip for non-step_ca SSL types
+  local ssl_type
+  ssl_type=$(config_get_ssl_type "${domain}")
+  if [[ "$ssl_type" != "step_ca" ]]; then
+    echo "Skipping Step CA setup (SSL type: ${ssl_type:-unknown})"
+    return
+  fi
+
   echo "Configuring Step CA trust..."
 
-  local domain ca_name fingerprint
-  domain=$(extract_domain_from_hostname "${ct_hostname}")
+  local ca_name fingerprint
   ca_name=$(config_get_ca_name "${domain}")
   fingerprint=$(config_get_fingerprint "${domain}")
 
@@ -986,8 +1233,18 @@ configure_step_ca() {
 
   # Install root CA to system trust store (for Docker containers)
   echo "  Installing root CA to system trust store..."
-  if ct_exec --timeout 30 "cp /root/.step/certs/root_ca.crt /usr/local/share/ca-certificates/step-ca-root.crt && update-ca-certificates" >/dev/null 2>&1; then
-    echo "  [✓] Root CA added to system trust store"
+  if ct_exec --timeout 30 "cp /root/.step/certs/root_ca.crt /usr/local/share/ca-certificates/step-ca-root.crt" >/dev/null 2>&1; then
+    # Refresh trust store to include newly added cert
+    if ct_exec --timeout 30 'update-ca-certificates' >/dev/null 2>&1; then
+      echo "  [✓] Root CA added to system trust store"
+      # Restart Docker so it picks up the new CA cert.
+      # Alpine's supervise-daemon stop phase can take up to 70s;
+      # container restoration adds another 30-50s.
+      echo "  Restarting Docker to reload trust store..."
+      ct_exec --timeout 120 'service docker restart >/dev/null 2>&1 || true'
+    else
+      echo "  [!] Warning: Failed to refresh CA trust store"
+    fi
   else
     echo "  [!] Warning: Failed to add root CA to system trust store"
   fi
@@ -1086,6 +1343,32 @@ echo "* * * * * /usr/local/bin/arping-gw.sh" >> /etc/crontabs/root'
   fi
 
   echo "  [✓] Arping gateway service configured"
+}
+
+# Apply the standard CT configuration sequence.
+# Consolidates the 8 idempotent config steps shared by createCT and refreshCT
+# into a single call.  Each step prints its own [✓] output.
+# Args:
+#   $1 - CTID (defaults to global $CTID)
+#   $2 - CT hostname (defaults to $CT_HOSTNAME or $HOSTNAME)
+#   $3 - GPU passthrough flag ("true" to enable, optional)
+apply_ct_configuration() {
+  local ctid="${1:-${CTID}}"
+  local hostname="${2:-${CT_HOSTNAME:-${HOSTNAME}}}"
+  local gpu="${3:-false}"
+
+  ensure_packages_and_ca "${ctid}"
+  configure_timezone
+  configure_docker_logging "${hostname}"
+  configure_telegraf "${hostname}"
+  configure_syslog_forwarding "${hostname}"
+  configure_registry_logins
+  configure_step_ca "${hostname}"
+  configure_arping_service "${hostname}"
+
+  if [[ "$gpu" == "true" ]]; then
+    configure_gpu_passthrough
+  fi
 }
 
 # Configure Authentik forward auth for a CT
@@ -1483,6 +1766,13 @@ compose_up() {
   newt_id=$(config_get_newt_id "$hostname")
   newt_secret=$(config_get_newt_secret "$hostname")
   newt_endpoint=$(config_get_newt_endpoint "$hostname")
+
+  # Determine TLS provider env requirements for this CT domain
+  local domain ssl_type dns_provider dns_api_token
+  domain=$(extract_domain_from_hostname "$hostname")
+  ssl_type=$(config_get_ssl_type "$domain")
+  dns_provider=$(config_get_dns_provider "$domain")
+  dns_api_token=$(config_get_dns_api_token "$domain")
   
   # Update .env file with newt values
   local hostname_lower
@@ -1490,23 +1780,32 @@ compose_up() {
   local env_file="/mnt/docker/${hostname_lower}/.env"
   
   if [[ -f "$env_file" ]]; then
+    set_or_add_env() {
+      local key="$1"
+      local value="$2"
+      if grep -q "^${key}=" "$env_file"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+      else
+        echo "${key}=${value}" >> "$env_file"
+      fi
+    }
+
+    remove_env() {
+      local key="$1"
+      sed -i "/^${key}=/d" "$env_file"
+    }
+
     # Update or add NEWT values
-    if grep -q "^NEWT_ID=" "$env_file"; then
-      sed -i "s|^NEWT_ID=.*|NEWT_ID=${newt_id}|" "$env_file"
+    set_or_add_env "NEWT_ID" "${newt_id}"
+    set_or_add_env "NEWT_SECRET" "${newt_secret}"
+    set_or_add_env "NEWT_ENDPOINT" "${newt_endpoint}"
+
+    # Keep DNS provider credentials aligned with the CT domain SSL config.
+    if [[ "$ssl_type" == "letsencrypt" && "$dns_provider" == "dnsimple" && -n "$dns_api_token" ]]; then
+      set_or_add_env "DNSIMPLE_API_ACCESS_TOKEN" "${dns_api_token}"
     else
-      echo "NEWT_ID=${newt_id}" >> "$env_file"
-    fi
-    
-    if grep -q "^NEWT_SECRET=" "$env_file"; then
-      sed -i "s|^NEWT_SECRET=.*|NEWT_SECRET=${newt_secret}|" "$env_file"
-    else
-      echo "NEWT_SECRET=${newt_secret}" >> "$env_file"
-    fi
-    
-    if grep -q "^NEWT_ENDPOINT=" "$env_file"; then
-      sed -i "s|^NEWT_ENDPOINT=.*|NEWT_ENDPOINT=${newt_endpoint}|" "$env_file"
-    else
-      echo "NEWT_ENDPOINT=${newt_endpoint}" >> "$env_file"
+      # Avoid leaking DNSimple vars into non-dnsimple or internal domains.
+      remove_env "DNSIMPLE_API_ACCESS_TOKEN"
     fi
   fi
   
@@ -1516,8 +1815,44 @@ compose_up() {
     profile_flag="--profile published"
     echo "  Newt tunnel enabled (published profile)"
   fi
-  
-  ct_exec --timeout 300 "${ctid}" "cd /mnt/docker && docker compose ${profile_flag} up -d --pull always --remove-orphans"
+
+  local max_attempts=3
+  local attempt output
+  local compose_cmd="cd /mnt/docker && docker compose ${profile_flag} up -d --pull always --remove-orphans"
+
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    echo "  Starting services (attempt ${attempt}/${max_attempts})..."
+
+    if output=$(ct_exec --timeout 300 "${ctid}" "${compose_cmd}" 2>&1); then
+      [[ -n "$output" ]] && echo "$output"
+      return 0
+    fi
+
+    [[ -n "$output" ]] && echo "$output"
+
+    # Retry transient registry/network failures
+    if echo "$output" | grep -qiE 'TLS handshake timeout|i/o timeout|Client\.Timeout exceeded|temporary failure|no such host'; then
+      if [[ $attempt -lt $max_attempts ]]; then
+        echo "  [!] Transient registry/network error detected; restarting Docker and retrying..."
+        ct_exec --timeout 120 "${ctid}" 'service docker restart >/dev/null 2>&1 || true'
+        # Wait for Docker daemon to be responsive before retrying
+        local waited=0
+        while ! ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; do
+          waited=$((waited + 5))
+          if [[ $waited -ge 120 ]]; then
+            echo "  [!] Docker daemon not responsive after restart (${waited}s)"
+            return 1
+          fi
+          sleep 5
+        done
+        continue
+      fi
+    fi
+
+    return 1
+  done
+
+  return 1
 }
 
 # Stop Docker Compose services in a CT
@@ -1638,6 +1973,49 @@ resolve_dns_with_retry() {
   return 1
 }
 
+# Flush local DNS cache on the Proxmox host (best effort)
+# Handles common resolver stacks. Non-fatal if no known cache service exists.
+# Returns: 0 always
+flush_local_dns_cache() {
+  local flushed=false
+
+  # systemd-resolved
+  if command -v resolvectl >/dev/null 2>&1; then
+    if resolvectl flush-caches >/dev/null 2>&1; then
+      flushed=true
+    fi
+  elif command -v systemd-resolve >/dev/null 2>&1; then
+    if systemd-resolve --flush-caches >/dev/null 2>&1; then
+      flushed=true
+    fi
+  fi
+
+  # nscd
+  if command -v nscd >/dev/null 2>&1; then
+    if nscd -i hosts >/dev/null 2>&1; then
+      flushed=true
+    fi
+  fi
+
+  # dnsmasq / unbound cache via service manager
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet dnsmasq 2>/dev/null && systemctl reload dnsmasq >/dev/null 2>&1; then
+      flushed=true
+    fi
+    if systemctl is-active --quiet unbound 2>/dev/null && systemctl reload unbound >/dev/null 2>&1; then
+      flushed=true
+    fi
+  fi
+
+  if [[ "$flushed" == "true" ]]; then
+    echo "  Local DNS cache flushed"
+  else
+    echo "  [i] No local DNS cache service detected to flush"
+  fi
+
+  return 0
+}
+
 # Check DNS configuration for a CT, configure static IP/DNS if needed
 # 
 # Flow:
@@ -1662,7 +2040,16 @@ check_dns_health() {
   local ct_ip ct_mac
   
   # Get IP from inside the CT (uses grep+tr+cut for BusyBox compatibility)
-  ct_ip=$(ct_exec --timeout 15 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
+  # Retry a few times — DHCP may not be ready immediately after reboot
+  local ip_retries=5
+  ct_ip=""
+  while [[ -z "$ct_ip" && $ip_retries -gt 0 ]]; do
+    ct_ip=$(ct_exec --timeout 15 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
+    if [[ -z "$ct_ip" ]]; then
+      ip_retries=$((ip_retries - 1))
+      [[ $ip_retries -gt 0 ]] && sleep 2
+    fi
+  done
   if [[ -z "$ct_ip" ]]; then
     echo "  [!] Could not get IP from CT ${ctid}"
     return 1
@@ -1683,10 +2070,25 @@ check_dns_health() {
   # Always run (idempotent) to ensure device properties are set
   # -------------------------
   udmpro_make_static "$ct_mac" "$ct_ip" "$hostname" || true
+
+  # For non-primary domains, refresh split DNS mapping before resolution checks.
+  local primary_domain hostname_domain
+  primary_domain=$(config_get_primary_domain)
+  hostname_domain=$(extract_domain_from_hostname "$hostname")
+  if [[ -n "$primary_domain" && "${hostname_domain,,}" != "${primary_domain,,}" ]]; then
+    if config_splitdns_configured; then
+      echo "  Refreshing split DNS configuration..."
+      "${SCRIPT_DIR}/forwardDNSCT.sh" || echo "  [!] Split DNS refresh failed (non-fatal)"
+    else
+      echo "  [i] splitdns.hostname not configured, skipping split DNS refresh"
+    fi
+  fi
   
   # -------------------------
   # Check DNS
   # -------------------------
+  flush_local_dns_cache
+
   echo -n "  Checking DNS resolution..."
   
   if resolve_dns_with_retry "$hostname" "$ct_ip"; then
@@ -1704,6 +2106,8 @@ check_dns_health() {
   fi
   
   echo -n "  Waiting for DNS propagation..."
+
+  flush_local_dns_cache
   
   # Wait for DNS to propagate and verify it matches
   if resolve_dns_with_retry "$hostname" "$ct_ip"; then
@@ -2045,7 +2449,8 @@ run_configure_script() {
     return 0
   fi
 
-  echo "Running per-CT configure script..."
+  echo ""
+  echo "--- configure.sh (${CT_HOSTNAME}) ---"
 
   # Ensure the script is executable
   chmod +x "$configure_script"
@@ -2089,11 +2494,194 @@ run_configure_script() {
   done
 
   # Run the script inside the CT with injected env vars
-  if ct_exec --timeout 120 "cd /mnt/docker && ${env_prefix}bash ./_config/configure.sh '${CT_HOSTNAME}'" 2>&1; then
-    echo "  [✓] Configure script completed"
+  if ct_exec --timeout 120 "cd /mnt/docker && ${env_prefix}sh ./_config/configure.sh '${CT_HOSTNAME}'" 2>&1; then
+    echo "--- [✓] configure.sh completed ---"
+    echo ""
   else
-    echo "  [!] Configure script failed (exit code $?) — continuing"
-    return 0  # Non-fatal
+    echo "--- [!] configure.sh failed (exit code $?) ---"
+    echo ""
+    return 1
+  fi
+}
+
+
+# Update or create .env file with required configuration values
+# Merges values from commonCT.json while preserving user-defined variables
+#
+# Values and their sources:
+#   HOSTNAME            - Argument passed to createCT.sh (e.g., app.thesaints.home)
+#   STEP_CA_URL         - Constructed from domain: https://ca.<domain>/acme/acme/directory
+#   STEP_CA_FINGERPRINT - From commonCT.json: ssl.<domain>.fingerprint
+#   CADDY_EMAIL         - From commonCT.json: ssl.<domain>.email
+#   DNSIMPLE_API_ACCESS_TOKEN - From commonCT.json: ssl.<domain>.dns_api_token (for letsencrypt+dnsimple)
+#
+update_env_file() {
+  local env_file="$1"
+  local target_hostname="${CT_HOSTNAME:-${HOSTNAME:-}}"
+  if [[ -z "$target_hostname" ]]; then
+    echo "ERROR: No hostname available for update_env_file"
+    return 1
+  fi
+  local domain
+  domain=$(extract_domain_from_hostname "${target_hostname}")
+  local ssl_type
+  ssl_type=$(config_get_ssl_type "${domain}")
+  local dns_provider dns_api_token
+  dns_provider=$(config_get_dns_provider "${domain}")
+  dns_api_token=$(config_get_dns_api_token "${domain}")
+  local email
+  email=$(config_get_email "${domain}")
+  
+  # Create file if it doesn't exist
+  touch "$env_file"
+  
+  # Function to set or update a key in the .env file
+  set_env_value() {
+    local key="$1"
+    local value="$2"
+    local comment="$3"
+    
+    if grep -q "^${key}=" "$env_file"; then
+      # Update existing key
+      sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+    else
+      # Add new key with optional comment
+      if [[ -n "$comment" ]]; then
+        echo -e "\n# ${comment}" >> "$env_file"
+      fi
+      echo "${key}=${value}" >> "$env_file"
+    fi
+  }
+
+  # Remove a key if present (used for provider-specific cleanup)
+  remove_env_key() {
+    local key="$1"
+    sed -i "/^${key}=/d" "$env_file"
+  }
+  
+  # Update required configuration values
+  set_env_value "HOSTNAME" "${target_hostname}" "Site hostname (from CT container)"
+  set_env_value "CADDY_EMAIL" "${email}" "Caddy email for ACME (from commonCT.json)"
+  
+  if [[ "$ssl_type" == "step_ca" ]]; then
+    local ca_name
+    ca_name=$(config_get_ca_name "${domain}")
+    local fingerprint
+    fingerprint=$(config_get_fingerprint "${domain}")
+    set_env_value "STEP_CA_URL" "https://${ca_name}/acme/acme/directory" "Step CA configuration (from commonCT.json)"
+    set_env_value "STEP_CA_FINGERPRINT" "${fingerprint}" ""
+  fi
+
+  # Inject DNS provider credentials only for letsencrypt + dnsimple domains.
+  if [[ "$ssl_type" == "letsencrypt" && "$dns_provider" == "dnsimple" && -n "$dns_api_token" ]]; then
+    set_env_value "DNSIMPLE_API_ACCESS_TOKEN" "${dns_api_token}" "DNSimple DNS challenge credentials (from commonCT.json)"
+  else
+    remove_env_key "DNSIMPLE_API_ACCESS_TOKEN"
+  fi
+  
+  # Add Newt/Pangolin placeholders if not already present
+  if ! grep -q "^NEWT_ID=" "$env_file"; then
+    echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
+    echo "NEWT_ID=" >> "$env_file"
+    echo "NEWT_SECRET=" >> "$env_file"
+    echo "NEWT_ENDPOINT=" >> "$env_file"
+  fi
+  
+  # Clean up multiple blank lines
+  sed -i '/^$/N;/^\n$/d' "$env_file"
+}
+
+# Copy docker-compose template from config to target file
+# Args: $1 = target compose file path
+create_compose_template() {
+  local compose_file="$1"
+  local target_hostname="${CT_HOSTNAME:-${HOSTNAME:-}}"
+  if [[ -z "$target_hostname" ]]; then
+    echo "ERROR: No hostname available for create_compose_template"
+    return 1
+  fi
+  local domain
+  domain=$(extract_domain_from_hostname "${target_hostname}")
+  local template
+  template=$(config_get_compose_template "${domain}") || return 1
+  cp "$template" "$compose_file"
+}
+
+# Register/verify container mountpoints
+# Idempotent: checks if mounts are correct before modifying
+# Args: (none - uses $CTID and CT hostname from $CT_HOSTNAME or $HOSTNAME)
+# Sets: DIR_DOCKER, DIR_DOCKER_DATA
+setup_mountpoints() {
+  echo "Registering mountpoints for CT ${CTID}..."
+
+  local target_hostname="${CT_HOSTNAME:-${HOSTNAME:-}}"
+  if [[ -z "$target_hostname" ]]; then
+    echo "ERROR: No hostname available for setup_mountpoints"
+    return 1
+  fi
+
+  local hostname_lower
+  hostname_lower=$(echo "$target_hostname" | tr '[:upper:]' '[:lower:]')
+
+  DIR_DOCKER="/mnt/docker/${hostname_lower}"
+  DIR_DOCKER_DATA="/mnt/docker-data/${hostname_lower}"
+
+  mkdir -p "$DIR_DOCKER"
+  mkdir -p "$DIR_DOCKER_DATA"
+  mkdir -p "$DIR_DOCKER/caddy/data"
+
+  echo "Created:"
+  echo "  $DIR_DOCKER"
+  echo "  $DIR_DOCKER_DATA"
+
+  COMPOSE_FILE="${DIR_DOCKER}/docker-compose.yaml"
+  ENV_FILE="${DIR_DOCKER}/.env"
+
+  if [[ ! -f "$COMPOSE_FILE" ]]; then
+    echo "Creating template docker-compose.yaml at $COMPOSE_FILE"
+    create_compose_template "$COMPOSE_FILE"
+  fi
+
+  echo "Updating .env at $ENV_FILE"
+  update_env_file "$ENV_FILE"
+
+  # Idempotent mount setup: only reconfigure if mounts are missing or incorrect
+  echo "Verifying bind mounts..."
+  
+  local current_mp0 current_mp1 needs_update=0
+  local config_output
+  config_output=$(pct config "$CTID" 2>/dev/null)
+  
+  # Extract current mp0 and mp1 paths (format: mp0: /path/on/host,mp=/path/in/ct)
+  current_mp0=$(echo "$config_output" | grep -E '^mp0:' | sed -E 's/^mp0:\s*([^,]+),.*/\1/')
+  current_mp1=$(echo "$config_output" | grep -E '^mp1:' | sed -E 's/^mp1:\s*([^,]+),.*/\1/')
+  
+  # Check if mounts are correct
+  if [[ "$current_mp0" != "$DIR_DOCKER" ]] || [[ "$current_mp1" != "$DIR_DOCKER_DATA" ]]; then
+    needs_update=1
+  fi
+  
+  if [[ $needs_update -eq 1 ]]; then
+    echo "Mountpoints need update (expected: mp0=$DIR_DOCKER, mp1=$DIR_DOCKER_DATA)"
+    echo "Current: mp0=$current_mp0, mp1=$current_mp1"
+    
+    # Remove all existing mountpoints to avoid conflicts
+    echo "Removing existing mountpoints..."
+    for mp in $(echo "$config_output" | awk -F: '/^mp[0-9]+/ {print $1}'); do
+      echo "  deleting $mp"
+      pct set "$CTID" -delete "$mp"
+    done
+    
+    # Add correct mounts
+    echo "Adding correct bind mounts..."
+    pct set "$CTID" -mp0 "${DIR_DOCKER},mp=/mnt/docker"
+    pct set "$CTID" -mp1 "${DIR_DOCKER_DATA},mp=/mnt/docker-data"
+    echo "Mountpoints updated."
+  else
+    echo "Mountpoints already correct:"
+    echo "  mp0: $current_mp0 → /mnt/docker"
+    echo "  mp1: $current_mp1 → /mnt/docker-data"
+    echo "No changes needed."
   fi
 }
 

@@ -18,11 +18,13 @@
 #   meaning the same configuration can be re-applied to update existing CTs.
 #
 # USAGE:
-#   ./createCT.sh <hostname> [--size S|M|L] [--priority low|mid|high] [--gpu] [key=value overrides...]
+#   ./createCT.sh <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [--gpu] [key=value overrides...]
 #
 # EXAMPLES:
 #   ./createCT.sh app.thesaints.home                   # Default size S, priority mid
 #   ./createCT.sh app.thesaints.home --size M          # Medium size
+#   ./createCT.sh app.thesaints.home --cores 3 --memory 3072  # Custom allocation
+#   ./createCT.sh app.thesaints.home --size M --memory 3072   # Size M base, 3072 MB RAM
 #   ./createCT.sh app.thesaints.home --priority low    # Low priority (background)
 #   ./createCT.sh app.thesaints.home --size L          # Large size (e.g., Seafile)
 #   ./createCT.sh nvr.thesaints.home --gpu --priority high  # GPU + high priority
@@ -36,12 +38,15 @@
 #
 # CONFIGURABLE PARAMETERS (with defaults):
 #   --size           T-shirt size: S, M, L (default: S, defined in commonCT.json)
+#   --cores          Override cores from the size base (e.g. --cores 3)
+#   --memory         Override memory in MB from the size base (e.g. --memory 3072)
 #   --gpu            Enable GPU passthrough for VAAPI hardware acceleration
 #   CTID             Auto-allocated starting at 2000, step 100
-#   STORAGE          local-lvm
+#   STORAGE          DATA (redundant ZFS mirror; override e.g. STORAGE=local-lvm
+#                    for write-heavy CTs that should stay on the NVMe). Creation
+#                    aborts if the chosen storage is missing or its ZFS pool is
+#                    DEGRADED/resilvering.
 #   DISK             16 (GB)
-#   CORES            From size (S=1, M=2, L=4) or manual override
-#   MEMORY           From size (S=1024, M=2048, L=4096) or manual override
 #   BRIDGE           vmbr1
 #   IP               dhcp (or CIDR like 10.0.0.50/24)
 #   GW               (empty, required for static IP)
@@ -97,6 +102,7 @@ MONITOR_AFTER=false
 GPU_PASSTHROUGH=false
 CT_SIZE="S"
 CT_PRIORITY="mid"
+IGNORE_STORAGE_HEALTH=false
 
 # -----------------------------
 # FUNCTIONS
@@ -104,13 +110,16 @@ CT_PRIORITY="mid"
 
 # Show usage and exit
 usage() {
-  echo "Usage: $0 <hostname> [--size S|M|L] [--priority low|mid|high] [--gpu] [key=value overrides]"
+  echo "Usage: $0 <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [--gpu] [key=value overrides]"
   echo ""
   echo "Options:"
   echo "  --size S|M|L             T-shirt size (default: S)"
+  echo "  --cores N                Override cores from the size base (custom allocation)"
+  echo "  --memory MB              Override memory in MB from the size base (custom allocation)"
   echo "  --priority low|mid|high  CPU priority (default: mid)"
   echo "  --gpu                    Enable GPU passthrough (VAAPI)"
   echo "  --monitor                Start log monitor after creation"
+  echo "  --ignore-storage-health  Provision even if the target storage is degraded (bypass recommendation)"
   echo ""
   echo "Sizes (defined in commonCT.json):"
   echo "  S = Small  ($(config_get_size_cores S) cores, $(config_get_size_memory S) MB)"
@@ -164,7 +173,7 @@ set_defaults() {
   validate_size "${CT_SIZE}" || exit 1
   
   CTID="${CTID:-$(next_ctid)}"
-  STORAGE="${STORAGE:-local-lvm}"
+  STORAGE="${STORAGE:-DATA}"
   DISK="${DISK:-16}"
   CORES="${CORES:-${SIZE_CORES}}"
   MEMORY="${MEMORY:-${SIZE_MEMORY}}"
@@ -277,17 +286,9 @@ start_ct() {
 }
 
 # Install Docker and Docker Compose
-install_docker() {
-  echo "Installing Docker inside CT ${CTID}..."
-
-  ct_exec --timeout 120 '
-    set -e
-    apk update
-    apk add docker docker-cli-compose ca-certificates
-    rc-update add docker boot
-    service docker start || true
-  '
-}
+# install_docker is now in commonCT.sh (shared single source of truth).
+# The OpenRC boot runlevel is managed idempotently by ensure_docker_runlevel()
+# via apply_ct_configuration (shared between createCT and refreshCT).
 
 # Create docker-compose.yaml template
 # create_compose_template is now in commonCT.sh (shared between createCT and refreshCT)
@@ -420,8 +421,28 @@ main() {
         CT_SIZE="$2"
         shift 2
         ;;
+      --cores)
+        if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ERROR: --cores must be a positive integer (got '$2')" >&2
+          exit 1
+        fi
+        CORES="$2"
+        shift 2
+        ;;
+      --memory)
+        if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+          echo "ERROR: --memory must be a positive integer in MB (got '$2')" >&2
+          exit 1
+        fi
+        MEMORY="$2"
+        shift 2
+        ;;
       --gpu)
         GPU_PASSTHROUGH=true
+        shift
+        ;;
+      --ignore-storage-health)
+        IGNORE_STORAGE_HEALTH=true
         shift
         ;;
       --priority|-p)
@@ -467,7 +488,14 @@ main() {
       # Forward compatible flags to refreshCT.sh
       local refresh_args=("${existing_ctid}")
       [[ "$MONITOR_AFTER" == "true" ]] && refresh_args+=("--monitor")
-      [[ -n "$CT_SIZE" ]] && refresh_args+=("--size" "$CT_SIZE")
+      # refreshCT treats --size and --cores/--memory as mutually exclusive, so a
+      # custom allocation (if given) takes precedence over the named size.
+      if [[ -n "$CORES" || -n "$MEMORY" ]]; then
+        [[ -n "$CORES" ]] && refresh_args+=("--cores" "$CORES")
+        [[ -n "$MEMORY" ]] && refresh_args+=("--memory" "$MEMORY")
+      elif [[ -n "$CT_SIZE" ]]; then
+        refresh_args+=("--size" "$CT_SIZE")
+      fi
       [[ "$GPU_PASSTHROUGH" == "true" ]] && refresh_args+=("--gpu")
       [[ -n "$CT_PRIORITY" ]] && refresh_args+=("--priority" "$CT_PRIORITY")
       exec "${SCRIPT_DIR}/refreshCT.sh" "${refresh_args[@]}"
@@ -479,6 +507,28 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
+  local storage_reason
+  if ! storage_reason=$(check_storage_health "${STORAGE}"); then
+    status_bar_cleanup
+    echo "  [!] Storage recommendation: '${STORAGE}' is not healthy: ${storage_reason}" >&2
+    echo "      Recommended: restore the storage/pool, or pass STORAGE=<other>." >&2
+    if [[ "$IGNORE_STORAGE_HEALTH" == "true" ]]; then
+      echo "  [!] Proceeding anyway (--ignore-storage-health)." >&2
+      status_bar_init
+    elif [[ -t 0 ]]; then
+      local storage_answer
+      read -rp "Provision on degraded storage anyway? [y/N]: " storage_answer
+      if [[ "$storage_answer" =~ ^[Yy]$ ]]; then
+        status_bar_init
+      else
+        echo "Aborted."
+        exit 0
+      fi
+    else
+      echo "      Aborting. Re-run with --ignore-storage-health to override." >&2
+      exit 1
+    fi
+  fi
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Preparing template..."
   prepare_template
@@ -493,28 +543,16 @@ main() {
   start_ct
   ensure_swap
   
-  # Wait for network connectivity before installing packages
-  local net_targets=("https://dl-cdn.alpinelinux.org" "https://registry-1.docker.io" "https://ghcr.io")
-  local net_ok=() net_fail=()
-  for target in "${net_targets[@]}"; do
-    local host="${target#https://}"
-    if wait_for "${host}" "ct_exec --timeout 5 'wget --spider -q ${target}'" 30; then
-      net_ok+=("$host")
-    else
-      net_fail+=("$host")
-    fi
-  done
-  if [[ ${#net_ok[@]} -gt 0 ]]; then
-    echo "  [✓] Reachable: ${net_ok[*]}"
-  fi
-  for host in "${net_fail[@]}"; do
-    echo "  [!] Warning: ${host} is not reachable — image pulls may fail"
-  done
-  # Alpine CDN is required for package installation
-  if [[ " ${net_fail[*]} " == *" dl-cdn.alpinelinux.org "* ]]; then
+  # Wait for network connectivity before installing packages. Only the Alpine package
+  # CDN is probed here: install_docker (the very next step) installs from it, so an early
+  # fatal check fails fast with a clear message. Registry reachability (ghcr.io/docker.io)
+  # is intentionally NOT probed — it runs before Docker is installed (so a bare wget can't
+  # validate Docker's real pull path) and compose_pull already owns it with retry/backoff.
+  if ! wait_for "dl-cdn.alpinelinux.org" "ct_exec --timeout 5 'wget --spider -q https://dl-cdn.alpinelinux.org'" 30; then
     echo "ERROR: No network connectivity to Alpine package CDN in CT ${CTID}."
     exit 1
   fi
+  echo "  [✓] Reachable: dl-cdn.alpinelinux.org"
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Installing Docker..."
   install_docker
@@ -530,11 +568,19 @@ main() {
   verify_setup
   start_compose
   reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
+
+  # MANDATORY: this CT is a Docker host — the post-compose reboot must leave the
+  # daemon up (with active recovery) or provisioning is not actually complete.
+  if ! ensure_docker_running "${CTID}"; then
+    echo "ERROR: Docker daemon is not running in CT ${CTID} after reboot."
+    exit 1
+  fi
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Checking DNS..."
   check_dns_health "$CTID" "$HOSTNAME" || echo "  [!] DNS health check failed (non-fatal)"
   
   status_progress "$step" "$total_steps" "Running configure script..."
+  sync_config_shared
   run_configure_script
   
   status_bar_cleanup

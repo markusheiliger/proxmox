@@ -2,7 +2,7 @@ services:
   # Hello World service - replace with your actual application
   hello:
     container_name: hello
-    restart: unless-stopped
+    restart: always
     image: traefik/whoami:latest
     labels:
       caddy: ${HOSTNAME}
@@ -11,7 +11,7 @@ services:
   # Caddy reverse proxy with automatic SSL via Step CA
   caddy:
     container_name: caddy
-    restart: unless-stopped
+    restart: always
     image: ghcr.io/markusheiliger/caddy-stepca:latest
     ports:
       - 80:80

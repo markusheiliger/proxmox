@@ -46,27 +46,38 @@ source "${SCRIPT_DIR}/commonCT.sh"
 # Global flags
 REMOVE_MODE=false
 
-# Forward auth label lines (indented for YAML labels block)
-# AUTHENTIK_HOST is replaced with the actual host at insertion time.
-# This array is the single source of truth — add new labels here.
+# Injector-managed Caddy labels (indented for the YAML labels block).
+# AUTHENTIK_HOST is replaced with the actual Authentik host at insertion time.
+# These two entries live inside a `caddy.route` block (single source of truth):
+#   - 0_reverse_proxy : always forward the Authentik outpost path to the outpost, so the
+#                       OAuth callback is served from the application host and the proxy
+#                       session cookie is set there. This is what makes forward_single work
+#                       even when the app and Authentik are under different parent domains.
+#                       Runs BEFORE forward_auth.
+#   - 50_forward_auth : authenticate everything that is not an explicit bypass route.
+# The protected service owns the rest of the route via numeric-prefix bands:
+#   1_..49_   bypass routes (no auth), evaluated before forward_auth
+#   51_..98_  authenticated auxiliary routes
+#   99_       the app catch-all reverse_proxy
 FORWARD_AUTH_LABELS=(
-  'caddy.forward_auth: "https://AUTHENTIK_HOST"'
-  'caddy.forward_auth.uri: "/outpost.goauthentik.io/auth/caddy"'
-  'caddy.forward_auth.header_up: "Host AUTHENTIK_HOST"'
-  'caddy.forward_auth.copy_headers: "X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid"'
-  'caddy.forward_auth.trusted_proxies: private_ranges'
+  'caddy.route.0_reverse_proxy: "/outpost.goauthentik.io/* https://AUTHENTIK_HOST"'
+  'caddy.route.0_reverse_proxy.header_up: "Host AUTHENTIK_HOST"'
+  'caddy.route.50_forward_auth: "https://AUTHENTIK_HOST"'
+  'caddy.route.50_forward_auth.uri: "/outpost.goauthentik.io/auth/caddy"'
+  'caddy.route.50_forward_auth.header_up: "Host AUTHENTIK_HOST"'
+  'caddy.route.50_forward_auth.copy_headers: "X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid"'
+  'caddy.route.50_forward_auth.trusted_proxies: private_ranges'
 )
 
-# Extract the label key from a "key: value" string (everything before the first ': ')
-_label_key() {
-  echo "${1%%:*}"
-}
+# Regex (PCRE) matching the injector-managed label keys (the two entries above).
+MANAGED_LABEL_REGEX='caddy\.route\.(0_reverse_proxy|50_forward_auth)'
 
 # Add forward auth labels to a compose file
-# Idempotent: removes any existing forward_auth labels, then inserts the
-# canonical set from FORWARD_AUTH_LABELS.  This ensures values are always
-# up-to-date with the single source of truth defined in this script.
-# Works with both simple (caddy.reverse_proxy) and handle-based (caddy.N_handle.reverse_proxy) routing.
+# Idempotent: removes any existing injector-managed labels, then inserts the canonical
+# set from FORWARD_AUTH_LABELS so values always match this script (single source of truth).
+# Requires the service to use a `caddy.route` block; a simple `caddy.reverse_proxy` is
+# auto-migrated to the catch-all band `caddy.route.99_reverse_proxy`. Handle-based or other
+# non-conforming label layouts fail fast with guidance to normalize per the ct-compose skill.
 add_forward_auth_labels() {
   local compose_file="$1"
   local ak_host="$2"
@@ -77,40 +88,58 @@ add_forward_auth_labels() {
     return 0
   fi
 
-  # Build the canonical label block with placeholder replaced
+  # The service must use a caddy.route block (forward-auth contract). If it only has a
+  # simple caddy.reverse_proxy, migrate it to the catch-all band caddy.route.99_reverse_proxy.
+  if ! grep -qP '^\s+caddy\.route\.' "$compose_file" 2>/dev/null; then
+    if grep -qP '^\s+caddy\.reverse_proxy(\.|:)' "$compose_file" 2>/dev/null \
+       && ! grep -qP '^\s+caddy\.[0-9]+_handle' "$compose_file" 2>/dev/null; then
+      local tmpmig
+      tmpmig=$(mktemp)
+      sed -E 's/^(\s*)caddy\.reverse_proxy/\1caddy.route.99_reverse_proxy/' "$compose_file" > "$tmpmig"
+      mv "$tmpmig" "$compose_file"
+      echo "  [~] Migrated simple reverse_proxy to caddy.route.99_reverse_proxy"
+    else
+      echo "  [!] Service does not use a 'caddy.route' block and cannot be auto-migrated."
+      echo "      Normalize the caddy labels to a route block per the ct-compose skill"
+      echo "      (bands: 1_-49_ bypass, 50_ forward_auth [managed], 51_-98_ authed, 99_ app),"
+      echo "      then re-run forward auth."
+      return 1
+    fi
+  fi
+
+  # Build the canonical managed label block with placeholder replaced
   local canonical_labels=()
+  local label_template
   for label_template in "${FORWARD_AUTH_LABELS[@]}"; do
     canonical_labels+=("${label_template//AUTHENTIK_HOST/$ak_host}")
   done
 
-  # Check if existing labels already match exactly
-  if grep -q 'caddy\.forward_auth' "$compose_file" 2>/dev/null; then
-    # Extract existing forward_auth label values (trimmed)
-    local existing
-    existing=$(grep 'caddy\.forward_auth' "$compose_file" | sed 's/^[[:space:]]*//' | sort)
-    local canonical
+  # Idempotency: if the managed labels already match exactly, nothing to do
+  if grep -qP "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" 2>/dev/null; then
+    local existing canonical
+    existing=$(grep -P "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" | sed 's/^[[:space:]]*//' | sort)
     canonical=$(printf '%s\n' "${canonical_labels[@]}" | sort)
-
     if [[ "$existing" == "$canonical" ]]; then
       echo "  [✓] Forward auth labels already up-to-date"
       return 2  # No changes needed
     fi
-
-    # Remove existing forward_auth labels first
+    # Remove outdated managed labels first
     local tmpfile
     tmpfile=$(mktemp)
-    grep -v 'caddy\.forward_auth' "$compose_file" > "$tmpfile"
+    grep -vP "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" > "$tmpfile"
     mv "$tmpfile" "$compose_file"
     echo "  [~] Removed outdated forward auth labels"
   fi
 
   # Build the block of lines to insert
   local insert_block=""
+  local label
   for label in "${canonical_labels[@]}"; do
     insert_block+="${label}\n"
   done
 
-  # Insert all labels after each 'caddy: <hostname>' line
+  # Insert managed labels right after the 'caddy: <hostname>' site line. Ordering inside the
+  # route block is by numeric prefix, independent of physical line position.
   local tmpfile
   tmpfile=$(mktemp)
   awk -v insert="$insert_block" '
@@ -131,19 +160,19 @@ add_forward_auth_labels() {
 }
 
 # Remove forward auth labels from a compose file
+# Strips only the injector-managed entries; the service's own route block and app
+# catch-all are left intact (the app keeps serving, just without authentication).
 remove_forward_auth_labels() {
   local compose_file="$1"
 
-  if ! grep -q 'caddy\.forward_auth' "$compose_file" 2>/dev/null; then
+  if ! grep -qP "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" 2>/dev/null; then
     echo "  [✓] No forward auth labels present"
     return 2  # No changes needed
   fi
 
-  # Remove lines containing caddy.forward_auth
   local tmpfile
   tmpfile=$(mktemp)
-
-  grep -v 'caddy\.forward_auth' "$compose_file" > "$tmpfile"
+  grep -vP "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" > "$tmpfile"
   mv "$tmpfile" "$compose_file"
   echo "  [✓] Forward auth labels removed"
 }
@@ -274,15 +303,6 @@ main() {
   local total=${#cts_to_process[@]}
   local current=0
 
-  # Ensure domain-level Authentik app exists (once, before processing CTs)
-  if [[ "$REMOVE_MODE" != "true" ]]; then
-    echo "Ensuring Authentik domain-level forward auth..."
-    # Use the first CT's hostname to derive the domain
-    local first_hostname="${CT_MAP[${cts_to_process[0]}]}"
-    configure_authentik_forward_auth "$first_hostname"
-    echo ""
-  fi
-
   status_bar_init
 
   for CTID in "${cts_to_process[@]}"; do
@@ -299,6 +319,16 @@ main() {
     status_progress "$current" "$total" "CT ${CTID}: ${mode_label} forward auth..."
 
     ensure_ct_running || continue
+
+    # Provision the per-host Authentik forward_single provider/application/outpost
+    # assignment before applying the Caddy labels. Failure here is fatal for this CT.
+    if [[ "$REMOVE_MODE" != "true" ]]; then
+      if ! configure_authentik_forward_auth "$CT_HOSTNAME"; then
+        echo "  [!] Authentik forward auth provisioning failed for ${CT_HOSTNAME} — skipping"
+        continue
+      fi
+      echo ""
+    fi
 
     process_ct
 

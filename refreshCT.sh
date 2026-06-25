@@ -16,14 +16,14 @@
 #   - Syslog forwarding to OTEL collector
 #   - ghcr.io Docker authentication refreshed
 #   - Step CA root certificate trust updated
-#   - Docker Compose services restarted
+#   - Docker Compose services fully restarted (down -> pull -> up)
 #
 #   Host-specific behavior:
 #   - CA hosts (ca.*): Skip logging, telegraf, syslog, step_ca
 #   - OTEL hosts (otel.*): Skip logging, syslog (would loop)
 #
 # USAGE:
-#   ./refreshCT.sh [CTID or hostname] [--size S|M|L] [--priority low|mid|high] [--gpu] [--monitor]
+#   ./refreshCT.sh [CTID or hostname] [--size S|M|L | --cores N --memory MB] [--priority low|mid|high] [--gpu] [--monitor] [--reset]
 #
 # EXAMPLES:
 #   ./refreshCT.sh                           # Interactive multi-select
@@ -31,16 +31,35 @@
 #   ./refreshCT.sh 2100                      # Refresh by CTID
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
-#   ./refreshCT.sh 2100 --size L             # Resize to Large and refresh
+#   ./refreshCT.sh 2100 --size L             # Resize to a named size and refresh
+#   ./refreshCT.sh 2100 --cores 3 --memory 3072  # Resize to a CUSTOM allocation
 #   ./refreshCT.sh 2100 --priority high      # Set high priority
 #   ./refreshCT.sh 2600 --gpu                # Enable GPU passthrough
+#   ./refreshCT.sh 2100 --reset              # Wipe data subfolders, then re-init
+#
+#   Sizing is either a named t-shirt size (--size, validated against commonCT.json)
+#   OR a custom allocation (--cores and/or --memory). The two modes are mutually
+#   exclusive. With a custom allocation, any dimension you omit keeps the CT's
+#   current value. Swap is always re-derived as half of memory.
 #
 # BEHAVIOR:
 #   - Without arguments: multi-select dialog to choose multiple containers
-#   - With options only (--gpu, --size, --monitor): single-select dialog
+#   - With options only (--gpu, --size, --cores, --memory, --monitor, --reset): single-select dialog
 #   - With CTID/hostname: operates on that specific container
 #   - All configuration functions are idempotent (safe to run repeatedly)
-#   - Docker Compose services are pulled and restarted
+#   - A resize (--size/--cores/--memory) waits up to 5 minutes for an active
+#     Proxmox lock (e.g. an in-progress backup) to clear before resizing, and
+#     aborts if it does not clear in time
+#   - Each CT's storage volumes (rootfs + volume mount points) are checked before
+#     refresh; if a backing ZFS pool is DEGRADED/resilvering or a storage is
+#     missing, a warning is printed but the refresh continues
+#   - Docker Compose services are brought down, freshly pulled, and started
+#   - With --reset: between 'compose down' and 'compose up', each CT shows its own
+#     list of deletable subfolders under /mnt/docker/<host> and
+#     /mnt/docker-data/<host> and asks for confirmation before recursively deleting
+#     them (subfolders starting with '_' are excluded; docker-compose.yaml and .env
+#     are kept). The 'caddy/' folder requires a separate, dedicated confirmation
+#     because deleting it forces Let's Encrypt/ACME certificate re-issuance.
 #
 # REQUIREMENTS:
 #   - Run on Proxmox VE host as root
@@ -61,7 +80,10 @@ source "${SCRIPT_DIR}/commonCT.sh"
 MONITOR_AFTER=false
 GPU_PASSTHROUGH=false
 CT_SIZE=""
+CT_CORES=""
+CT_MEMORY=""
 CT_PRIORITY=""
+RESET=false
 
 # -----------------------------
 # FUNCTIONS
@@ -70,7 +92,85 @@ CT_PRIORITY=""
 # Note: update_packages is now provided by ensure_packages_and_ca in commonCT.sh
 # This legacy function is kept for reference but is no longer called
 
-# Reset Docker and restart compose services
+# List deletable subfolders for a reset, one path per line.
+# Emits the immediate subdirectories of DIR_DOCKER and DIR_DOCKER_DATA whose
+# basename does NOT start with "_". Top-level files (docker-compose.yaml, .env)
+# are never listed. Requires get_ct_dirs to have set DIR_DOCKER/DIR_DOCKER_DATA.
+reset_list_candidates() {
+  local base d name
+  for base in "$DIR_DOCKER" "$DIR_DOCKER_DATA"; do
+    [[ -d "$base" ]] || continue
+    for d in "$base"/*/; do
+      [[ -d "$d" ]] || continue          # skip when glob has no match
+      name="$(basename "$d")"
+      [[ "$name" == _* ]] && continue     # exclude "_"-prefixed subfolders
+      echo "${d%/}"
+    done
+  done
+}
+
+# Interactive per-CT reset cleanup. Intended to run while Compose is DOWN
+# (between compose_down and compose_up) so bind mounts are released.
+# Shows this CT's deletable subfolders, asks for confirmation, and recursively
+# deletes the confirmed ones. The "caddy" folder requires a separate, dedicated
+# confirmation because deleting it forces Let's Encrypt/ACME cert re-issuance.
+# Uses globals CTID and CT_HOSTNAME. Never fatal (always returns 0).
+reset_cleanup_folders() {
+  get_ct_dirs "${CT_HOSTNAME}"
+
+  local candidates=()
+  mapfile -t candidates < <(reset_list_candidates)
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "  [reset] CT ${CTID} (${CT_HOSTNAME}): no deletable subfolders found."
+    return 0
+  fi
+
+  echo ""
+  echo "  [reset] CT ${CTID} (${CT_HOSTNAME}) — subfolders eligible for RECURSIVE deletion:"
+  local c name
+  for c in "${candidates[@]}"; do
+    name="$(basename "$c")"
+    if [[ "$name" == "caddy" ]]; then
+      echo "    $c   (Caddy data — separate confirmation)"
+    else
+      echo "    $c"
+    fi
+  done
+  echo "    ('_'-prefixed subfolders are excluded; docker-compose.yaml and .env are kept)"
+  echo ""
+
+  local reply
+  read -p "  Delete these folders for CT ${CTID}? [y/N]: " reply
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    echo "  [reset] Declined — continuing refresh without deleting."
+    return 0
+  fi
+
+  # Delete all non-caddy candidates first.
+  for c in "${candidates[@]}"; do
+    name="$(basename "$c")"
+    [[ "$name" == "caddy" ]] && continue
+    rm -rf "$c" && echo "    Deleted: $c"
+  done
+
+  # Dedicated confirmation for each caddy folder (cert re-issuance risk).
+  for c in "${candidates[@]}"; do
+    name="$(basename "$c")"
+    [[ "$name" != "caddy" ]] && continue
+    local caddy_reply
+    read -p "  Also delete ${c}? This wipes LE/ACME certs and forces re-issuance (rate limits). [y/N]: " caddy_reply
+    if [[ "$caddy_reply" =~ ^[Yy]$ ]]; then
+      rm -rf "$c" && echo "    Deleted: $c"
+    else
+      echo "    Kept: $c"
+    fi
+  done
+
+  return 0
+}
+
+# Reset Docker and perform a full compose restart (down -> pull -> up)
 reset_docker() {
   echo "Checking for docker-compose.yaml..."
   
@@ -116,8 +216,33 @@ reset_docker() {
   fi
   echo "  [✓] Compose file is valid"
   
-  # Pull and deploy
-  echo "  Pulling images and deploying..."
+  # Enforce a full stop/start cycle so refresh behavior is deterministic.
+  echo "  Stopping existing Compose services..."
+  if ! compose_down "${CTID}"; then
+    echo "  [!] Warning: failed to stop existing Compose services, skipping deploy"
+    return 1
+  fi
+
+  # Pre-pull all images BEFORE any destructive cleanup. A transient registry
+  # failure must never leave a CT with wiped data and no images to start from.
+  echo "  Pulling images before deploy..."
+  if ! compose_pull "${CTID}"; then
+    if [[ "${RESET:-false}" == "true" ]]; then
+      echo "  [!] Image pull failed; NOT wiping data. CT left intact."
+      echo "      Retry later: pct exec ${CTID} -- sh -c 'cd /mnt/docker && docker compose pull'"
+      return 1
+    fi
+    echo "  [!] Warning: image pull failed; continuing with cached images."
+  fi
+
+  # Optional reset: with Compose down (bind mounts released) and images cached,
+  # wipe data subfolders so the next 'compose up' reinitializes from scratch.
+  if [[ "${RESET:-false}" == "true" ]]; then
+    reset_cleanup_folders
+  fi
+
+  # Deploy (uses pre-pulled/cached images)
+  echo "  Starting services..."
   compose_up "${CTID}"
   
   # Fix permissions after containers are created
@@ -218,14 +343,49 @@ print_summary() {
 
 # Resize CT resources based on size
 resize_ct() {
-  if [[ -z "$CT_SIZE" ]]; then
+  # Nothing requested -> no-op
+  if [[ -z "$CT_SIZE" && -z "$CT_CORES" && -z "$CT_MEMORY" ]]; then
     return
   fi
-  
-  echo "Resizing CT ${CTID} to size ${CT_SIZE}..."
-  
-  validate_size "${CT_SIZE}" || exit 1
-  
+
+  # Named size and custom cores/memory are mutually exclusive
+  if [[ -n "$CT_SIZE" && ( -n "$CT_CORES" || -n "$CT_MEMORY" ) ]]; then
+    echo "ERROR: --size cannot be combined with --cores/--memory" >&2
+    exit 1
+  fi
+
+  # A resize stops/sets/starts the CT, which fails while Proxmox holds a config
+  # lock (e.g. an in-progress backup). Wait the lock out (up to 5 min) before
+  # touching the CT; abort if it does not clear.
+  if ! wait_for_ct_unlock "${CTID}" 300; then
+    echo "ERROR: CT ${CTID} is still locked/unavailable after 5 minutes; aborting resize." >&2
+    exit 1
+  fi
+
+  if [[ -n "$CT_SIZE" ]]; then
+    # Named t-shirt size: resolve SIZE_CORES/SIZE_MEMORY from commonCT.json
+    echo "Resizing CT ${CTID} to size ${CT_SIZE}..."
+    validate_size "${CT_SIZE}" || exit 1
+  else
+    # Custom allocation: validate provided dimensions, fill omitted ones from
+    # the CT's current config so a single dimension can be tuned in isolation.
+    if [[ -n "$CT_CORES" && ! "$CT_CORES" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: --cores must be a positive integer (got '${CT_CORES}')" >&2
+      exit 1
+    fi
+    if [[ -n "$CT_MEMORY" && ! "$CT_MEMORY" =~ ^[1-9][0-9]*$ ]]; then
+      echo "ERROR: --memory must be a positive integer in MB (got '${CT_MEMORY}')" >&2
+      exit 1
+    fi
+    SIZE_CORES="${CT_CORES:-$(pct config "${CTID}" 2>/dev/null | grep -oP '^cores:\s*\K\d+' || echo "")}"
+    SIZE_MEMORY="${CT_MEMORY:-$(pct config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "")}"
+    if [[ -z "$SIZE_CORES" || -z "$SIZE_MEMORY" ]]; then
+      echo "ERROR: could not determine target cores/memory for CT ${CTID}" >&2
+      exit 1
+    fi
+    echo "Resizing CT ${CTID} to custom allocation (${SIZE_CORES} cores, ${SIZE_MEMORY} MB)..."
+  fi
+
   # Check if CT needs to be stopped for resize
   local was_running=false
   if pct status "${CTID}" | grep -q 'status: running'; then
@@ -283,6 +443,16 @@ main() {
         has_options=true
         shift 2
         ;;
+      --cores)
+        CT_CORES="$2"
+        has_options=true
+        shift 2
+        ;;
+      --memory)
+        CT_MEMORY="$2"
+        has_options=true
+        shift 2
+        ;;
       --gpu)
         GPU_PASSTHROUGH=true
         has_options=true
@@ -292,6 +462,11 @@ main() {
         CT_PRIORITY="$2"
         has_options=true
         shift 2
+        ;;
+      --reset)
+        RESET=true
+        has_options=true
+        shift
         ;;
       -*)
         echo "Unknown option: $1"
@@ -331,6 +506,7 @@ main() {
   # Process each selected CT
   local total=${#cts_to_process[@]}
   local current=0
+  local failed_cts=()
   
   # Initialize status bar for progress tracking
   local steps_per_ct=7
@@ -350,6 +526,8 @@ main() {
     echo "=============================================="
     echo ""
     
+    check_ct_storage_health "${CTID}" warn
+    
     ensure_ct_running || { overall_step=$((base_step + steps_per_ct)); continue; }
     
     overall_step=$((base_step + 1)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Resizing..."
@@ -368,12 +546,23 @@ main() {
     
     overall_step=$((base_step + 5)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Rebooting..."
     reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
-    
+
+    # MANDATORY: every CT is a Docker host — a reboot that leaves the daemon
+    # dead means the whole stack is down. Verify (with active recovery) and
+    # treat a hard failure as fatal for this CT.
+    if ! ensure_docker_running "${CTID}"; then
+      echo "  [✗] FATAL: Docker daemon is not running in CT ${CTID} after reboot — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME})")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
+
     overall_step=$((base_step + 6)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Checking DNS..."
     check_dns_health || echo "  [!] DNS health check failed (non-fatal)"
     
     overall_step=$((base_step + 7)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Running configure script..."
     get_ct_dirs
+    sync_config_shared
     run_configure_script
     
     print_summary
@@ -384,6 +573,15 @@ main() {
   
   echo ""
   echo "All ${total} container(s) refreshed."
+
+  if [[ ${#failed_cts[@]} -gt 0 ]]; then
+    echo ""
+    echo "  [✗] Docker daemon FAILED to come up after reboot on:"
+    for f in "${failed_cts[@]}"; do
+      echo "        - ${f}"
+    done
+    return 1
+  fi
 
   # Optionally start monitoring (only for single CT)
   if [[ "$MONITOR_AFTER" == "true" && $total -eq 1 ]]; then

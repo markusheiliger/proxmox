@@ -26,6 +26,7 @@
 #   configure_step_ca         Install step-cli, bootstrap CA trust
 #   configure_registry_logins  Authenticate Docker to configured registries
 #   configure_gpu_passthrough Configure GPU passthrough (VAAPI)
+#   configure_docker_watchdog Boot-time watchdog that retries Docker startup
 #
 #   Host-specific behavior:
 #   - CA hosts (ca.*): Skip logging, telegraf, syslog, step_ca
@@ -1055,6 +1056,17 @@ TELEGRAF_EOF
   # Verify service is running
   local service_status
   service_status=$(ct_exec --timeout 15 'rc-service telegraf status 2>&1 || true')
+
+  # A transient crash can occur if telegraf restarts while the Docker socket is
+  # mid-cycle (e.g. during a refresh that also restarts Docker) or under brief
+  # memory pressure on low-RAM CTs. Retry the restart once before warning.
+  if echo "$service_status" | grep -q "crashed"; then
+    echo "  Telegraf reported crashed, retrying restart..."
+    ct_exec --timeout 30 'rc-service telegraf restart >/dev/null 2>&1 || true'
+    sleep 6
+    service_status=$(ct_exec --timeout 15 'rc-service telegraf status 2>&1 || true')
+  fi
+
   if echo "$service_status" | grep -q "started"; then
     echo "  [✓] Telegraf configured and running"
   elif echo "$service_status" | grep -q "crashed"; then
@@ -1345,6 +1357,143 @@ echo "* * * * * /usr/local/bin/arping-gw.sh" >> /etc/crontabs/root'
   echo "  [✓] Arping gateway service configured"
 }
 
+# Install Docker and Docker Compose inside a CT (Alpine/OpenRC).
+# Create-time step; the boot runlevel is managed separately and idempotently
+# by ensure_docker_runlevel() (invoked from apply_ct_configuration), so this
+# function only installs the packages and starts the daemon.
+# Args:
+#   $1 - CTID (defaults to global $CTID)
+install_docker() {
+  local ctid="${1:-${CTID}}"
+
+  echo "Installing Docker inside CT ${ctid}..."
+  ct_exec --timeout 120 "${ctid}" '
+    set -e
+    apk update
+    apk add docker docker-cli-compose ca-certificates
+    service docker start || true
+  '
+}
+
+# Ensure the Docker service starts on boot via the correct OpenRC runlevel.
+# Docker must run in the 'default' runlevel (after networking and bind mounts
+# are ready), not 'boot' (which starts too early and intermittently fails).
+# Idempotent: safe to run on every create/refresh. No-op on non-OpenRC systems.
+# Args:
+#   $1 - CTID (defaults to global $CTID)
+ensure_docker_runlevel() {
+  local ctid="${1:-${CTID}}"
+
+  echo "Ensuring Docker starts on boot (OpenRC default runlevel)..."
+  ct_exec --timeout 30 "${ctid}" '
+    if command -v rc-update >/dev/null 2>&1; then
+      rc-update del docker boot 2>/dev/null || true
+      rc-update add docker default 2>/dev/null || true
+    fi
+  '
+  echo "  [✓] Docker boot runlevel configured"
+}
+
+# Verify the Docker daemon is up and responsive inside a CT, with active
+# recovery. Every CT in this fleet is a Docker host, so a dead daemon after a
+# reboot is a hard failure — this function waits for `docker info`, and if the
+# daemon does not come up it re-asserts the boot runlevel and forces a restart
+# before giving up. Idempotent and safe to call after any reboot.
+# Args:
+#   $1 - CTID (defaults to global $CTID)
+#   $2 - seconds to wait for the daemon on each attempt (optional, default 120)
+# Returns: 0 if the daemon is responsive, 1 if still down after recovery.
+ensure_docker_running() {
+  local ctid="${1:-${CTID}}"
+  local timeout="${2:-120}"
+  local i
+
+  echo "Verifying Docker daemon in CT ${ctid}..."
+
+  # Fast path / initial wait: daemon may still be starting after the reboot.
+  for ((i=1; i<=timeout; i++)); do
+    if ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; then
+      echo "  [✓] Docker daemon is running"
+      return 0
+    fi
+    sleep 1
+  done
+
+  # Recovery: re-assert the boot runlevel and force a (re)start, then wait again.
+  echo "  [!] Docker daemon not responding after ${timeout}s — attempting recovery..."
+  ensure_docker_runlevel "${ctid}"
+  ct_exec --timeout 60 "${ctid}" 'rc-service docker restart >/dev/null 2>&1 || rc-service docker start >/dev/null 2>&1 || true'
+
+  for ((i=1; i<=timeout; i++)); do
+    if ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; then
+      echo "  [✓] Docker daemon recovered and is running"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "  [✗] Docker daemon FAILED to start in CT ${ctid} after recovery attempt"
+  echo "      Diagnose: pct exec ${ctid} -- sh -c 'rc-service docker status; tail -n 40 /var/log/docker.log'"
+  return 1
+}
+
+# Install a boot-time Docker watchdog inside the CT.
+# On a low-RAM CT the embedded containerd can time out during the boot storm,
+# causing dockerd to give up and exit — leaving the Docker host dead after a
+# reboot until something restarts it. This OpenRC service runs after the docker
+# service at boot, polls `docker info`, and restarts Docker until the daemon is
+# responsive. Self-heals on EVERY reboot (refresh, manual, or Proxmox host
+# reboot), not just during provisioning.
+# Idempotent: rewrites the unit and re-asserts the runlevel on each run.
+# No-op on non-OpenRC systems.
+# Args:
+#   $1 - CTID (defaults to global $CTID)
+configure_docker_watchdog() {
+  local ctid="${1:-${CTID}}"
+
+  # Only meaningful on OpenRC (Alpine) systems.
+  if ! ct_exec --timeout 15 "${ctid}" 'command -v rc-update >/dev/null 2>&1' 2>/dev/null; then
+    echo "Skipping Docker watchdog (non-OpenRC system)."
+    return 0
+  fi
+
+  echo "Configuring Docker boot watchdog..."
+
+  # Write the OpenRC unit with a quoted heredoc so the in-script $variables are
+  # NOT expanded by the host shell (same pattern as configure_arping_service).
+  pct exec "${ctid}" -- sh -c 'cat > /etc/init.d/docker-watchdog << '"'"'WATCHDOG'"'"'
+#!/sbin/openrc-run
+
+description="Retry Docker startup at boot until the daemon is responsive"
+
+depend() {
+    after docker
+}
+
+start() {
+    ebegin "Verifying Docker daemon is responsive"
+    i=0
+    max=12
+    while [ "$i" -lt "$max" ]; do
+        if docker info >/dev/null 2>&1; then
+            eend 0
+            return 0
+        fi
+        i=$((i + 1))
+        ewarn "Docker not responsive (attempt $i/$max) - restarting docker"
+        rc-service docker restart >/dev/null 2>&1 || rc-service docker start >/dev/null 2>&1 || true
+        sleep 5
+    done
+    docker info >/dev/null 2>&1
+    eend $? "Docker daemon did not become responsive after $max attempts"
+}
+WATCHDOG
+chmod +x /etc/init.d/docker-watchdog
+rc-update add docker-watchdog default 2>/dev/null || true'
+
+  echo "  [✓] Docker boot watchdog configured"
+}
+
 # Apply the standard CT configuration sequence.
 # Consolidates the 8 idempotent config steps shared by createCT and refreshCT
 # into a single call.  Each step prints its own [✓] output.
@@ -1359,6 +1508,8 @@ apply_ct_configuration() {
 
   ensure_packages_and_ca "${ctid}"
   configure_timezone
+  ensure_docker_runlevel "${ctid}"
+  configure_docker_watchdog "${ctid}"
   configure_docker_logging "${hostname}"
   configure_telegraf "${hostname}"
   configure_syslog_forwarding "${hostname}"
@@ -1373,13 +1524,15 @@ apply_ct_configuration() {
 
 # Configure Authentik forward auth for a CT
 # Detects caddy.forward_auth labels in the CT's docker-compose.yaml and
-# auto-provisions a domain-level forward auth setup in Authentik via REST API:
-#   1. Proxy Provider (mode: forward_domain, one per domain)
+# auto-provisions a per-host forward auth setup in Authentik via REST API:
+#   1. Proxy Provider (mode: forward_single, external_host = https://<hostname>)
 #   2. Application (linked to the provider)
 #   3. Outpost assignment (adds provider to the configured outpost)
-# Domain-level: one provider covers all services under the same parent domain.
+# Per-host (forward_single): one provider/application per protected hostname. This
+# works regardless of whether the app and Authentik share a parent domain, because
+# the proxy session cookie is scoped to the application host itself.
 # Individual apps handle their own authorization; Authentik only authenticates.
-# Idempotent: skips if domain application already exists with a provider attached
+# Idempotent: skips if the host application already exists with a provider attached
 # Args:
 #   $1 - CT hostname (e.g., rust.thesaints.home)
 # Returns: 0 on success or skip, 1 on error
@@ -1401,7 +1554,7 @@ configure_authentik_forward_auth() {
     return 0
   fi
 
-  if ! grep -q 'caddy\.forward_auth' "$compose_file" 2>/dev/null; then
+  if ! grep -qE 'caddy\.(route\.[0-9]+_)?forward_auth' "$compose_file" 2>/dev/null; then
     return 0
   fi
 
@@ -1416,28 +1569,32 @@ configure_authentik_forward_auth() {
 
   local ak_api="https://${ak_host}/api/v3"
 
-  # Domain-level: one provider per domain, not per hostname
-  local domain
-  domain=$(extract_domain_from_hostname "$ct_hostname")
+  # Single-application: one provider per host (mode forward_single).
+  # forward_domain is unusable here because Authentik (e.g. oidc.thesaints.de) and many
+  # protected hosts (e.g. home.thesaints.home) live under different parent domains; a
+  # domain-level cookie cannot span them. forward_single sets the proxy session cookie on
+  # the application host itself, so the parent domains no longer need to match.
+  local app_host
+  app_host="$hostname_lower"
   local slug
-  slug=$(echo "$domain" | tr '.' '-')
+  slug=$(echo "$app_host" | tr '.' '-')
 
   # Helper: Authentik API GET
   ak_get() {
-    curl -sk -H "Authorization: Bearer ${ak_token}" -H "Accept: application/json" \
+    curl -sk --connect-timeout 10 --max-time 60 -H "Authorization: Bearer ${ak_token}" -H "Accept: application/json" \
       "${ak_api}${1}" 2>/dev/null
   }
 
   # Helper: Authentik API POST
   ak_post() {
-    curl -sk -X POST -H "Authorization: Bearer ${ak_token}" \
+    curl -sk --connect-timeout 10 --max-time 60 -X POST -H "Authorization: Bearer ${ak_token}" \
       -H "Content-Type: application/json" -H "Accept: application/json" \
       "${ak_api}${1}" -d "${2}" 2>/dev/null
   }
 
   # Helper: Authentik API PATCH
   ak_patch() {
-    curl -sk -X PATCH -H "Authorization: Bearer ${ak_token}" \
+    curl -sk --connect-timeout 10 --max-time 60 -X PATCH -H "Authorization: Bearer ${ak_token}" \
       -H "Content-Type: application/json" -H "Accept: application/json" \
       "${ak_api}${1}" -d "${2}" 2>/dev/null
   }
@@ -1447,7 +1604,7 @@ configure_authentik_forward_auth() {
   existing_app=$(ak_get "/core/applications/?slug=${slug}")
 
   if echo "$existing_app" | jq -e --arg s "$slug" '.results[] | select(.slug == $s) | .provider != null' >/dev/null 2>&1; then
-    echo "  [✓] Authentik: domain '${domain}' already configured"
+    echo "  [✓] Authentik: host '${app_host}' already configured"
     return 0
   fi
 
@@ -1472,22 +1629,20 @@ configure_authentik_forward_auth() {
     return 1
   fi
 
-  # Step 3: Create domain-level Proxy Provider
-  echo "  Creating domain-level proxy provider: ${domain}"
+  # Step 3: Create per-host Proxy Provider (forward_single)
+  echo "  Creating proxy provider: ${app_host}"
   local provider_payload
   provider_payload=$(jq -n \
-    --arg name "${domain}" \
+    --arg name "${app_host}" \
     --arg auth_flow "$auth_flow_uuid" \
     --arg inval_flow "$inval_flow_uuid" \
-    --arg ext_host "https://${ak_host}" \
-    --arg cookie_domain "$domain" \
+    --arg ext_host "https://${app_host}" \
     '{
       name: $name,
       authorization_flow: $auth_flow,
       invalidation_flow: $inval_flow,
       external_host: $ext_host,
-      mode: "forward_domain",
-      cookie_domain: $cookie_domain
+      mode: "forward_single"
     }')
 
   local provider_result
@@ -1508,10 +1663,10 @@ configure_authentik_forward_auth() {
   echo "  Creating application: ${slug}"
   local app_payload
   app_payload=$(jq -n \
-    --arg name "${domain}" \
+    --arg name "${app_host}" \
     --arg slug "$slug" \
     --argjson provider "$provider_pk" \
-    --arg launch_url "https://${ak_host}" \
+    --arg launch_url "https://${app_host}" \
     '{
       name: $name,
       slug: $slug,
@@ -1570,7 +1725,7 @@ configure_authentik_forward_auth() {
     fi
   fi
 
-  echo "  [✓] Authentik forward auth configured (domain: ${domain})"
+  echo "  [✓] Authentik forward auth configured (host: ${app_host})"
   return 0
 }
 
@@ -1748,6 +1903,74 @@ configure_registry_logins() {
   echo "  [✓] ${count} container registry(s) configured"
 }
 
+# Detect transient registry/network errors that are worth retrying.
+# Args:
+#   $1 - text to inspect (typically captured docker output)
+# Returns: 0 if the text matches a known transient error, 1 otherwise
+is_transient_registry_error() {
+  echo "$1" | grep -qiE 'TLS handshake timeout|i/o timeout|Client\.Timeout exceeded|temporary failure|no such host|connection reset|unexpected EOF|context deadline exceeded|deadline exceeded|429 Too Many Requests|500 Internal Server Error|timeout awaiting'
+}
+
+# Pull all images for a CT's compose stack with exponential backoff.
+# Detects all profiles so every image (incl. published/newt) is cached locally,
+# allowing a subsequent 'compose up --pull missing' to start without network.
+# Args:
+#   $1 - CTID (optional, defaults to global CTID)
+# Returns: 0 on success, 1 on failure
+compose_pull() {
+  local ctid="${1:-${CTID}}"
+
+  # Get all profiles defined in the compose file and build --profile flags
+  local profile_flags
+  profile_flags=$(ct_exec --timeout 30 "${ctid}" 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
+    while read -r profile; do echo -n "--profile $profile "; done)
+
+  local max_attempts=5
+  local attempt output backoff
+  local pull_cmd="cd /mnt/docker && docker compose ${profile_flags}pull"
+
+  for ((attempt=1; attempt<=max_attempts; attempt++)); do
+    echo "  Pulling images (attempt ${attempt}/${max_attempts})..."
+
+    if output=$(ct_exec --timeout 600 "${ctid}" "${pull_cmd}" 2>&1); then
+      [[ -n "$output" ]] && echo "$output"
+      return 0
+    fi
+
+    [[ -n "$output" ]] && echo "$output"
+
+    # Only retry transient registry/network failures
+    if ! is_transient_registry_error "$output"; then
+      echo "  [!] Non-transient pull error; aborting."
+      return 1
+    fi
+
+    if [[ $attempt -lt $max_attempts ]]; then
+      # On attempt 3, restart Docker once as a last-resort recovery
+      if [[ $attempt -eq 3 ]]; then
+        echo "  [!] Persistent transient error; restarting Docker once..."
+        ct_exec --timeout 120 "${ctid}" 'service docker restart >/dev/null 2>&1 || true'
+        local waited=0
+        while ! ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; do
+          waited=$((waited + 5))
+          if [[ $waited -ge 120 ]]; then
+            echo "  [!] Docker daemon not responsive after restart (${waited}s)"
+            return 1
+          fi
+          sleep 5
+        done
+      else
+        backoff=$((10 * (1 << (attempt - 1))))
+        echo "  [!] Transient registry/network error; retrying in ${backoff}s..."
+        sleep "${backoff}"
+      fi
+    fi
+  done
+
+  echo "  [!] Image pull failed after ${max_attempts} attempts."
+  return 1
+}
+
 # Start Docker Compose services in a CT
 # Updates .env with newt configuration from commonCT.json
 # Enables 'published' profile if newt credentials are configured
@@ -1768,11 +1991,12 @@ compose_up() {
   newt_endpoint=$(config_get_newt_endpoint "$hostname")
 
   # Determine TLS provider env requirements for this CT domain
-  local domain ssl_type dns_provider dns_api_token
+  local domain ssl_type dns_provider dns_api_token dns_account_id
   domain=$(extract_domain_from_hostname "$hostname")
   ssl_type=$(config_get_ssl_type "$domain")
   dns_provider=$(config_get_dns_provider "$domain")
   dns_api_token=$(config_get_dns_api_token "$domain")
+  dns_account_id=$(config_get_dns_account_id "$domain")
   
   # Update .env file with newt values
   local hostname_lower
@@ -1803,9 +2027,12 @@ compose_up() {
     # Keep DNS provider credentials aligned with the CT domain SSL config.
     if [[ "$ssl_type" == "letsencrypt" && "$dns_provider" == "dnsimple" && -n "$dns_api_token" ]]; then
       set_or_add_env "DNSIMPLE_API_ACCESS_TOKEN" "${dns_api_token}"
+      # Optional account id; an empty value lets the provider fall back to a whoami lookup.
+      set_or_add_env "DNSIMPLE_ACCOUNT_ID" "${dns_account_id}"
     else
       # Avoid leaking DNSimple vars into non-dnsimple or internal domains.
       remove_env "DNSIMPLE_API_ACCESS_TOKEN"
+      remove_env "DNSIMPLE_ACCOUNT_ID"
     fi
   fi
   
@@ -1816,9 +2043,11 @@ compose_up() {
     echo "  Newt tunnel enabled (published profile)"
   fi
 
+  # Images are pre-pulled by compose_pull (see reset_docker), so use the default
+  # --pull missing here: start from cached images and avoid a redundant network hit.
   local max_attempts=3
   local attempt output
-  local compose_cmd="cd /mnt/docker && docker compose ${profile_flag} up -d --pull always --remove-orphans"
+  local compose_cmd="cd /mnt/docker && docker compose ${profile_flag} up -d --pull missing --remove-orphans"
 
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
     echo "  Starting services (attempt ${attempt}/${max_attempts})..."
@@ -1831,20 +2060,27 @@ compose_up() {
     [[ -n "$output" ]] && echo "$output"
 
     # Retry transient registry/network failures
-    if echo "$output" | grep -qiE 'TLS handshake timeout|i/o timeout|Client\.Timeout exceeded|temporary failure|no such host'; then
+    if is_transient_registry_error "$output"; then
       if [[ $attempt -lt $max_attempts ]]; then
-        echo "  [!] Transient registry/network error detected; restarting Docker and retrying..."
-        ct_exec --timeout 120 "${ctid}" 'service docker restart >/dev/null 2>&1 || true'
-        # Wait for Docker daemon to be responsive before retrying
-        local waited=0
-        while ! ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; do
-          waited=$((waited + 5))
-          if [[ $waited -ge 120 ]]; then
-            echo "  [!] Docker daemon not responsive after restart (${waited}s)"
-            return 1
-          fi
-          sleep 5
-        done
+        # Back off first; only restart Docker as a last resort on the final retry.
+        if [[ $attempt -eq $((max_attempts - 1)) ]]; then
+          echo "  [!] Persistent transient error; restarting Docker and retrying..."
+          ct_exec --timeout 120 "${ctid}" 'service docker restart >/dev/null 2>&1 || true'
+          # Wait for Docker daemon to be responsive before retrying
+          local waited=0
+          while ! ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; do
+            waited=$((waited + 5))
+            if [[ $waited -ge 120 ]]; then
+              echo "  [!] Docker daemon not responsive after restart (${waited}s)"
+              return 1
+            fi
+            sleep 5
+          done
+        else
+          local backoff=$((10 * attempt))
+          echo "  [!] Transient registry/network error; retrying in ${backoff}s..."
+          sleep "${backoff}"
+        fi
         continue
       fi
     fi
@@ -1868,7 +2104,7 @@ compose_down() {
   profile_flags=$(ct_exec --timeout 30 "${ctid}" 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
     while read -r profile; do echo -n "--profile $profile "; done)
   
-  ct_exec --timeout 120 "${ctid}" "cd /mnt/docker && docker compose ${profile_flags} down"
+  ct_exec --timeout 300 "${ctid}" "cd /mnt/docker && docker compose ${profile_flags} down"
 }
 
 # Reboot a container
@@ -2322,12 +2558,141 @@ resolve_ct_from_input() {
   return 0
 }
 
+# Check the health of a single Proxmox storage.
+# Verifies the storage exists/is active and, when it is a ZFS pool, that the pool
+# is ONLINE and not resilvering (i.e. its redundancy is intact). Non-ZFS storages
+# (dir, lvmthin, nfs, ...) have no ZFS redundancy concept here and only get the
+# existence check.
+# Args: $1 = storage id
+# Output: on failure, echoes a human-readable reason to stdout
+# Returns: 0 if healthy, 1 if missing/inactive/degraded/resilvering
+check_storage_health() {
+  local storage="$1"
+  local health
+
+  if [[ -z "$storage" ]]; then
+    echo "no storage specified"
+    return 1
+  fi
+
+  if ! pvesm status 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$storage"; then
+    echo "storage '${storage}' not found or not active"
+    return 1
+  fi
+
+  if command -v zpool >/dev/null 2>&1 && zpool list "$storage" >/dev/null 2>&1; then
+    health=$(zpool list -H -o health "$storage" 2>/dev/null)
+    if [[ "$health" != "ONLINE" ]]; then
+      echo "ZFS pool '${storage}' health is ${health:-UNKNOWN} (redundancy lost)"
+      return 1
+    fi
+    if zpool status "$storage" 2>/dev/null | grep -qiE 'resilver in progress'; then
+      echo "ZFS pool '${storage}' is resilvering (redundancy not yet restored)"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# Check the health of every storage VOLUME backing a container.
+# Inspects the CT's rootfs and any volume-backed mount points (mpN of the form
+# "storage:volume"); bind mounts (host paths starting with "/") are ignored.
+# Each distinct storage is validated with check_storage_health.
+# Args:
+#   $1 = CTID
+#   $2 = mode: "fatal" (exit 1 on first problem) or "warn" (print warning, continue)
+# Returns: 0 when all healthy or mode=warn; exits 1 when mode=fatal and a problem found.
+check_ct_storage_health() {
+  local ctid="$1"
+  local mode="${2:-warn}"
+  local config storages storage reason
+
+  config=$(pct config "$ctid" 2>/dev/null) || {
+    echo "  [!] Cannot read config for CT ${ctid}; skipping storage health check" >&2
+    return 0
+  }
+
+  storages=$(echo "$config" \
+    | grep -E '^(rootfs|mp[0-9]+):' \
+    | sed -E 's/^[^:]+:[[:space:]]*//' \
+    | grep -v '^/' \
+    | sed -E 's/:.*//' \
+    | sort -u)
+
+  for storage in $storages; do
+    if ! reason=$(check_storage_health "$storage"); then
+      if [[ "$mode" == "fatal" ]]; then
+        echo "  [✗] CT ${ctid}: storage health check failed: ${reason}" >&2
+        exit 1
+      fi
+      echo "  [!] CT ${ctid}: storage health warning: ${reason}" >&2
+    fi
+  done
+
+  return 0
+}
+
 # Get container status
 # Args: $1 = CTID (optional, defaults to $CTID)
 # Returns: status string (running, stopped, etc.)
 get_ct_status() {
   local ctid="${1:-$CTID}"
   pct status "$ctid" 2>/dev/null | awk '{print $2}'
+}
+
+# Wait for a CT to become unlocked AND running, polling with exponential backoff.
+# Proxmox holds a config lock (e.g. "lock: backup") during backup/snapshot/migrate
+# operations, which blocks pct stop/set/start. This waits the lock out instead of
+# failing immediately.
+# Args:
+#   $1 = CTID (optional, defaults to $CTID)
+#   $2 = timeout in seconds (optional, default: 300)
+# Returns: 0 once unlocked and running; 1 if still locked/not running at timeout.
+wait_for_ct_unlock() {
+  local ctid="${1:-$CTID}"
+  local timeout="${2:-300}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local delay=5
+  local lock_reason announced=false
+
+  while true; do
+    lock_reason=$(pct config "${ctid}" 2>/dev/null | grep -oP '^lock:\s*\K\S+' || true)
+
+    if [[ -z "$lock_reason" ]] && [[ "$(get_ct_status "$ctid")" == "running" ]]; then
+      [[ "$announced" == "true" ]] && echo "  [✓] CT ${ctid} is unlocked and running"
+      return 0
+    fi
+
+    local now remaining
+    now=$(date +%s)
+    if [[ $now -ge $deadline ]]; then
+      if [[ -n "$lock_reason" ]]; then
+        echo "  [!] CT ${ctid} still locked (lock: ${lock_reason}) after ${timeout}s"
+      else
+        echo "  [!] CT ${ctid} not running after ${timeout}s"
+      fi
+      return 1
+    fi
+
+    if [[ "$announced" != "true" ]]; then
+      if [[ -n "$lock_reason" ]]; then
+        echo "  CT ${ctid} is locked (lock: ${lock_reason}); waiting up to ${timeout}s for it to clear..."
+      else
+        echo "  CT ${ctid} is not running yet; waiting up to ${timeout}s..."
+      fi
+      announced=true
+    fi
+
+    # Do not sleep past the deadline
+    remaining=$(( deadline - now ))
+    [[ $delay -gt $remaining ]] && delay=$remaining
+    sleep "$delay"
+
+    # Exponential backoff, capped at 60s
+    delay=$(( delay * 2 ))
+    [[ $delay -gt 60 ]] && delay=60
+  done
 }
 
 # Ensure container is running (starts it if stopped)
@@ -2428,6 +2793,36 @@ ct_exists() {
   pct status "$ctid" &>/dev/null
 }
 
+# Mirror the shared configure library into the CT before configure.sh runs.
+# Source of truth: ${SCRIPT_DIR}/configure on the Proxmox host. The folder is
+# COPIED (not symlinked/mounted) into ${DIR_DOCKER}/_config/shared because only
+# files physically under the per-CT ${DIR_DOCKER} are visible inside the CT —
+# anything sourced as /mnt/docker/_config/shared/*.sh must live there for real.
+#
+# Idempotent: the destination is fully mirrored (rm -rf + cp -a) on every run.
+# Non-fatal: a CT without a _config/ dir, or a missing source library, is skipped.
+#
+# Args: none (uses globals SCRIPT_DIR, DIR_DOCKER)
+sync_config_shared() {
+  local src="${SCRIPT_DIR}/configure"
+  local dest="${DIR_DOCKER}/_config/shared"
+
+  # Only CTs that ship a _config/ (i.e. have a configure.sh) need the library.
+  if [[ ! -d "${DIR_DOCKER}/_config" ]]; then
+    return 0
+  fi
+
+  if [[ ! -d "$src" ]]; then
+    echo "  [i] No shared configure library at ${src} - skipping"
+    return 0
+  fi
+
+  rm -rf "$dest"
+  mkdir -p "$dest"
+  cp -a "${src}/." "${dest}/"
+  echo "  [✓] Synced shared configure library -> _config/shared"
+}
+
 # Run per-CT configure.sh script (if present)
 # Looks for ${DIR_DOCKER}/configure.sh on the Proxmox host and runs it
 # inside the CT via ct_exec. The script must be idempotent.
@@ -2514,6 +2909,7 @@ run_configure_script() {
 #   STEP_CA_FINGERPRINT - From commonCT.json: ssl.<domain>.fingerprint
 #   CADDY_EMAIL         - From commonCT.json: ssl.<domain>.email
 #   DNSIMPLE_API_ACCESS_TOKEN - From commonCT.json: ssl.<domain>.dns_api_token (for letsencrypt+dnsimple)
+#   DNSIMPLE_ACCOUNT_ID - From commonCT.json: ssl.<domain>.dns_account_id (optional; empty falls back to whoami)
 #
 update_env_file() {
   local env_file="$1"
@@ -2526,9 +2922,10 @@ update_env_file() {
   domain=$(extract_domain_from_hostname "${target_hostname}")
   local ssl_type
   ssl_type=$(config_get_ssl_type "${domain}")
-  local dns_provider dns_api_token
+  local dns_provider dns_api_token dns_account_id
   dns_provider=$(config_get_dns_provider "${domain}")
   dns_api_token=$(config_get_dns_api_token "${domain}")
+  dns_account_id=$(config_get_dns_account_id "${domain}")
   local email
   email=$(config_get_email "${domain}")
   
@@ -2575,8 +2972,10 @@ update_env_file() {
   # Inject DNS provider credentials only for letsencrypt + dnsimple domains.
   if [[ "$ssl_type" == "letsencrypt" && "$dns_provider" == "dnsimple" && -n "$dns_api_token" ]]; then
     set_env_value "DNSIMPLE_API_ACCESS_TOKEN" "${dns_api_token}" "DNSimple DNS challenge credentials (from commonCT.json)"
+    set_env_value "DNSIMPLE_ACCOUNT_ID" "${dns_account_id}" "DNSimple account ID (optional; empty falls back to whoami lookup)"
   else
     remove_env_key "DNSIMPLE_API_ACCESS_TOKEN"
+    remove_env_key "DNSIMPLE_ACCOUNT_ID"
   fi
   
   # Add Newt/Pangolin placeholders if not already present
@@ -2653,8 +3052,10 @@ setup_mountpoints() {
   config_output=$(pct config "$CTID" 2>/dev/null)
   
   # Extract current mp0 and mp1 paths (format: mp0: /path/on/host,mp=/path/in/ct)
-  current_mp0=$(echo "$config_output" | grep -E '^mp0:' | sed -E 's/^mp0:\s*([^,]+),.*/\1/')
-  current_mp1=$(echo "$config_output" | grep -E '^mp1:' | sed -E 's/^mp1:\s*([^,]+),.*/\1/')
+  # `|| true`: a fresh CT has no mp lines, so grep exits 1; under `set -euo pipefail`
+  # the bare assignment would abort the script before the mounts are ever added.
+  current_mp0=$(echo "$config_output" | grep -E '^mp0:' | sed -E 's/^mp0:\s*([^,]+),.*/\1/') || true
+  current_mp1=$(echo "$config_output" | grep -E '^mp1:' | sed -E 's/^mp1:\s*([^,]+),.*/\1/') || true
   
   # Check if mounts are correct
   if [[ "$current_mp0" != "$DIR_DOCKER" ]] || [[ "$current_mp1" != "$DIR_DOCKER_DATA" ]]; then

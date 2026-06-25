@@ -2,7 +2,7 @@ services:
   # Hello World service - replace with your actual application
   hello:
     container_name: hello
-    restart: unless-stopped
+    restart: always
     image: traefik/whoami:latest
     labels:
       caddy: ${HOSTNAME}
@@ -11,7 +11,7 @@ services:
   # Caddy reverse proxy with automatic SSL via Let's Encrypt (DNS-01)
   caddy:
     container_name: caddy
-    restart: unless-stopped
+    restart: always
     image: ghcr.io/markusheiliger/caddy-dnsimple:latest
     ports:
       - 80:80
@@ -21,14 +21,17 @@ services:
       - /mnt/docker/caddy/data:/data
     environment:
       DNSIMPLE_API_ACCESS_TOKEN: ${DNSIMPLE_API_ACCESS_TOKEN}
+      DNSIMPLE_ACCOUNT_ID: ${DNSIMPLE_ACCOUNT_ID}
     labels:
       caddy.email: ${CADDY_EMAIL}
-      caddy.tls.dns: dnsimple {env.DNSIMPLE_API_ACCESS_TOKEN}
+      caddy.acme_dns: dnsimple
+      caddy.acme_dns.api_access_token: "{env.DNSIMPLE_API_ACCESS_TOKEN}"
+      caddy.acme_dns.account_id: "{env.DNSIMPLE_ACCOUNT_ID}"
 
   # Newt tunnel for external access via Pangolin
   newt:
     container_name: newt
-    restart: unless-stopped
+    restart: always
     image: fosrl/newt
     environment:
       NEWT_ID: ${NEWT_ID}

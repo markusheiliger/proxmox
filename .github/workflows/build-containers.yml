@@ -17,7 +17,6 @@ jobs:
         image:
           - caddy-dnsimple
           - caddy-stepca
-          - rustdesk-webclient
 
     steps:
       - name: Checkout

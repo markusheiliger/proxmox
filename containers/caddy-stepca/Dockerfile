@@ -7,6 +7,12 @@ FROM alpine:latest
 
 RUN apk add --no-cache step-cli bash ca-certificates
 
+# Restore the official caddy image's storage locations (dropped by the alpine base).
+# Without these, Caddy stores certs/ACME state in the ephemeral /root/.local/share/caddy
+# instead of the persistent /data bind mount, forcing cert re-issuance on every recreate.
+ENV XDG_CONFIG_HOME=/config
+ENV XDG_DATA_HOME=/data
+
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 
 COPY docker-entrypoint.sh /docker-entrypoint.sh

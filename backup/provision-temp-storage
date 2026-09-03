@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VG="${TEMP_VG:-pve}"
+THIN_POOL="${TEMP_THIN_POOL:-data}"
+LV="${TEMP_LV:-temp}"
+FILESYSTEM="${TEMP_FILESYSTEM:-ext4}"
+MOUNTPOINT="${TEMP_MOUNTPOINT:-/TEMP}"
+TARGET_GIB="${TEMP_TARGET_GIB:-}"
+HEADROOM_PERCENT="${TEMP_HEADROOM_PERCENT:-20}"
+DRY_RUN="${TEMP_DRY_RUN:-false}"
+FSTAB="${TEMP_FSTAB:-/etc/fstab}"
+MANAGED_TAG="backup_temp_storage"
+
+fail() { echo "ERROR: $*" >&2; return 1; }
+run() {
+  if [[ "$DRY_RUN" == true ]]; then
+    printf 'Would run:'
+    printf ' %q' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
+
+[[ "$TARGET_GIB" =~ ^[1-9][0-9]*$ ]] || fail "TEMP_TARGET_GIB must be a positive integer."
+[[ "$HEADROOM_PERCENT" =~ ^[0-9]+$ ]] || fail "TEMP_HEADROOM_PERCENT must be an integer."
+[[ "$FILESYSTEM" == ext4 ]] || fail "Only ext4 TEMP filesystems are supported."
+
+pool_attr=$(lvs --noheadings -o lv_attr "${VG}/${THIN_POOL}" 2>/dev/null | xargs || true)
+[[ "$pool_attr" == t* ]] || fail "${VG}/${THIN_POOL} is not an available LVM thin pool."
+pool_size_bytes=$(lvs --noheadings --units b --nosuffix -o lv_size "${VG}/${THIN_POOL}" 2>/dev/null | xargs || true)
+pool_data_percent=$(lvs --noheadings --nosuffix -o data_percent "${VG}/${THIN_POOL}" 2>/dev/null | xargs || true)
+[[ "$pool_size_bytes" =~ ^[0-9]+([.][0-9]+)?$ && "$pool_data_percent" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+  || fail "Cannot determine thin-pool capacity for ${VG}/${THIN_POOL}."
+required_bytes=$((TARGET_GIB * 1073741824 * (100 + HEADROOM_PERCENT) / 100))
+available_bytes=$(awk -v size="$pool_size_bytes" -v used="$pool_data_percent" 'BEGIN { printf "%.0f", size * (100 - used) / 100 }')
+echo "Thin pool ${VG}/${THIN_POOL}: $((available_bytes / 1073741824)) GiB physically available; $((required_bytes / 1073741824)) GiB required including ${HEADROOM_PERCENT}% headroom."
+(( available_bytes >= required_bytes )) \
+  || fail "${VG}/${THIN_POOL} lacks physical headroom: need $((required_bytes / 1073741824)) GiB, have $((available_bytes / 1073741824)) GiB."
+
+device="/dev/${VG}/${LV}"
+created=false
+if ! lvs "${VG}/${LV}" >/dev/null 2>&1; then
+  run lvcreate --type thin --thinpool "${VG}/${THIN_POOL}" --virtualsize "${TARGET_GIB}G" --name "$LV" --addtag "$MANAGED_TAG"
+  created=true
+else
+  lv_pool=$(lvs --noheadings -o pool_lv "${VG}/${LV}" 2>/dev/null | xargs || true)
+  lv_tags=$(lvs --noheadings -o lv_tags "${VG}/${LV}" 2>/dev/null | xargs || true)
+  [[ "$lv_pool" == "$THIN_POOL" && ",${lv_tags}," == *",${MANAGED_TAG},"* ]] \
+    || fail "Existing ${device} is not the managed TEMP thin LV."
+fi
+
+if [[ "$created" == false ]]; then
+  current_bytes=$(lvs --noheadings --units b --nosuffix -o lv_size "${VG}/${LV}" 2>/dev/null | xargs || true)
+  [[ "$current_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "Cannot determine ${device} size."
+  target_bytes=$((TARGET_GIB * 1073741824))
+  if awk -v current="$current_bytes" -v target="$target_bytes" 'BEGIN { exit !(current < target) }'; then
+    run lvextend -L "${TARGET_GIB}G" "${VG}/${LV}"
+  elif awk -v current="$current_bytes" -v target="$target_bytes" 'BEGIN { exit !(current > target) }'; then
+    echo "Keeping ${device} at its larger existing virtual size; automatic shrinking is disabled."
+  fi
+fi
+
+fs_type=$(blkid -o value -s TYPE "$device" 2>/dev/null || true)
+if [[ -z "$fs_type" ]]; then
+  if [[ "$created" == true || "$DRY_RUN" == true ]]; then
+    run mkfs.ext4 -F -L TEMP "$device"
+  else
+    lv_tags=$(lvs --noheadings -o lv_tags "${VG}/${LV}" 2>/dev/null | xargs || true)
+    [[ ",${lv_tags}," == *",${MANAGED_TAG},"* ]] || fail "Refusing to format unrecognized ${device}."
+    run mkfs.ext4 -F -L TEMP "$device"
+  fi
+elif [[ "$fs_type" != "$FILESYSTEM" ]]; then
+  fail "${device} contains ${fs_type}, expected ${FILESYSTEM}; refusing to format it."
+fi
+
+if findmnt -rn --mountpoint "$MOUNTPOINT" >/dev/null 2>&1; then
+  mounted_source=$(findmnt -rn -o SOURCE --mountpoint "$MOUNTPOINT")
+  [[ "$(readlink -f "$mounted_source")" == "$(readlink -f "$device")" ]] \
+    || fail "${MOUNTPOINT} is already mounted from ${mounted_source}, not ${device}."
+else
+  if [[ -d "$MOUNTPOINT" && -n "$(find "$MOUNTPOINT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    fail "${MOUNTPOINT} exists and is not empty."
+  fi
+  run install -d -o root -g root -m 0755 "$MOUNTPOINT"
+fi
+
+if [[ "$DRY_RUN" == true ]]; then
+  echo "Would persist ${device} by UUID and mount it at ${MOUNTPOINT}."
+else
+  uuid=$(blkid -o value -s UUID "$device")
+  [[ -n "$uuid" ]] || fail "Cannot determine filesystem UUID for ${device}."
+  expected="UUID=${uuid} ${MOUNTPOINT} ext4 defaults,discard,nofail,x-systemd.device-timeout=10 0 2"
+  conflicting=$(awk -v mountpoint="$MOUNTPOINT" '$2 == mountpoint && $1 !~ /^#/ { print }' "$FSTAB" || true)
+  if [[ -n "$conflicting" && "$conflicting" != "$expected" ]]; then
+    fail "Conflicting ${MOUNTPOINT} entry exists in ${FSTAB}: ${conflicting}"
+  fi
+  if [[ -z "$conflicting" ]]; then
+    temporary=$(mktemp "${FSTAB}.XXXXXX")
+    cp -a "$FSTAB" "$temporary"
+    printf '%s\n' "$expected" >>"$temporary"
+    mv "$temporary" "$FSTAB"
+    systemctl daemon-reload
+  fi
+  mountpoint -q "$MOUNTPOINT" || mount "$MOUNTPOINT"
+  resize2fs "$device"
+  fstrim "$MOUNTPOINT"
+fi
+
+run install -d -o root -g root -m 1777 "${MOUNTPOINT}/vzdump-tmp"
+run chmod 1777 "${MOUNTPOINT}/vzdump-tmp"
+if [[ "$DRY_RUN" == true ]]; then
+  echo "TEMP storage plan complete for ${MOUNTPOINT} with a ${TARGET_GIB} GiB minimum virtual size."
+else
+  echo "TEMP storage reconciled at ${MOUNTPOINT} with a ${TARGET_GIB} GiB minimum virtual size."
+fi

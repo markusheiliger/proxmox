@@ -1,0 +1,8 @@
+[Unit]
+Description=Reconcile Proxmox CT and VM backup job membership
+After=pve-cluster.service
+Wants=pve-cluster.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/reconcile-backup-jobs

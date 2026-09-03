@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # monitorCT.sh - Stream Docker Compose logs from a container
+# Documentation: monitorCT.md
 #
 # DESCRIPTION:
 #   Streams combined logs from all Docker Compose services running

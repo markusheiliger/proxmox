@@ -48,3 +48,55 @@ ensure_data_dir() {
   mkdir -p "$_edd_path"
   chown "${_edd_uid}:${_edd_gid}" "$_edd_path"
 }
+
+# Load a docker-compose .env file into the environment, treating each value as a
+# LITERAL string (no shell expansion, command substitution, or quote evaluation).
+# This makes the CT's .env the single source of truth for configure.sh, mirroring
+# how Docker Compose itself reads it. The naive `. ./.env` is unsafe here because
+# busybox sh would interpret spaces, '#', quotes and '$' in values.
+#
+# Parsing rules (kept close to Compose's .env semantics):
+#   - blank lines and lines whose first non-space char is '#' are skipped
+#   - a leading `export ` prefix is tolerated and stripped
+#   - the key is everything left of the first '=' (trimmed); the value is the rest
+#   - one layer of matching surrounding single or double quotes is removed
+#   - the value is exported verbatim; it is never evaluated by the shell
+# Args: $1 = path to the .env file (missing file is a no-op)
+load_env_file() {
+  _lef_file="$1"
+  [ -f "$_lef_file" ] || return 0
+  while IFS= read -r _lef_line || [ -n "$_lef_line" ]; do
+    # Strip a trailing CR (in case the file has CRLF line endings).
+    _lef_line=${_lef_line%$(printf '\r')}
+    # Skip blank lines and comments (allow leading whitespace before '#').
+    case "$_lef_line" in
+      ''|'#'*) continue ;;
+      *) ;;
+    esac
+    _lef_trim=${_lef_line#"${_lef_line%%[![:space:]]*}"}
+    case "$_lef_trim" in
+      ''|'#'*) continue ;;
+    esac
+    # Tolerate an optional `export ` prefix.
+    case "$_lef_trim" in
+      export\ *) _lef_trim=${_lef_trim#export } ;;
+    esac
+    # A line without '=' is not a valid assignment; skip it.
+    case "$_lef_trim" in
+      *=*) ;;
+      *) continue ;;
+    esac
+    _lef_key=${_lef_trim%%=*}
+    _lef_val=${_lef_trim#*=}
+    # Trim surrounding whitespace from the key only.
+    _lef_key=${_lef_key#"${_lef_key%%[![:space:]]*}"}
+    _lef_key=${_lef_key%"${_lef_key##*[![:space:]]}"}
+    [ -n "$_lef_key" ] || continue
+    # Remove one layer of matching surrounding quotes from the value.
+    case "$_lef_val" in
+      \"*\") _lef_val=${_lef_val#\"}; _lef_val=${_lef_val%\"} ;;
+      \'*\') _lef_val=${_lef_val#\'}; _lef_val=${_lef_val%\'} ;;
+    esac
+    export "${_lef_key}=${_lef_val}"
+  done < "$_lef_file"
+}

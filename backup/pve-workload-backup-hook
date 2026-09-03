@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BACKUP_CONFIG="${BACKUP_CONFIG:-/etc/pve-workload-backup.conf}"
+if [[ -r "$BACKUP_CONFIG" ]]; then
+  # shellcheck source=/dev/null
+  source "$BACKUP_CONFIG"
+fi
+BACKUP_STORAGE="${BACKUP_STORAGE:-SYNOLOGY}"
+BACKUP_TMPDIR="${BACKUP_TMPDIR:-/TEMP/vzdump-tmp}"
+BACKUP_TEMP_DEVICE="${BACKUP_TEMP_DEVICE:-/dev/pve/temp}"
+BACKUP_TEMP_FILESYSTEM="${BACKUP_TEMP_FILESYSTEM:-ext4}"
+BACKUP_TEMP_SIZE_MULTIPLIER="${BACKUP_TEMP_SIZE_MULTIPLIER:-2}"
+BACKUP_STATE_DIR="${BACKUP_STATE_DIR:-/var/lib/pve-workload-backup}"
+BACKUP_HEADROOM_PERCENT="${BACKUP_HEADROOM_PERCENT:-20}"
+BACKUP_MOUNT="${BACKUP_MOUNT:-/mnt/pve/${BACKUP_STORAGE}}"
+WORKLOAD_ROOT="${WORKLOAD_ROOT:-${BACKUP_MOUNT}/workloads}"
+
+fail() { echo "ERROR: $*" >&2; return 1; }
+log() { printf 'WORKLOAD-BACKUP [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+require_commands() {
+  local command_name missing=()
+  for command_name in "$@"; do
+    command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || { fail "Missing required commands: ${missing[*]}"; return 1; }
+}
+
+storage_mount() { printf '%s\n' "$BACKUP_MOUNT"; }
+
+cleanup_stale_probe_dirs() {
+  local mount_path="$1"
+  find "$mount_path" -mindepth 1 -maxdepth 1 -type d -name '.workload-backup-probe.*' -mmin +60 -exec rm -rf -- {} +
+}
+
+validate_local_tmpdir() {
+  local fs_type ownership mountpoint mounted_source
+  [[ "$BACKUP_TMPDIR" == /* && -d "$BACKUP_TMPDIR" && ! -L "$BACKUP_TMPDIR" && -w "$BACKUP_TMPDIR" ]] || {
+    fail "Local vzdump tmpdir is unavailable or unsafe: ${BACKUP_TMPDIR}"
+    return 1
+  }
+  [[ "$(realpath -e "$BACKUP_TMPDIR")" == "$BACKUP_TMPDIR" ]] || {
+    fail "Local vzdump tmpdir contains a symlinked component: ${BACKUP_TMPDIR}"
+    return 1
+  }
+  ownership=$(stat -c '%a:%u:%g' "$BACKUP_TMPDIR" 2>/dev/null || true)
+  [[ "$ownership" == "1777:0:0" ]] || {
+    fail "Local vzdump tmpdir must be root-owned mode 1777 (found ${ownership:-unknown}): ${BACKUP_TMPDIR}"
+    return 1
+  }
+  mountpoint=$(dirname "$BACKUP_TMPDIR")
+  fs_type=$(findmnt -n -o FSTYPE --target "$mountpoint" 2>/dev/null || true)
+  mounted_source=$(findmnt -n -o SOURCE --target "$mountpoint" 2>/dev/null || true)
+  [[ "$fs_type" == "$BACKUP_TEMP_FILESYSTEM" ]] || {
+    fail "TEMP storage must use ${BACKUP_TEMP_FILESYSTEM}, not ${fs_type:-unknown}: ${mountpoint}"
+    return 1
+  }
+  [[ -e "$BACKUP_TEMP_DEVICE" && "$(readlink -f "$mounted_source")" == "$(readlink -f "$BACKUP_TEMP_DEVICE")" ]] || {
+    fail "TEMP storage must be mounted from ${BACKUP_TEMP_DEVICE}, not ${mounted_source:-unknown}: ${mountpoint}"
+    return 1
+  }
+}
+
+size_to_bytes() {
+  local value="${1:-}" number unit multiplier
+  [[ "$value" =~ ^([0-9]+)([KMGT])$ ]] || return 1
+  number="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  case "$unit" in
+    K) multiplier=1024 ;;
+    M) multiplier=1048576 ;;
+    G) multiplier=1073741824 ;;
+    T) multiplier=1099511627776 ;;
+  esac
+  printf '%s\n' "$((number * multiplier))"
+}
+
+validate_temp_capacity_for_ct() {
+  local ctid="$1" config rootfs size_value rootfs_bytes temp_device available_bytes required_bytes
+  config=$(pct config "$ctid" 2>/dev/null) || { fail "Cannot read CT ${ctid} configuration."; return 1; }
+  rootfs=$(awk -F': ' '$1 == "rootfs" {print $2}' <<<"$config")
+  size_value=$(grep -oE '(^|,)size=[0-9]+[KMGT](,|$)' <<<"$rootfs" | head -n1 | sed -E 's/(^|,)size=//; s/,$//' || true)
+  rootfs_bytes=$(size_to_bytes "$size_value") || { fail "Cannot determine CT ${ctid} rootfs size."; return 1; }
+  temp_device=$(findmnt -rn -o SOURCE --target "$(dirname "$BACKUP_TMPDIR")" 2>/dev/null || true)
+  [[ -n "$temp_device" ]] || { fail "Cannot determine TEMP block device."; return 1; }
+  available_bytes=$(blockdev --getsize64 "$temp_device" 2>/dev/null || true)
+  [[ "$available_bytes" =~ ^[0-9]+$ ]] || { fail "Cannot determine TEMP block-device capacity."; return 1; }
+  required_bytes=$((rootfs_bytes * BACKUP_TEMP_SIZE_MULTIPLIER))
+  (( available_bytes >= required_bytes )) || {
+    fail "TEMP storage is undersized for CT ${ctid}; rerun backupCT.sh --provision-temp."
+    return 1
+  }
+}
+
+validate_nfs_storage() {
+  local mount_path fs_type probe_dir first second config status node content
+  mount_path=$(storage_mount)
+  node=$(hostname -s)
+  config=$(pvesh get "/storage/${BACKUP_STORAGE}" --output-format json 2>/dev/null) || {
+    fail "PVE storage ${BACKUP_STORAGE} is not configured."
+    return 1
+  }
+  [[ "$(jq -r '.type // ""' <<<"$config")" == nfs ]] || { fail "PVE storage ${BACKUP_STORAGE} must be type nfs."; return 1; }
+  [[ "$(jq -r '.shared // 0' <<<"$config")" == 1 ]] || { fail "PVE storage ${BACKUP_STORAGE} must be shared."; return 1; }
+  content=$(jq -r '.content // ""' <<<"$config")
+  tr ',' '\n' <<<"$content" | grep -Fxq backup || { fail "PVE storage ${BACKUP_STORAGE} must allow backup content."; return 1; }
+  status=$(pvesh get "/nodes/${node}/storage/${BACKUP_STORAGE}/status" --output-format json 2>/dev/null) || {
+    fail "Cannot read ${BACKUP_STORAGE} status on ${node}."
+    return 1
+  }
+  [[ "$(jq -r '.active // 0' <<<"$status")" == 1 ]] || { fail "PVE storage ${BACKUP_STORAGE} is inactive on ${node}."; return 1; }
+  [[ -d "$mount_path" && -w "$mount_path" ]] || { fail "${BACKUP_STORAGE} is not mounted writable at ${mount_path}."; return 1; }
+  fs_type=$(findmnt -n -o FSTYPE --target "$mount_path" 2>/dev/null || true)
+  [[ "$fs_type" == nfs || "$fs_type" == nfs4 ]] || { fail "${mount_path} must be NFS (found ${fs_type:-unknown})."; return 1; }
+
+  cleanup_stale_probe_dirs "$mount_path"
+  probe_dir="${mount_path}/.workload-backup-probe.$$"
+  first="${probe_dir}/first"
+  second="${probe_dir}/second"
+  mkdir "$probe_dir"
+  trap 'rm -rf "$probe_dir"' RETURN
+  printf 'hard-link-probe\n' >"$first"
+  ln "$first" "$second" || { fail "NFS storage does not support hard links."; return 1; }
+  [[ "$(stat -c '%d:%i' "$first")" == "$(stat -c '%d:%i' "$second")" ]] || { fail "NFS hard-link identity check failed."; return 1; }
+  mv "$second" "${second}.renamed" || { fail "NFS atomic rename probe failed."; return 1; }
+  chown 1234:2345 "$first" || {
+    fail "NFS storage must allow numeric ownership preservation from this PVE node; check Synology NFS squash mapping."
+    return 1
+  }
+  [[ "$(stat -c '%u:%g' "$first")" == "1234:2345" ]] || {
+    fail "NFS storage did not preserve numeric ownership."
+    return 1
+  }
+  rm -rf "$probe_dir"
+  trap - RETURN
+}
+
+reconcile_stale_state() {
+  local file ctid snapshot
+  mkdir -p "$BACKUP_STATE_DIR"
+  for file in "$BACKUP_STATE_DIR"/*.json; do
+    [[ -e "$file" ]] || continue
+    jq -e '.ctid and .generation and (.snapshots | type == "array")' "$file" >/dev/null 2>&1 || {
+      fail "Unrecognized stale state must be inspected manually: ${file}"
+      return 1
+    }
+    ctid=$(jq -r '.ctid' "$file")
+    while IFS= read -r snapshot; do
+      [[ "$snapshot" == *@pending-"${ctid}"-* ]] || { fail "Refusing unknown snapshot in ${file}: ${snapshot}"; return 1; }
+    done < <(jq -r '.snapshots[]?.name // empty' "$file")
+    destroy_snapshots "$ctid" || return 1
+    rm -f "$file"
+  done
+  find "$WORKLOAD_ROOT" -mindepth 2 -maxdepth 2 -type d -name '.tmp-vzdump-lxc-*' -exec rm -rf {} + 2>/dev/null || true
+}
+
+snapshot_source_info() {
+  local path="$1" source target dataset mountpoint available used total free_percent
+  [[ -d "$path" && ! -L "$path" ]] || { fail "Snapshot source is missing or symlinked: ${path}"; return 1; }
+  [[ "$(realpath -e "$path")" == "$path" ]] || { fail "Snapshot source contains a symlinked component: ${path}"; return 1; }
+  source=$(findmnt -n -o SOURCE --target "$path" 2>/dev/null || true)
+  target=$(findmnt -n -o TARGET --target "$path" 2>/dev/null || true)
+  [[ -n "$source" && -n "$target" ]] || { fail "Cannot resolve mount backing ${path}."; return 1; }
+  dataset=$(zfs list -H -o name "$source" 2>/dev/null || true)
+  [[ "$dataset" == "$source" ]] || { fail "Unsupported snapshot backend for ${path} (source ${source})."; return 1; }
+  mountpoint=$(zfs get -H -o value mountpoint "$dataset" 2>/dev/null || true)
+  [[ "$mountpoint" == "$target" ]] || { fail "ZFS mountpoint mismatch for ${path}: ${mountpoint:-unknown} != ${target}."; return 1; }
+  available=$(zfs get -Hp -o value available "$dataset" 2>/dev/null || true)
+  used=$(zfs get -Hp -o value used "$dataset" 2>/dev/null || true)
+  [[ "$available" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ ]] || { fail "Cannot determine ZFS headroom for ${dataset}."; return 1; }
+  total=$((available + used))
+  (( total > 0 )) || { fail "Invalid ZFS capacity for ${dataset}."; return 1; }
+  free_percent=$((available * 100 / total))
+  (( free_percent >= BACKUP_HEADROOM_PERCENT )) || { fail "${dataset} has ${free_percent}% free; ${BACKUP_HEADROOM_PERCENT}% is required."; return 1; }
+  printf '%s\t%s\t%s\n' "$dataset" "$mountpoint" "${path#"${mountpoint}/"}"
+}
+
+resolve_ct_sources() {
+  local ctid="$1" config hostname expected_docker expected_data line key value source
+  config=$(pct config "$ctid" 2>/dev/null) || { fail "Cannot read CT ${ctid} configuration."; return 1; }
+  hostname=$(awk -F': ' '$1 == "hostname" {print $2}' <<<"$config")
+  [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || { fail "CT ${ctid} has an invalid hostname."; return 1; }
+  expected_docker="/mnt/docker/${hostname}"
+  expected_data="/mnt/docker-data/${hostname}"
+  CT_DOCKER_SOURCE=""
+  CT_DATA_SOURCE=""
+  while IFS= read -r line; do
+    key="${line%%:*}"
+    value="${line#*: }"
+    source="${value%%,*}"
+    case "$source" in
+      "$expected_docker") CT_DOCKER_SOURCE="$source" ;;
+      "$expected_data") CT_DATA_SOURCE="$source" ;;
+    esac
+  done < <(grep -E '^mp[0-9]+:' <<<"$config" || true)
+  [[ "$CT_DOCKER_SOURCE" == "$expected_docker" ]] || { fail "CT ${ctid} does not bind ${expected_docker}."; return 1; }
+  [[ "$CT_DATA_SOURCE" == "$expected_data" ]] || { fail "CT ${ctid} does not bind ${expected_data}."; return 1; }
+  CT_HOSTNAME="$hostname"
+}
+
+is_restore_test_ct() {
+  local ctid="$1" config tags
+  config=$(pct config "$ctid" 2>/dev/null) || return 1
+  tags=$(awk -F': ' '$1 == "tags" {print $2}' <<<"$config")
+  tr ';' '\n' <<<"$tags" | grep -Fxq backup-restore-test
+}
+
+state_file() { printf '%s/%s.json\n' "$BACKUP_STATE_DIR" "$1"; }
+
+write_state() {
+  local ctid="$1" json="$2" file temporary
+  file=$(state_file "$ctid")
+  temporary="${file}.tmp.$$"
+  printf '%s\n' "$json" >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$file"
+}
+
+update_state() {
+  local ctid="$1" file json
+  shift
+  file=$(state_file "$ctid")
+  [[ -f "$file" ]] || { fail "No pending backup state for CT ${ctid}."; return 1; }
+  json=$(jq -c "$@" "$file") || { fail "Cannot update CT ${ctid} backup state."; return 1; }
+  write_state "$ctid" "$json"
+}
+
+destroy_snapshots() {
+  local ctid="$1" file snapshot
+  file=$(state_file "$ctid")
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r snapshot; do
+    [[ -n "$snapshot" ]] || continue
+    zfs list -H -t snapshot -o name "$snapshot" >/dev/null 2>&1 || continue
+    zfs destroy "$snapshot"
+  done < <(jq -r '.snapshots[]?.name // empty' "$file")
+}
+
+prepare_backup() {
+  local mode="$1" ctid="$2" generation status json
+  [[ "$mode" == suspend ]] || { fail "CT ${ctid} backup mode must be suspend."; return 1; }
+  validate_local_tmpdir || return 1
+  validate_temp_capacity_for_ct "$ctid" || return 1
+  resolve_ct_sources "$ctid" || return 1
+  snapshot_source_info "$CT_DOCKER_SOURCE" >/dev/null || return 1
+  snapshot_source_info "$CT_DATA_SOURCE" >/dev/null || return 1
+  generation="pending-${ctid}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  status=$(pct status "$ctid" 2>/dev/null | awk '{print $2}')
+  json=$(jq -nc --arg ctid "$ctid" --arg hostname "$CT_HOSTNAME" --arg generation "$generation" \
+    --arg docker "$CT_DOCKER_SOURCE" --arg data "$CT_DATA_SOURCE" --arg status "$status" \
+    '{ctid:$ctid,hostname:$hostname,generation:$generation,docker_source:$docker,data_source:$data,original_status:$status,phase:"prepared",snapshots:[]}')
+  write_state "$ctid" "$json"
+  log "CT ${ctid}: validated ${CT_HOSTNAME}; waiting for Proxmox suspend window"
+}
+
+create_snapshots() {
+  local ctid="$1" file generation hostname docker_info data_info dataset mountpoint relative snapshot snapshot_path json
+  file=$(state_file "$ctid")
+  [[ -f "$file" ]] || { fail "No pending backup state for CT ${ctid}."; return 1; }
+  generation=$(jq -r '.generation' "$file")
+  hostname=$(jq -r '.hostname' "$file")
+  docker_info=$(snapshot_source_info "$(jq -r '.docker_source' "$file")") || return 1
+  data_info=$(snapshot_source_info "$(jq -r '.data_source' "$file")") || return 1
+  json=$(cat "$file")
+  log "CT ${ctid}: creating workload snapshots while guest is suspended"
+  for entry in "$docker_info" "$data_info"; do
+    IFS=$'\t' read -r dataset mountpoint relative <<<"$entry"
+    snapshot="${dataset}@${generation}"
+    if ! jq -e --arg name "$snapshot" '.snapshots[]? | select(.name == $name)' >/dev/null <<<"$json"; then
+      if ! zfs snapshot "$snapshot"; then
+        write_state "$ctid" "$json"
+        destroy_snapshots "$ctid" || true
+        fail "Failed to create ${snapshot}."
+        return 1
+      fi
+    fi
+    snapshot_path="${mountpoint}/.zfs/snapshot/${generation}/${relative}"
+    if [[ ! -d "$snapshot_path" ]]; then
+      zfs destroy "$snapshot" || true
+      write_state "$ctid" "$json"
+      destroy_snapshots "$ctid" || true
+      fail "Snapshot path is unavailable: ${snapshot_path}"
+      return 1
+    fi
+    json=$(jq -c --arg name "$snapshot" --arg path "$snapshot_path" '.snapshots += [{name:$name,path:$path}]' <<<"$json")
+    write_state "$ctid" "$json"
+  done
+  update_state "$ctid" '.phase = "snapshotted"'
+  log "CT ${ctid}: both workload snapshots are ready"
+}
+
+archive_stem() {
+  local target="$1" basename
+  basename=$(basename "$target")
+  [[ "$basename" == vzdump-lxc-*.tar.zst ]] || {
+    fail "Unexpected CT archive name: ${basename}"
+    return 1
+  }
+  printf '%s\n' "${basename%.tar.zst}"
+}
+
+latest_basis() {
+  local hostname="$1" exclude="$2" host_root candidate stem archive
+  host_root="${WORKLOAD_ROOT}/${hostname}"
+  [[ -d "$host_root" ]] || return 0
+  while IFS= read -r candidate; do
+    [[ -d "$candidate/docker" && -d "$candidate/docker-data" ]] || continue
+    stem=$(basename "$candidate")
+    [[ "$stem" != "$exclude" ]] || continue
+    archive="$(storage_mount)/dump/${stem}.tar.zst"
+    [[ -f "$archive" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done < <(find "$host_root" -mindepth 1 -maxdepth 1 -type d ! -name '.tmp-*' -print | sort -r)
+}
+
+verify_hard_links() {
+  local basis="$1" destination="$2" relative basis_file destination_file basis_meta destination_meta
+  [[ -n "$basis" ]] || return 0
+  while IFS= read -r -d '' basis_file; do
+    relative="${basis_file#"${basis}/"}"
+    destination_file="${destination}/${relative}"
+    [[ -f "$destination_file" ]] || continue
+    basis_meta=$(stat -c '%f:%u:%g:%s:%y' "$basis_file")
+    destination_meta=$(stat -c '%f:%u:%g:%s:%y' "$destination_file")
+    [[ "$basis_meta" == "$destination_meta" ]] || continue
+    [[ "$(stat -c '%d:%i' "$basis_file")" == "$(stat -c '%d:%i' "$destination_file")" ]] || fail "Unchanged file was not hard-linked: ${relative}"
+  done < <(find "$basis" -type f -print0)
+}
+
+mirror_generation() {
+  local ctid="$1" target="$2" file hostname stem host_root final temporary basis snapshots docker_snapshot data_snapshot
+  file=$(state_file "$ctid")
+  [[ -f "$file" ]] || { fail "No pending backup state for CT ${ctid}."; return 1; }
+  [[ "$(jq -r '.phase' "$file")" == ready ]] || { fail "CT ${ctid} snapshots are not ready to mirror."; return 1; }
+  [[ -f "$target" ]] || { fail "PVE archive does not exist: ${target}"; return 1; }
+  stem=$(archive_stem "$target") || return 1
+  hostname=$(jq -r '.hostname' "$file")
+  host_root="${WORKLOAD_ROOT}/${hostname}"
+  final="${host_root}/${stem}"
+  temporary="${host_root}/.tmp-${stem}-$$"
+  [[ ! -e "$final" ]] || { fail "Workload generation already exists: ${final}"; return 1; }
+  mkdir -p "$temporary/docker" "$temporary/docker-data"
+  trap 'rm -rf "$temporary"' RETURN
+  basis=$(latest_basis "$hostname" "$stem")
+  mapfile -t snapshots < <(jq -r '.snapshots[].path' "$file")
+  [[ ${#snapshots[@]} -eq 2 ]] || { fail "CT ${ctid} does not have two snapshots."; return 1; }
+  docker_snapshot="${snapshots[0]}"
+  data_snapshot="${snapshots[1]}"
+  # Keep hook output bounded. Per-file/progress2 output is relayed through the
+  # Proxmox task writer and can block finalization when its terminal backs up.
+  local options=(-aHAXS --numeric-ids --delete --modify-window=-1 --human-readable --info=stats1)
+  if [[ -n "$basis" ]]; then
+    log "CT ${ctid}: building ${stem} using basis $(basename "$basis")"
+    rsync "${options[@]}" --link-dest="${basis}/docker" "${docker_snapshot}/" "${temporary}/docker/"
+    rsync "${options[@]}" --link-dest="${basis}/docker-data" "${data_snapshot}/" "${temporary}/docker-data/"
+    verify_hard_links "${basis}/docker" "${temporary}/docker" || return 1
+    verify_hard_links "${basis}/docker-data" "${temporary}/docker-data" || return 1
+  else
+    log "CT ${ctid}: building first full workload generation ${stem}"
+    rsync "${options[@]}" "${docker_snapshot}/" "${temporary}/docker/"
+    rsync "${options[@]}" "${data_snapshot}/" "${temporary}/docker-data/"
+  fi
+  [[ "$(stat -c %d "$temporary")" == "$(stat -c %d "$host_root")" ]] || { fail "Temporary and final generation paths cross filesystems."; return 1; }
+  mv "$temporary" "$final"
+  trap - RETURN
+  update_state "$ctid" --arg target "$target" --arg final "$final" '.phase = "mirrored" | .target = $target | .generation_path = $final'
+  log "CT ${ctid}: finalized complete workload generation ${final}"
+}
+
+prune_orphan_generations() {
+  local generation stem
+  [[ -d "$WORKLOAD_ROOT" ]] || return 0
+  while IFS= read -r -d '' generation; do
+    stem=$(basename "$generation")
+    [[ -f "$(storage_mount)/dump/${stem}.tar.zst" ]] || rm -rf "$generation"
+  done < <(find "$WORKLOAD_ROOT" -mindepth 2 -maxdepth 2 -type d ! -name '.tmp-*' -print0)
+}
+
+audit_node() {
+  local node path info dataset mountpoint relative ctid
+  require_commands findmnt jq pct pvesh realpath stat zfs
+  validate_local_tmpdir
+  validate_nfs_storage
+  node=$(hostname -s)
+  echo "Node ${node}:"
+  echo "  ${BACKUP_TMPDIR}: local vzdump staging=ok"
+  for path in /mnt/docker /mnt/docker-data; do
+    info=$(snapshot_source_info "$path")
+    IFS=$'\t' read -r dataset mountpoint relative <<<"$info"
+    echo "  ${path}: zfs dataset=${dataset} mountpoint=${mountpoint}"
+  done
+  while IFS= read -r ctid; do
+    [[ "$ctid" =~ ^[0-9]+$ ]] || continue
+    if is_restore_test_ct "$ctid"; then
+      echo "  CT ${ctid}: isolated restore test=skipped"
+      continue
+    fi
+    resolve_ct_sources "$ctid"
+    snapshot_source_info "$CT_DOCKER_SOURCE" >/dev/null
+    snapshot_source_info "$CT_DATA_SOURCE" >/dev/null
+    echo "  CT ${ctid} (${CT_HOSTNAME}): isolated bind sources=ok"
+  done < <(pct list 2>/dev/null | awk 'NR > 1 {print $1}')
+  echo "  $(storage_mount): nfs hard-links=ok atomic-rename=ok numeric-ownership=ok"
+}
+
+hook_phase() {
+  local phase="$1" mode="${2:-}" ctid="${3:-}" target="${TARGET:-}" lock_fd
+  require_commands findmnt flock jq pct pvesh realpath rsync stat zfs
+  mkdir -p "$BACKUP_STATE_DIR"
+  chmod 700 "$BACKUP_STATE_DIR"
+  if [[ "$ctid" =~ ^[0-9]+$ ]]; then
+    exec {lock_fd}>"${BACKUP_STATE_DIR}/${ctid}.lock"
+    flock -n "$lock_fd" || { fail "Backup state for CT ${ctid} is busy."; return 1; }
+  fi
+  log "phase=${phase}${ctid:+ ctid=${ctid}}${mode:+ mode=${mode}}"
+  case "$phase" in
+    job-init)
+      validate_local_tmpdir
+      validate_nfs_storage
+      reconcile_stale_state
+      ;;
+    job-start) validate_nfs_storage ;;
+    backup-start)
+      [[ ! -e "$(state_file "$ctid")" ]] || { fail "Pending state already exists for CT ${ctid}."; return 1; }
+      prepare_backup "$mode" "$ctid"
+      ;;
+    pre-stop)
+      resolve_ct_sources "$ctid"
+      snapshot_source_info "$CT_DOCKER_SOURCE" >/dev/null
+      snapshot_source_info "$CT_DATA_SOURCE" >/dev/null
+      ;;
+    pre-restart) create_snapshots "$ctid" ;;
+    post-restart)
+      [[ "$(pct status "$ctid" 2>/dev/null | awk '{print $2}')" == running ]] || fail "CT ${ctid} did not resume."
+      update_state "$ctid" '.phase = "ready"'
+      ;;
+    backup-end) mirror_generation "$ctid" "$target" ;;
+    backup-abort)
+      rm -rf "${WORKLOAD_ROOT}"/*/.tmp-* 2>/dev/null || true
+      destroy_snapshots "$ctid" || true
+      rm -f "$(state_file "$ctid")"
+      ;;
+    job-abort) find "$WORKLOAD_ROOT" -mindepth 2 -maxdepth 2 -type d -name '.tmp-*' -exec rm -rf {} + 2>/dev/null || true ;;
+    job-end)
+      prune_orphan_generations
+      local pending
+      for pending in "$BACKUP_STATE_DIR"/*.json; do
+        [[ -e "$pending" ]] || continue
+        ctid=$(basename "$pending" .json)
+        destroy_snapshots "$ctid"
+        rm -f "$pending"
+      done
+      ;;
+    log-end) : ;;
+    *) fail "Unsupported vzdump hook phase: ${phase}" ;;
+  esac
+}
+
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]:-}" == "$0" ]]; then
+  case "${1:-}" in
+    audit-node) audit_node ;;
+    '') fail "Missing hook phase." ;;
+    *) hook_phase "$@" ;;
+  esac
+fi

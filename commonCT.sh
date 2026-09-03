@@ -25,7 +25,7 @@
 #   configure_syslog_forwarding  Configure busybox syslogd remote logging
 #   configure_step_ca         Install step-cli, bootstrap CA trust
 #   configure_registry_logins  Authenticate Docker to configured registries
-#   configure_gpu_passthrough Configure GPU passthrough (VAAPI)
+#   reconcile_ct_gpu_config  Reconcile runtime-discovered DRM passthrough
 #   configure_docker_watchdog Boot-time watchdog that retries Docker startup
 #
 #   Host-specific behavior:
@@ -122,6 +122,97 @@ CT_HOSTNAME=""
 STATUS_BAR_ENABLED=false
 STATUS_BAR_TEXT=""
 
+# Lifecycle run-log state
+LIFECYCLE_LOG_ACTIVE=false
+LIFECYCLE_LOG_STOPPED=false
+RUN_LOG_FILE=""
+RUN_LOG_STARTED_AT=""
+RUN_LOG_STARTED_EPOCH=""
+RUN_LOG_TEE_PID=""
+
+redact_lifecycle_args() {
+  local redact_next=false arg name
+  for arg in "$@"; do
+    if [[ "$redact_next" == "true" ]]; then
+      printf ' %q' 'REDACTED'
+      redact_next=false
+      continue
+    fi
+    name="${arg%%=*}"
+    if [[ "$arg" == *=* && "${name,,}" =~ (password|passwd|token|secret|apikey|api-key) ]]; then
+      printf ' %q' "${name}=REDACTED"
+    elif [[ "${arg,,}" =~ ^--?(password|passwd|token|secret|apikey|api-key)$ ]]; then
+      printf ' %q' "$arg"
+      redact_next=true
+    else
+      printf ' %q' "$arg"
+    fi
+  done
+}
+
+lifecycle_log_init() {
+  local script_path="${1:-}" script_name log_dir arguments
+  shift || true
+  [[ "$LIFECYCLE_LOG_ACTIVE" != "true" ]] || return 0
+  [[ -n "$script_path" ]] || { echo "ERROR: Lifecycle logger requires a script path." >&2; return 1; }
+  script_name=$(basename "$script_path" .sh)
+  log_dir="${LIFECYCLE_LOG_DIR:-${SCRIPT_DIR}/logs}"
+  umask 077
+  mkdir -p "$log_dir" || { echo "ERROR: Cannot create lifecycle log directory: ${log_dir}" >&2; return 1; }
+  chmod 0700 "$log_dir" || { echo "ERROR: Cannot secure lifecycle log directory: ${log_dir}" >&2; return 1; }
+  RUN_LOG_FILE="${log_dir}/${script_name}.log"
+  : > "$RUN_LOG_FILE" || { echo "ERROR: Cannot create lifecycle log: ${RUN_LOG_FILE}" >&2; return 1; }
+  chmod 0600 "$RUN_LOG_FILE" || { echo "ERROR: Cannot secure lifecycle log: ${RUN_LOG_FILE}" >&2; return 1; }
+  exec 8>&1 9>&2
+  exec > >(tee -a "$RUN_LOG_FILE" >&8) 2>&1
+  RUN_LOG_TEE_PID=$!
+  LIFECYCLE_LOG_ACTIVE=true
+  LIFECYCLE_LOG_STOPPED=false
+  RUN_LOG_STARTED_AT=$(date -Is)
+  RUN_LOG_STARTED_EPOCH=$(date +%s)
+  arguments=$(redact_lifecycle_args "$@")
+  printf '=== lifecycle run start ===\n'
+  printf 'started=%s script=%s host=%s pid=%s cwd=%q\n' \
+    "$RUN_LOG_STARTED_AT" "$script_name" "$(hostname -s)" "$$" "$PWD"
+  printf 'arguments:%s\n' "$arguments"
+  printf 'log=%s\n' "$RUN_LOG_FILE"
+  trap 'lifecycle_signal_handler HUP 129' HUP
+  trap 'lifecycle_signal_handler INT 130' INT
+  trap 'lifecycle_signal_handler TERM 143' TERM
+}
+
+lifecycle_log_stop() {
+  local exit_code="${1:-0}" ended_epoch duration
+  [[ "$LIFECYCLE_LOG_ACTIVE" == "true" && "$LIFECYCLE_LOG_STOPPED" != "true" ]] || return 0
+  ended_epoch=$(date +%s)
+  duration=$((ended_epoch - RUN_LOG_STARTED_EPOCH))
+  printf '=== lifecycle run end ===\n'
+  printf 'ended=%s exit_status=%s duration_seconds=%s\n' "$(date -Is)" "$exit_code" "$duration"
+  exec 1>&8 2>&9
+  exec 8>&- 9>&-
+  if [[ -n "$RUN_LOG_TEE_PID" ]]; then
+    wait "$RUN_LOG_TEE_PID" 2>/dev/null || true
+  fi
+  RUN_LOG_TEE_PID=""
+  LIFECYCLE_LOG_ACTIVE=false
+  LIFECYCLE_LOG_STOPPED=true
+}
+
+lifecycle_exit_handler() {
+  local exit_code=$?
+  trap - EXIT
+  status_bar_cleanup || true
+  lifecycle_log_stop "$exit_code" || true
+  exit "$exit_code"
+}
+
+lifecycle_signal_handler() {
+  local signal="${1:-UNKNOWN}" exit_code="${2:-1}"
+  trap - HUP INT TERM
+  printf 'signal=%s\n' "$signal"
+  exit "$exit_code"
+}
+
 # -----------------------------
 # STATUS BAR FUNCTIONS
 # -----------------------------
@@ -129,25 +220,30 @@ STATUS_BAR_TEXT=""
 # Initialize status bar (reserves bottom line of terminal)
 # Call this before starting operations that use status_update
 status_bar_init() {
+  local output_fd=1
+  [[ "$LIFECYCLE_LOG_ACTIVE" == "true" ]] && output_fd=8
+  [[ -t "$output_fd" ]] || { STATUS_BAR_ENABLED=false; return 0; }
   STATUS_BAR_ENABLED=true
   local rows
   rows=$(tput lines)
   # Clear screen first
-  clear
+  clear >&"$output_fd"
   # Set scroll region to exclude last line
-  printf '\e[1;%dr' "$((rows-1))"
+  printf '\e[1;%dr' "$((rows-1))" >&"$output_fd"
   # Move cursor to top-left of scroll region
-  printf '\e[1;1H'
+  printf '\e[1;1H' >&"$output_fd"
   # Clear the status line and set initial text
-  printf '\e[%d;1H\e[0;7m Starting...\e[K\e[0m' "$rows"
+  printf '\e[%d;1H\e[0;7m Starting...\e[K\e[0m' "$rows" >&"$output_fd"
   # Move cursor back to scroll region
-  printf '\e[1;1H'
+  printf '\e[1;1H' >&"$output_fd"
 }
 
 # Update the status bar text
 # Args: $1 = status text
 status_update() {
   [[ "$STATUS_BAR_ENABLED" != "true" ]] && return
+  local output_fd=1
+  [[ "$LIFECYCLE_LOG_ACTIVE" == "true" ]] && output_fd=8
   STATUS_BAR_TEXT="$1"
   local rows cols
   rows=$(tput lines)
@@ -155,7 +251,7 @@ status_update() {
   # Truncate text if too long
   local text="${1:0:$((cols-2))}"
   # Save cursor, move to status line (outside scroll region), print, restore
-  printf '\e7\e[%d;1H\e[0;7m %s\e[K\e[0m\e8' "$rows" "$text"
+  printf '\e7\e[%d;1H\e[0;7m %s\e[K\e[0m\e8' "$rows" "$text" >&"$output_fd"
 }
 
 # Update status bar with progress info
@@ -169,20 +265,22 @@ status_progress() {
 # Clean up status bar (restore full scroll region)
 status_bar_cleanup() {
   if [[ "$STATUS_BAR_ENABLED" == "true" ]]; then
+    local output_fd=1
+    [[ "$LIFECYCLE_LOG_ACTIVE" == "true" ]] && output_fd=8
     local rows
     rows=$(tput lines)
     # Restore full scroll region
-    printf '\e[1;%dr' "$rows"
+    printf '\e[1;%dr' "$rows" >&"$output_fd"
     # Clear status line
-    printf '\e[%d;1H\e[K' "$rows"
+    printf '\e[%d;1H\e[K' "$rows" >&"$output_fd"
     # Move cursor to bottom of restored region
-    printf '\e[%d;1H' "$((rows-1))"
+    printf '\e[%d;1H' "$((rows-1))" >&"$output_fd"
     STATUS_BAR_ENABLED=false
   fi
 }
 
-# Trap to ensure cleanup on exit
-trap 'status_bar_cleanup' EXIT
+# Trap to ensure terminal and lifecycle-log cleanup on exit.
+trap lifecycle_exit_handler EXIT
 
 # -----------------------------
 # CONFIGURATION FUNCTIONS
@@ -358,6 +456,145 @@ config_get_size_memory() {
     return 1
   fi
   jq -r ".sizes.\"${size}\".memory // empty" "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Read one required backup policy value using a jq expression.
+config_get_backup_value() {
+  local expression="${1:-}"
+  [[ -n "$expression" ]] || return 1
+  config_exists || return 1
+  jq -er "$expression" "${CONFIG_FILE}" 2>/dev/null
+}
+
+config_get_backup_storage() { config_get_backup_value '.backup.storage'; }
+config_get_backup_tmpdir() { config_get_backup_value '.backup.tmpdir'; }
+config_get_backup_temp_storage_id() { config_get_backup_value '.backup.temp_storage.storage_id'; }
+config_get_backup_temp_vg() { config_get_backup_value '.backup.temp_storage.vg'; }
+config_get_backup_temp_thin_pool() { config_get_backup_value '.backup.temp_storage.thin_pool'; }
+config_get_backup_temp_lv() { config_get_backup_value '.backup.temp_storage.lv'; }
+config_get_backup_temp_filesystem() { config_get_backup_value '.backup.temp_storage.filesystem'; }
+config_get_backup_temp_size_multiplier() { config_get_backup_value '.backup.temp_storage.size_multiplier'; }
+config_get_backup_temp_headroom_percent() { config_get_backup_value '.backup.temp_storage.headroom_percent'; }
+config_get_backup_mode() { config_get_backup_value '.backup.mode'; }
+config_get_backup_schedule() { config_get_backup_value '.backup.schedule'; }
+config_get_backup_repeat_missed() { config_get_backup_value '.backup.repeat_missed'; }
+config_get_backup_compress() { config_get_backup_value '.backup.compress'; }
+config_get_backup_keep_daily() { config_get_backup_value '.backup.retention.keep_daily'; }
+config_get_backup_keep_weekly() { config_get_backup_value '.backup.retention.keep_weekly'; }
+config_get_backup_keep_monthly() { config_get_backup_value '.backup.retention.keep_monthly'; }
+config_get_backup_prune_policy() {
+  printf 'keep-daily=%s,keep-weekly=%s,keep-monthly=%s\n' \
+    "$(config_get_backup_keep_daily)" \
+    "$(config_get_backup_keep_weekly)" \
+    "$(config_get_backup_keep_monthly)"
+}
+config_get_backup_bwlimit_kib() { config_get_backup_value '.backup.bwlimit_kib'; }
+config_get_backup_ionice() { config_get_backup_value '.backup.ionice'; }
+config_get_backup_notification_mode() { config_get_backup_value '.backup.notification_mode'; }
+config_get_backup_snapshot_headroom_percent() { config_get_backup_value '.backup.snapshot_headroom_percent'; }
+config_get_backup_job_id() { config_get_backup_value '.backup.job_id'; }
+config_get_backup_hook_path() { config_get_backup_value '.backup.hook_path'; }
+config_get_backup_state_dir() { config_get_backup_value '.backup.state_dir'; }
+config_get_backup_exclude_tags() { config_get_backup_value '.backup.exclude_tags | @json'; }
+config_get_backup_vm_enabled() { config_get_backup_value '.backup.vm.enabled'; }
+config_get_backup_vm_job_id() { config_get_backup_value '.backup.vm.job_id'; }
+config_get_backup_vm_mode() { config_get_backup_value '.backup.vm.mode'; }
+config_get_backup_vm_schedule() { config_get_backup_value '.backup.vm.schedule'; }
+config_get_backup_vm_repeat_missed() { config_get_backup_value '.backup.vm.repeat_missed'; }
+config_get_backup_vm_restore_storage() { config_get_backup_value '.backup.vm.restore_storage'; }
+
+backup_resource_ids() {
+  local resource_type="${1:-}" resources="${2:-}" exclude_tags
+  [[ "$resource_type" == lxc || "$resource_type" == qemu ]] || {
+    echo "ERROR: Backup resource type must be lxc or qemu." >&2
+    return 1
+  }
+  exclude_tags=$(config_get_backup_exclude_tags) || return 1
+  if [[ -z "$resources" ]]; then
+    resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || return 1
+  fi
+  jq -r --arg type "$resource_type" --argjson excluded "$exclude_tags" '
+    [.[]
+      | select(.type == $type)
+      | select(((.tags // "") | split(";")) as $tags
+          | all($excluded[]; . as $tag | ($tags | index($tag)) == null))
+      | .vmid]
+    | sort
+    | map(tostring)
+    | join(",")
+  ' <<<"$resources"
+}
+
+validate_backup_config() {
+  local errors
+  config_exists || {
+    echo "ERROR: Config file not found: ${CONFIG_FILE}" >&2
+    return 1
+  }
+
+  if ! errors=$(jq -r '
+    def required_string($path; $value):
+      if ($value | type) != "string" or ($value | length) == 0 then $path + " must be a non-empty string" else empty end;
+    def nonnegative_integer($path; $value):
+      if ($value | type) != "number" or ($value | floor) != $value or $value < 0 then $path + " must be a non-negative integer" else empty end;
+    def ranged_integer($path; $value; $minimum; $maximum):
+      if ($value | type) != "number" or ($value | floor) != $value or $value < $minimum or $value > $maximum
+      then $path + " must be an integer from " + ($minimum | tostring) + " to " + ($maximum | tostring) else empty end;
+    [
+      required_string("backup.storage"; .backup.storage),
+      required_string("backup.tmpdir"; .backup.tmpdir),
+      required_string("backup.temp_storage.storage_id"; .backup.temp_storage.storage_id),
+      required_string("backup.temp_storage.vg"; .backup.temp_storage.vg),
+      required_string("backup.temp_storage.thin_pool"; .backup.temp_storage.thin_pool),
+      required_string("backup.temp_storage.lv"; .backup.temp_storage.lv),
+      (if .backup.temp_storage.filesystem != "ext4" then "backup.temp_storage.filesystem must be ext4" else empty end),
+      ranged_integer("backup.temp_storage.size_multiplier"; .backup.temp_storage.size_multiplier; 2; 10),
+      ranged_integer("backup.temp_storage.headroom_percent"; .backup.temp_storage.headroom_percent; 1; 90),
+      required_string("backup.schedule"; .backup.schedule),
+      required_string("backup.job_id"; .backup.job_id),
+      required_string("backup.hook_path"; .backup.hook_path),
+      required_string("backup.state_dir"; .backup.state_dir),
+      (if (.backup.exclude_tags | type) != "array" or (.backup.exclude_tags | length) == 0
+        or any(.backup.exclude_tags[]; (type != "string") or length == 0 or test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$") != true)
+        then "backup.exclude_tags must be a non-empty array of valid tags" else empty end),
+      (if (.backup.vm.enabled | type) != "boolean" then "backup.vm.enabled must be boolean" else empty end),
+      required_string("backup.vm.job_id"; .backup.vm.job_id),
+      (if .backup.vm.mode != "snapshot" then "backup.vm.mode must be snapshot" else empty end),
+      required_string("backup.vm.schedule"; .backup.vm.schedule),
+      (if (.backup.vm.repeat_missed | type) != "boolean" then "backup.vm.repeat_missed must be boolean" else empty end),
+      required_string("backup.vm.restore_storage"; .backup.vm.restore_storage),
+      (if .backup.vm.job_id == .backup.job_id then "backup.vm.job_id must differ from backup.job_id" else empty end),
+      (if .backup.mode != "suspend" then "backup.mode must be suspend" else empty end),
+      (if .backup.compress != "zstd" then "backup.compress must be zstd" else empty end),
+      (if (.backup.repeat_missed | type) != "boolean" then "backup.repeat_missed must be boolean" else empty end),
+      nonnegative_integer("backup.retention.keep_daily"; .backup.retention.keep_daily),
+      nonnegative_integer("backup.retention.keep_weekly"; .backup.retention.keep_weekly),
+      nonnegative_integer("backup.retention.keep_monthly"; .backup.retention.keep_monthly),
+      nonnegative_integer("backup.bwlimit_kib"; .backup.bwlimit_kib),
+      ranged_integer("backup.ionice"; .backup.ionice; 0; 8),
+      (.backup.notification_mode as $notification_mode
+        | if (["auto", "legacy-sendmail", "notification-system"] | index($notification_mode)) == null then "backup.notification_mode is invalid" else empty end),
+      ranged_integer("backup.snapshot_headroom_percent"; .backup.snapshot_headroom_percent; 1; 90),
+      (if (.backup.hook_path | startswith("/")) != true then "backup.hook_path must be absolute" else empty end),
+      (if (.backup.tmpdir | startswith("/")) != true then "backup.tmpdir must be absolute" else empty end),
+      (if (.backup.temp_storage.storage_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.temp_storage.storage_id contains unsupported characters" else empty end),
+      (if (.backup.temp_storage.vg | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.vg contains unsupported characters" else empty end),
+      (if (.backup.temp_storage.thin_pool | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.thin_pool contains unsupported characters" else empty end),
+      (if (.backup.temp_storage.lv | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.lv contains unsupported characters" else empty end),
+      (if (.backup.state_dir | startswith("/")) != true then "backup.state_dir must be absolute" else empty end),
+      (if (.backup.job_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.job_id contains unsupported characters" else empty end),
+      (if (.backup.vm.job_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.vm.job_id contains unsupported characters" else empty end),
+      (if (.backup.vm.restore_storage | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.vm.restore_storage contains unsupported characters" else empty end)
+    ] | .[]' "${CONFIG_FILE}" 2>&1); then
+    echo "ERROR: Cannot parse backup policy in ${CONFIG_FILE}: ${errors}" >&2
+    return 1
+  fi
+
+  if [[ -n "$errors" ]]; then
+    echo "ERROR: Invalid backup policy in ${CONFIG_FILE}:" >&2
+    sed 's/^/  - /' <<< "$errors" >&2
+    return 1
+  fi
 }
 
 # Validate size and return values
@@ -659,13 +896,22 @@ config_get_telemetry_fluentd_port() {
   jq -r '.telemetry.fluentd_port // empty' "${CONFIG_FILE}" 2>/dev/null
 }
 
-# Get telemetry OTLP port
+# Get telemetry OTLP gRPC port
 # Returns: port number or empty
-config_get_telemetry_otlp_port() {
+config_get_telemetry_otlp_grpc_port() {
   if ! config_exists; then
     return 1
   fi
-  jq -r '.telemetry.otlp_port // empty' "${CONFIG_FILE}" 2>/dev/null
+  jq -r '.telemetry.otlp_grpc_port // empty' "${CONFIG_FILE}" 2>/dev/null
+}
+
+# Get telemetry OTLP HTTP port (OTLP/HTTP exporter endpoint, distinct from gRPC otlp_grpc_port)
+# Returns: port number or empty
+config_get_telemetry_otlp_http_port() {
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r '.telemetry.otlp_http_port // empty' "${CONFIG_FILE}" 2>/dev/null
 }
 
 # Get telemetry syslog port
@@ -812,6 +1058,83 @@ udmpro_make_static() {
   fi
 }
 
+# Release the UDM Pro fixed-IP reservation AND local DNS record for a CT.
+# Used when a CT's VLAN changes: the old reservation pins an address on the
+# previous VLAN's subnet, which prevents a clean DHCP lease on the new VLAN.
+# Clearing it BEFORE the reboot lets the CT pull a fresh lease; check_dns_health
+# then re-pins the fixed IP + local DNS with the new IP after the reboot.
+#
+# Idempotent (safe to run when nothing needs releasing).
+# Args: $1 - CTID (defaults to $CTID)
+# Returns: 0 when there is nothing to release or the release succeeds;
+#          1 only on a genuine failure (no MAC, API query error, or PUT failure).
+udmpro_release_fixedip() {
+  local ctid="${1:-${CTID}}"
+
+  if ! config_udmpro_configured; then
+    echo "  [i] UDM Pro not configured; nothing to release"
+    return 0
+  fi
+
+  # MAC identifies the client across a VLAN change (the CT keeps its MAC).
+  local ct_mac
+  if ! ct_mac=$(get_ct_mac "${ctid}"); then
+    echo "  [!] Could not get MAC from CT ${ctid}"
+    return 1
+  fi
+
+  local udm_host udm_apikey
+  udm_host=$(config_get_udmpro_host)
+  udm_apikey=$(config_get_udmpro_apikey)
+
+  echo "  Releasing UDM Pro fixed IP + local DNS for MAC ${ct_mac}..."
+
+  local all_clients
+  all_clients=$(curl -sk -H "X-API-KEY: ${udm_apikey}" \
+    "https://${udm_host}/proxy/network/api/s/default/rest/user" 2>/dev/null || true)
+
+  if [[ -z "$all_clients" ]] || ! echo "$all_clients" | jq -e '.data' >/dev/null 2>&1; then
+    echo "  [!] Failed to query UDM Pro API"
+    return 1
+  fi
+
+  local client_id
+  client_id=$(echo "$all_clients" | jq -r --arg mac "$ct_mac" \
+    '.data[] | select((.mac | ascii_downcase) == $mac) | ._id' 2>/dev/null | head -1 || true)
+
+  if [[ -z "$client_id" || "$client_id" == "null" ]]; then
+    echo "  [i] No UDM Pro client for MAC ${ct_mac}; nothing to release"
+    return 0
+  fi
+
+  # Idempotent no-op: skip the PUT when the reservation is already fully cleared.
+  local needs_release
+  needs_release=$(echo "$all_clients" | jq -r --arg id "$client_id" \
+    '.data[] | select(._id == $id)
+       | ((.use_fixedip == true)
+          or (.local_dns_record_enabled == true)
+          or ((.local_dns_record // "") != ""))' 2>/dev/null || echo "true")
+  if [[ "$needs_release" != "true" ]]; then
+    echo "  [i] UDM Pro fixed IP + local DNS already cleared for ${ct_mac}"
+    return 0
+  fi
+
+  local release_result
+  release_result=$(curl -sk -X PUT -H "X-API-KEY: ${udm_apikey}" -H "Content-Type: application/json" \
+    "https://${udm_host}/proxy/network/api/s/default/rest/user/${client_id}" \
+    -d '{"use_fixedip": false, "fixed_ip": "", "local_dns_record_enabled": false, "local_dns_record": ""}' 2>/dev/null || true)
+
+  if echo "$release_result" | jq -e '.meta.rc == "ok"' >/dev/null 2>&1; then
+    echo "  [✓] UDM Pro fixed IP + local DNS released"
+    return 0
+  fi
+
+  local error_msg
+  error_msg=$(echo "$release_result" | jq -r '.meta.msg // "unknown error"' 2>/dev/null || echo "unknown error")
+  echo "  [!] Failed to release fixed IP: ${error_msg}"
+  return 1
+}
+
 # Configure timezone in CT
 # Installs tzdata and sets /etc/localtime to Europe/Berlin
 # Idempotent: safe to run multiple times
@@ -925,14 +1248,12 @@ configure_docker_logging() {
 # Requires: CTID to be set
 configure_telegraf() {
   local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
-  
-  # Skip for CA hosts (no metrics needed)
+
   if [[ "${ct_hostname}" =~ ^ca\. ]]; then
     echo "Skipping Telegraf for CA host."
     return
   fi
 
-  # Disable Telegraf on the telemetry host itself (avoid self-reporting)
   local telemetry_host
   telemetry_host=$(config_get_telemetry_hostname)
   if [[ "${ct_hostname}" == "${telemetry_host}" ]]; then
@@ -950,19 +1271,16 @@ configure_telegraf() {
     return
   fi
 
-  local otlp_port
-  otlp_port=$(config_get_telemetry_otlp_port)
-
+  local otlp_grpc_port
+  otlp_grpc_port=$(config_get_telemetry_otlp_grpc_port)
   local domain
   domain=$(extract_domain_from_hostname "${ct_hostname}")
 
   echo "Configuring Telegraf metrics collection..."
-  echo "  Metrics target: ${telemetry_host}:${otlp_port}"
+  echo "  Metrics target: ${telemetry_host}:${otlp_grpc_port}"
 
-  # Check if telegraf is installed
   local telegraf_installed
   telegraf_installed=$(ct_exec --timeout 15 'command -v telegraf >/dev/null 2>&1 && echo "yes" || echo "no"')
-  
   if [[ "$telegraf_installed" != "yes" ]]; then
     echo "  Installing telegraf..."
     ct_exec --timeout 120 'apk add --no-cache telegraf'
@@ -970,7 +1288,6 @@ configure_telegraf() {
     echo "  Telegraf already installed"
   fi
 
-  # Ensure telegraf user can access docker socket
   local in_docker_group
   in_docker_group=$(ct_exec --timeout 15 'groups telegraf 2>/dev/null | grep -q docker && echo "yes" || echo "no"')
   if [[ "$in_docker_group" != "yes" ]]; then
@@ -978,7 +1295,6 @@ configure_telegraf() {
     ct_exec --timeout 15 'adduser telegraf docker 2>/dev/null || true'
   fi
 
-  # Build telegraf config
   local telegraf_conf
   telegraf_conf="# Telegraf configuration for ${ct_hostname}
 # Auto-generated by commonCT.sh - manual changes may be overwritten
@@ -996,12 +1312,11 @@ configure_telegraf() {
   omit_hostname = false
 
 [[outputs.opentelemetry]]
-  service_address = \"${telemetry_host}:${otlp_port}\"
+  service_address = \"${telemetry_host}:${otlp_grpc_port}\"
   [outputs.opentelemetry.attributes]
     \"service.name\" = \"${ct_hostname}\"
     \"service.namespace\" = \"${domain}\"
 
-# Host metrics
 [[inputs.cpu]]
   percpu = true
   totalcpu = true
@@ -1022,23 +1337,18 @@ configure_telegraf() {
 
 [[inputs.processes]]
 
-# Docker metrics
 [[inputs.docker]]
   endpoint = \"unix:///var/run/docker.sock\"
   gather_services = false
   timeout = \"5s\"
 "
 
-  # Write config and ensure service is enabled
   ct_exec --timeout 30 "
     mkdir -p /etc/telegraf
     cat > /etc/telegraf/telegraf.conf << 'TELEGRAF_EOF'
 ${telegraf_conf}
 TELEGRAF_EOF
-
-    # Set correct config path for OpenRC service
     echo 'TELEGRAF_OPTS=\"-config /etc/telegraf/telegraf.conf\"' > /etc/conf.d/telegraf
-    
     # Enable service (OpenRC)
     rc-update add telegraf default >/dev/null 2>&1 || true
     
@@ -1406,7 +1716,7 @@ ensure_docker_runlevel() {
 ensure_docker_running() {
   local ctid="${1:-${CTID}}"
   local timeout="${2:-120}"
-  local i
+  local i recovery_output=""
 
   echo "Verifying Docker daemon in CT ${ctid}..."
 
@@ -1422,7 +1732,14 @@ ensure_docker_running() {
   # Recovery: re-assert the boot runlevel and force a (re)start, then wait again.
   echo "  [!] Docker daemon not responding after ${timeout}s — attempting recovery..."
   ensure_docker_runlevel "${ctid}"
-  ct_exec --timeout 60 "${ctid}" 'rc-service docker restart >/dev/null 2>&1 || rc-service docker start >/dev/null 2>&1 || true'
+  ct_exec --timeout 15 "${ctid}" \
+    'if [ -f /var/log/docker.log ]; then cp /var/log/docker.log /var/log/docker.log.pre-recovery; : > /var/log/docker.log; fi' \
+    >/dev/null 2>&1 || true
+  if ! recovery_output=$(ct_exec --timeout 60 "${ctid}" \
+    'rc-service docker restart 2>&1 || rc-service docker start 2>&1' 2>&1); then
+    echo "  [!] OpenRC could not restart Docker:"
+    printf '%s\n' "$recovery_output" | sed 's/^/        /'
+  fi
 
   for ((i=1; i<=timeout; i++)); do
     if ct_exec --timeout 10 "${ctid}" 'docker info >/dev/null 2>&1' 2>/dev/null; then
@@ -1433,7 +1750,14 @@ ensure_docker_running() {
   done
 
   echo "  [✗] Docker daemon FAILED to start in CT ${ctid} after recovery attempt"
-  echo "      Diagnose: pct exec ${ctid} -- sh -c 'rc-service docker status; tail -n 40 /var/log/docker.log'"
+  if [[ -n "$recovery_output" ]]; then
+    echo "      OpenRC recovery output:"
+    printf '%s\n' "$recovery_output" | sed 's/^/        /'
+  fi
+  echo "      Docker service status and recent log:"
+  ct_exec --timeout 30 "${ctid}" \
+    'rc-service docker status 2>&1 || true; tail -n 40 /var/log/docker.log 2>/dev/null || true' \
+    | sed 's/^/        /' || true
   return 1
 }
 
@@ -1473,16 +1797,24 @@ depend() {
 start() {
     ebegin "Verifying Docker daemon is responsive"
     i=0
-    max=12
+  max=3
     while [ "$i" -lt "$max" ]; do
         if docker info >/dev/null 2>&1; then
             eend 0
             return 0
         fi
         i=$((i + 1))
-        ewarn "Docker not responsive (attempt $i/$max) - restarting docker"
-        rc-service docker restart >/dev/null 2>&1 || rc-service docker start >/dev/null 2>&1 || true
-        sleep 5
+    ewarn "Docker not responsive (attempt $i/$max) - restarting docker"
+    rc-service docker restart >/dev/null 2>&1 || rc-service docker start >/dev/null 2>&1 || true
+    waited=0
+    while [ "$waited" -lt 60 ]; do
+      if docker info >/dev/null 2>&1; then
+        eend 0
+        return 0
+      fi
+      sleep 5
+      waited=$((waited + 5))
+    done
     done
     docker info >/dev/null 2>&1
     eend $? "Docker daemon did not become responsive after $max attempts"
@@ -1500,11 +1832,9 @@ rc-update add docker-watchdog default 2>/dev/null || true'
 # Args:
 #   $1 - CTID (defaults to global $CTID)
 #   $2 - CT hostname (defaults to $CT_HOSTNAME or $HOSTNAME)
-#   $3 - GPU passthrough flag ("true" to enable, optional)
 apply_ct_configuration() {
   local ctid="${1:-${CTID}}"
   local hostname="${2:-${CT_HOSTNAME:-${HOSTNAME}}}"
-  local gpu="${3:-false}"
 
   ensure_packages_and_ca "${ctid}"
   configure_timezone
@@ -1516,10 +1846,110 @@ apply_ct_configuration() {
   configure_registry_logins
   configure_step_ca "${hostname}"
   configure_arping_service "${hostname}"
+}
 
-  if [[ "$gpu" == "true" ]]; then
-    configure_gpu_passthrough
+# Delete the per-host Authentik forward-auth application + provider combo.
+# Shared first step for forwardAuthCT.sh --remove (delete only) and --reset (delete then
+# recreate). Prompts for confirmation when an existing application is found; idempotent
+# no-op (no prompt) when nothing exists. Also detaches the provider from the configured
+# outpost before deletion so no dangling reference is left behind.
+# Args:
+#   $1 - CT hostname (e.g. pdf.thesaints.home)
+# Returns: 0 if deleted or nothing to delete; 1 on error or user decline.
+delete_authentik_forward_auth() {
+  local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
+
+  if ! config_authentik_configured; then
+    echo "  [!] Authentik not configured (missing host or apitoken in commonCT.json)"
+    return 0
   fi
+
+  local ak_host ak_token ak_outpost
+  ak_host=$(config_get_authentik_host)
+  ak_token=$(config_get_authentik_token)
+  ak_outpost=$(config_get_authentik_outpost)
+  local ak_api="https://${ak_host}/api/v3"
+
+  local app_host slug
+  app_host=$(echo "$ct_hostname" | tr '[:upper:]' '[:lower:]')
+  slug=$(echo "$app_host" | tr '.' '-')
+
+  ak_get() {
+    curl -sk --connect-timeout 10 --max-time 60 -H "Authorization: Bearer ${ak_token}" -H "Accept: application/json" \
+      "${ak_api}${1}" 2>/dev/null
+  }
+  ak_patch() {
+    curl -sk --connect-timeout 10 --max-time 60 -X PATCH -H "Authorization: Bearer ${ak_token}" \
+      -H "Content-Type: application/json" -H "Accept: application/json" \
+      "${ak_api}${1}" -d "${2}" 2>/dev/null
+  }
+  ak_delete() {
+    curl -sk --connect-timeout 10 --max-time 60 -X DELETE -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${ak_token}" "${ak_api}${1}" 2>/dev/null
+  }
+
+  local existing_app existing_app_pk existing_provider_pk
+  existing_app=$(ak_get "/core/applications/?slug=${slug}")
+  existing_app_pk=$(echo "$existing_app" | jq -r --arg s "$slug" '.results[] | select(.slug == $s) | .pk // empty' 2>/dev/null)
+  existing_provider_pk=$(echo "$existing_app" | jq -r --arg s "$slug" '.results[] | select(.slug == $s) | .provider // empty' 2>/dev/null)
+
+  if [[ -z "$existing_app_pk" ]]; then
+    echo "  [✓] Authentik: no application '${slug}' to delete"
+    return 0
+  fi
+
+  local prov_label="none"
+  if [[ -n "$existing_provider_pk" ]]; then
+    prov_label=$(ak_get "/providers/all/${existing_provider_pk}/" | \
+      jq -r '((.verbose_name // .meta_model_name // "provider")|tostring) + " (pk=" + (.pk|tostring) + ")"' 2>/dev/null)
+    [[ -z "$prov_label" || "$prov_label" == null* ]] && prov_label="provider pk=${existing_provider_pk}"
+  fi
+
+  echo "  [!] Existing Authentik application for '${app_host}':"
+  echo "        application: slug=${slug} pk=${existing_app_pk}"
+  echo "        provider:    ${prov_label}"
+  printf "  [?] Delete this Authentik application/provider combo? [y/N] "
+  local reply=""
+  read -r reply
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    echo "  [!] Deletion declined — leaving existing Authentik objects unchanged."
+    return 1
+  fi
+
+  # Detach the provider from the configured outpost (best-effort) so deletion is clean.
+  if [[ -n "$existing_provider_pk" && -n "$ak_outpost" ]]; then
+    local op_res op_uuid op_providers op_new
+    op_res=$(ak_get "/outposts/instances/?name__iexact=$(printf '%s' "$ak_outpost" | jq -sRr @uri)")
+    op_uuid=$(echo "$op_res" | jq -r '.results[0].pk // empty' 2>/dev/null)
+    if [[ -n "$op_uuid" ]]; then
+      op_providers=$(echo "$op_res" | jq -r '[.results[0].providers[]]' 2>/dev/null)
+      if echo "$op_providers" | jq -e --argjson pk "$existing_provider_pk" 'index($pk) != null' >/dev/null 2>&1; then
+        op_new=$(echo "$op_providers" | jq --argjson pk "$existing_provider_pk" 'map(select(. != $pk))')
+        ak_patch "/outposts/instances/${op_uuid}/" "$(jq -n --argjson p "$op_new" '{providers:$p}')" >/dev/null 2>&1
+        echo "    Detached provider from outpost '${ak_outpost}'"
+      fi
+    fi
+  fi
+
+  # Delete the application first (it references the provider), then the provider.
+  local del_code
+  del_code=$(ak_delete "/core/applications/${slug}/")
+  if [[ "$del_code" =~ ^2 ]]; then
+    echo "    Deleted application '${slug}' (HTTP ${del_code})"
+  else
+    echo "  [!] Failed to delete application '${slug}' (HTTP ${del_code})"
+    return 1
+  fi
+  if [[ -n "$existing_provider_pk" ]]; then
+    del_code=$(ak_delete "/providers/all/${existing_provider_pk}/")
+    if [[ "$del_code" =~ ^2 ]]; then
+      echo "    Deleted provider pk=${existing_provider_pk} (HTTP ${del_code})"
+    else
+      echo "  [!] Failed to delete provider pk=${existing_provider_pk} (HTTP ${del_code}) — continuing"
+    fi
+  fi
+  echo "  [✓] Authentik application/provider for '${app_host}' deleted"
+  return 0
 }
 
 # Configure Authentik forward auth for a CT
@@ -1538,6 +1968,7 @@ apply_ct_configuration() {
 # Returns: 0 on success or skip, 1 on error
 configure_authentik_forward_auth() {
   local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
+  local reset_existing="${2:-false}"
 
   # Check if Authentik is configured
   if ! config_authentik_configured; then
@@ -1599,7 +2030,13 @@ configure_authentik_forward_auth() {
       "${ak_api}${1}" -d "${2}" 2>/dev/null
   }
 
-  # Step 1: Check if domain application already exists with a provider
+  # Step 1: If --reset, delete any existing app/provider combo first (shared step with
+  # --remove; prompts for confirmation). Otherwise, skip when the host application already
+  # has a provider attached.
+  if [[ "$reset_existing" == "true" ]]; then
+    delete_authentik_forward_auth "$ct_hostname" || return 1
+  fi
+
   local existing_app
   existing_app=$(ak_get "/core/applications/?slug=${slug}")
 
@@ -1729,126 +2166,175 @@ configure_authentik_forward_auth() {
   return 0
 }
 
-# Configure GPU passthrough for hardware acceleration (e.g., VAAPI)
-# Idempotent: only adds config if not already present
-# Requires a full stop/start cycle to apply mount changes
-# Args:
-#   $1 - CTID (optional, defaults to global CTID)
-configure_gpu_passthrough() {
-  local ctid="${1:-${CTID}}"
-  local config_file="/etc/pve/lxc/${ctid}.conf"
-  
-  echo "Configuring GPU passthrough for CT ${ctid}..."
-  
-  # Check if host has GPU devices
-  if [[ ! -d /dev/dri ]]; then
-    echo "  [!] No GPU found on host (/dev/dri does not exist)"
-    return 1
-  fi
-  
-  # Get render device GID from host
-  local render_gid
-  render_gid=$(stat -c '%g' /dev/dri/renderD128 2>/dev/null) || {
-    echo "  [!] Could not determine render device GID"
-    return 1
-  }
-  
-  # Check if GPU passthrough is already configured
-  local needs_config=false
-  if ! grep -q "lxc.cgroup2.devices.allow: c 226:\* rwm" "$config_file" 2>/dev/null; then
-    needs_config=true
-  fi
-  if ! grep -q "lxc.mount.entry: /dev/dri" "$config_file" 2>/dev/null; then
-    needs_config=true
-  fi
-  
-  if [[ "$needs_config" == "false" ]]; then
-    echo "  GPU passthrough already configured"
-    # Still ensure render group exists inside CT
-    ct_exec --timeout 15 "${ctid}" "
-      addgroup -g ${render_gid} render 2>/dev/null || true
-      addgroup root render 2>/dev/null || true
-    " 2>/dev/null
-    echo "  [✓] GPU passthrough ready"
+# Emit a machine-readable description of local DRM capability.
+probe_local_gpu_capability() {
+  local pci_gpu=false class_file class_value device major_hex gid
+  local pci_root="${GPU_PCI_ROOT:-/sys/bus/pci/devices}"
+  local dri_root="${GPU_DRI_ROOT:-/dev/dri}"
+  local render_devices=()
+
+  for class_file in "$pci_root"/*/class; do
+    [[ -r "$class_file" ]] || continue
+    read -r class_value < "$class_file" || continue
+    if [[ "$class_value" == 0x03* ]]; then
+      pci_gpu=true
+      break
+    fi
+  done
+
+  shopt -s nullglob
+  render_devices=("$dri_root"/renderD*)
+  shopt -u nullglob
+
+  if [[ ${#render_devices[@]} -eq 0 ]]; then
+    [[ "$pci_gpu" == "true" ]] && echo "STATE broken" || echo "STATE absent"
     return 0
   fi
-  
-  echo "  Adding GPU passthrough configuration..."
-  
-  # Add cgroup device access
-  if ! grep -q "lxc.cgroup2.devices.allow: c 226:\* rwm" "$config_file"; then
-    echo "lxc.cgroup2.devices.allow: c 226:* rwm" >> "$config_file"
-    echo "  Added cgroup2 device access for DRI"
-  fi
-  
-  # Add mount entry for /dev/dri
-  if ! grep -q "lxc.mount.entry: /dev/dri" "$config_file"; then
-    echo "lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir" >> "$config_file"
-    echo "  Added /dev/dri bind mount"
-  fi
-  
-  # Need full stop/start for mount changes to take effect
-  echo "  Stopping CT ${ctid} to apply mount changes..."
-  pct stop "${ctid}"
-  
-  # Wait for stop
-  local timeout=30
-  for ((i=1; i<=timeout; i++)); do
-    if pct status "${ctid}" 2>/dev/null | grep -q "status: stopped"; then
-      break
+
+  for device in "${render_devices[@]}"; do
+    [[ -c "$device" ]] || { echo "STATE broken"; return 0; }
+    major_hex=$(stat -c '%t' "$device" 2>/dev/null || true)
+    if [[ ! "$major_hex" =~ ^[0-9a-fA-F]+$ ]] || (( 16#$major_hex != 226 )); then
+      echo "STATE broken"
+      return 0
     fi
-    sleep 1
   done
-  
-  echo "  Starting CT ${ctid}..."
-  pct start "${ctid}"
-  
-  # Wait for start and responsiveness
-  local running=false
-  for ((i=1; i<=timeout; i++)); do
-    if pct status "${ctid}" 2>/dev/null | grep -q "status: running"; then
-      running=true
-      break
-    fi
-    sleep 1
+
+  echo "STATE available"
+  for device in "${render_devices[@]}"; do
+    gid=$(stat -c '%g' "$device" 2>/dev/null || true)
+    [[ -n "$gid" ]] || { echo "STATE broken"; return 0; }
+    echo "DEVICE ${device} ${gid}"
   done
-  
-  if [[ "$running" != "true" ]]; then
-    echo "  [!] Warning: CT ${ctid} did not start within ${timeout}s"
-    return 1
-  fi
-  
-  # Wait for responsiveness
-  local responsive=false
-  for ((i=1; i<=timeout; i++)); do
-    if pct exec "${ctid}" -- true 2>/dev/null; then
-      responsive=true
-      break
-    fi
-    sleep 1
-  done
-  
-  if [[ "$responsive" != "true" ]]; then
-    echo "  [!] Warning: CT ${ctid} not responsive within ${timeout}s"
-    return 1
-  fi
-  
-  # Add render group inside CT with matching GID
-  echo "  Configuring render group inside CT..."
-  ct_exec --timeout 15 "${ctid}" "
-    addgroup -g ${render_gid} render 2>/dev/null || true
-    addgroup root render 2>/dev/null || true
-  "
-  
-  # Verify device is accessible
-  if ct_exec --timeout 15 "${ctid}" 'test -e /dev/dri/renderD128' 2>/dev/null; then
-    echo "  [✓] GPU passthrough configured successfully"
+}
+
+# Sets NODE_GPU_STATE and NODE_GPU_RENDER_DEVICES/NODE_GPU_RENDER_GIDS.
+detect_node_gpu_capability() {
+  local node="${1:-$(hostname -s)}"
+  local local_node probe state="" key device gid
+  local_node=$(hostname -s)
+  NODE_GPU_STATE="indeterminate"
+  NODE_GPU_RENDER_DEVICES=()
+  NODE_GPU_RENDER_GIDS=()
+
+  if [[ "$node" == "$local_node" ]]; then
+    probe=$(probe_local_gpu_capability) || return 1
   else
-    echo "  [!] Warning: /dev/dri/renderD128 not accessible in CT"
+    probe=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "$(declare -f probe_local_gpu_capability); probe_local_gpu_capability" 2>/dev/null) || {
+      echo "ERROR: Cannot discover GPU capability on node '${node}'." >&2
+      return 1
+    }
+  fi
+
+  while read -r key device gid; do
+    case "$key" in
+      STATE) state="$device" ;;
+      DEVICE)
+        NODE_GPU_RENDER_DEVICES+=("$device")
+        NODE_GPU_RENDER_GIDS+=("$gid")
+        ;;
+    esac
+  done <<< "$probe"
+
+  case "$state" in
+    available)
+      [[ ${#NODE_GPU_RENDER_DEVICES[@]} -gt 0 ]] || return 1
+      NODE_GPU_STATE="available"
+      ;;
+    absent) NODE_GPU_STATE="absent" ;;
+    broken)
+      NODE_GPU_STATE="broken"
+      echo "ERROR: Node '${node}' has GPU hardware but no usable DRM render device." >&2
+      return 1
+      ;;
+    *)
+      echo "ERROR: GPU capability on node '${node}' is indeterminate." >&2
+      return 1
+      ;;
+  esac
+}
+
+ct_gpu_config_matches_capability() {
+  local ctid="$1"
+  local config_file="/etc/pve/lxc/${ctid}.conf"
+  local has_allow=false has_mount=false
+  grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null && has_allow=true
+  grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null && has_mount=true
+
+  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+    [[ "$has_allow" == "true" && "$has_mount" == "true" ]]
+  else
+    [[ "$has_allow" == "false" && "$has_mount" == "false" ]]
+  fi
+}
+
+reconcile_stopped_ct_gpu_config() {
+  local ctid="$1"
+  local config_file="/etc/pve/lxc/${ctid}.conf"
+
+  if [[ "$(get_ct_status "$ctid")" != "stopped" ]]; then
+    echo "ERROR: CT ${ctid} must be stopped before GPU config reconciliation." >&2
     return 1
   fi
-  
-  return 0
+
+  sed -i \
+    -e '\|^lxc.cgroup2.devices.allow: c 226:\* rwm$|d' \
+    -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
+    "$config_file"
+
+  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+    printf '%s\n' \
+      'lxc.cgroup2.devices.allow: c 226:* rwm' \
+      'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' >> "$config_file"
+    echo "  [✓] CT ${ctid}: exposing ${#NODE_GPU_RENDER_DEVICES[@]} DRM render device(s)"
+  else
+    echo "  [✓] CT ${ctid}: removed managed DRM passthrough (no GPU on node)"
+  fi
+}
+
+reconcile_ct_gpu_config() {
+  local ctid="${1:-${CTID}}"
+  local node="${2:-$(hostname -s)}"
+  local original_status
+  original_status=$(get_ct_status "$ctid")
+
+  detect_node_gpu_capability "$node" || return 1
+  if ct_gpu_config_matches_capability "$ctid"; then
+    echo "  [✓] CT ${ctid}: GPU config matches node '${node}' (${NODE_GPU_STATE})"
+    return 0
+  fi
+
+  if [[ "$original_status" == "running" ]]; then
+    pct stop "$ctid"
+    ensure_ct_stopped "$ctid" || return 1
+  fi
+  reconcile_stopped_ct_gpu_config "$ctid" || return 1
+  if [[ "$original_status" == "running" ]]; then
+    pct start "$ctid"
+    ensure_ct_running "$ctid" || return 1
+  fi
+}
+
+finalize_ct_gpu_capability() {
+  local ctid="${1:-${CTID}}"
+  local index device gid group
+
+  detect_node_gpu_capability || return 1
+  [[ "$NODE_GPU_STATE" == "available" ]] || return 0
+
+  for index in "${!NODE_GPU_RENDER_DEVICES[@]}"; do
+    device="${NODE_GPU_RENDER_DEVICES[$index]}"
+    gid="${NODE_GPU_RENDER_GIDS[$index]}"
+    group="render"
+    [[ "$index" -gt 0 ]] && group="render${index}"
+    ct_exec --timeout 15 "$ctid" "addgroup -g '${gid}' '${group}' 2>/dev/null || true; addgroup root '${group}' 2>/dev/null || true"
+    if ! ct_exec --timeout 15 "$ctid" "test -c '${device}'" 2>/dev/null; then
+      echo "ERROR: ${device} is not accessible inside CT ${ctid}." >&2
+      return 1
+    fi
+  done
+  echo "  [✓] CT ${ctid}: all DRM render devices are accessible"
 }
 
 # Configure container registry authentication for Docker
@@ -2154,6 +2640,62 @@ reboot_ct() {
   return 0
 }
 
+# Hard-restart a CT: full pct stop + pct start so Proxmox tears down and
+# recreates the veth. Required for a net0 VLAN tag change to actually take
+# effect — `pct reboot` does not reliably re-wire the interface onto the new
+# VLAN bridge (the repo already uses stop/start for changes that must be
+# re-initialized cleanly, e.g. resize and GPU mount changes).
+# Args: $1 - CTID (defaults to $CTID)
+# Returns: 0 when running + responsive, 1 otherwise.
+restart_ct_hard() {
+  local ctid="${1:-${CTID}}"
+  local timeout=60 i
+
+  echo "  Stopping CT ${ctid}..."
+  pct stop "${ctid}" 2>/dev/null
+  local stopped=false
+  for ((i=1; i<=timeout; i++)); do
+    if pct status "${ctid}" 2>/dev/null | grep -q "status: stopped"; then
+      stopped=true; break
+    fi
+    sleep 1
+  done
+  if [[ "$stopped" != "true" ]]; then
+    echo "  [!] CT ${ctid} did not stop within ${timeout}s"
+    return 1
+  fi
+
+  echo "  Starting CT ${ctid}..."
+  pct start "${ctid}" 2>/dev/null
+  local running=false
+  for ((i=1; i<=timeout; i++)); do
+    if pct status "${ctid}" 2>/dev/null | grep -q "status: running"; then
+      running=true; break
+    fi
+    sleep 1
+  done
+  if [[ "$running" != "true" ]]; then
+    echo "  [!] CT ${ctid} did not start within ${timeout}s"
+    return 1
+  fi
+
+  echo "  Waiting for CT ${ctid} to become responsive..."
+  local responsive=false
+  for ((i=1; i<=timeout; i++)); do
+    if pct exec "${ctid}" -- true 2>/dev/null; then
+      responsive=true; break
+    fi
+    sleep 1
+  done
+  if [[ "$responsive" != "true" ]]; then
+    echo "  [!] CT ${ctid} not responsive within ${timeout}s"
+    return 1
+  fi
+
+  echo "  [✓] CT ${ctid} restarted (running and responsive)"
+  return 0
+}
+
 # Resolve DNS with retry loop
 # Attempts to resolve hostname via DNS, retrying for up to timeout seconds.
 # If expected_ip is provided, only succeeds if resolved IP matches.
@@ -2264,6 +2806,35 @@ flush_local_dns_cache() {
 #   $1 - CTID (optional, defaults to global CTID)
 #   $2 - hostname (optional, defaults to global CT_HOSTNAME)
 # Returns: 0 if DNS is healthy, 1 on error
+# Read a CT's current IPv4 address on eth0 (from inside the CT). Retries a few
+# times because DHCP may not be ready immediately after a (re)start.
+# Args: $1 - CTID (defaults to $CTID)
+# Prints: the IPv4 address (nothing on failure). Returns 0 if found, 1 otherwise.
+read_ct_ip() {
+  local ctid="${1:-${CTID}}"
+  local ip="" retries=5
+  while [[ -z "$ip" && $retries -gt 0 ]]; do
+    ip=$(ct_exec --timeout 15 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
+    if [[ -z "$ip" ]]; then
+      retries=$((retries - 1))
+      [[ $retries -gt 0 ]] && sleep 2
+    fi
+  done
+  [[ -n "$ip" ]] || return 1
+  printf '%s' "$ip"
+}
+
+# Get a CT's net0 MAC address (lowercased) from its Proxmox config.
+# Args: $1 - CTID (defaults to $CTID)
+# Prints: the MAC (nothing on failure). Returns 0 if found, 1 otherwise.
+get_ct_mac() {
+  local ctid="${1:-${CTID}}"
+  local mac
+  mac=$(pct config "${ctid}" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
+  [[ -n "$mac" ]] || return 1
+  printf '%s' "$mac"
+}
+
 check_dns_health() {
   local ctid="${1:-${CTID}}"
   local hostname="${2:-${CT_HOSTNAME}}"
@@ -2275,25 +2846,14 @@ check_dns_health() {
   # -------------------------
   local ct_ip ct_mac
   
-  # Get IP from inside the CT (uses grep+tr+cut for BusyBox compatibility)
-  # Retry a few times — DHCP may not be ready immediately after reboot
-  local ip_retries=5
-  ct_ip=""
-  while [[ -z "$ct_ip" && $ip_retries -gt 0 ]]; do
-    ct_ip=$(ct_exec --timeout 15 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
-    if [[ -z "$ct_ip" ]]; then
-      ip_retries=$((ip_retries - 1))
-      [[ $ip_retries -gt 0 ]] && sleep 2
-    fi
-  done
-  if [[ -z "$ct_ip" ]]; then
+  # Get IP from inside the CT (retries a few times — DHCP may lag a reboot).
+  if ! ct_ip=$(read_ct_ip "${ctid}"); then
     echo "  [!] Could not get IP from CT ${ctid}"
     return 1
   fi
   
   # Get MAC from CT config
-  ct_mac=$(pct config "${ctid}" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
-  if [[ -z "$ct_mac" ]]; then
+  if ! ct_mac=$(get_ct_mac "${ctid}"); then
     echo "  [!] Could not get MAC from CT ${ctid}"
     return 1
   fi
@@ -2307,11 +2867,18 @@ check_dns_health() {
   # -------------------------
   udmpro_make_static "$ct_mac" "$ct_ip" "$hostname" || true
 
-  # For non-primary domains, refresh split DNS mapping before resolution checks.
-  local primary_domain hostname_domain
+  # Refresh split DNS mapping before resolution checks. This runs for:
+  #   - any CT whose domain is NOT the primary domain (its record lives in a
+  #     per-domain split-DNS zone owned by forwardDNSCT.sh), and
+  #   - the split-DNS host itself, so a fresh/`--reset` rebuild self-heals the
+  #     per-domain zone configs (conf.d/<domain>.conf) that only forwardDNSCT.sh
+  #     generates — nothing else repopulates them.
+  local primary_domain hostname_domain splitdns_hostname
   primary_domain=$(config_get_primary_domain)
   hostname_domain=$(extract_domain_from_hostname "$hostname")
-  if [[ -n "$primary_domain" && "${hostname_domain,,}" != "${primary_domain,,}" ]]; then
+  splitdns_hostname=$(config_get_splitdns_hostname)
+  if [[ ( -n "$primary_domain" && "${hostname_domain,,}" != "${primary_domain,,}" ) \
+        || ( -n "$splitdns_hostname" && "${hostname,,}" == "${splitdns_hostname,,}" ) ]]; then
     if config_splitdns_configured; then
       echo "  Refreshing split DNS configuration..."
       "${SCRIPT_DIR}/forwardDNSCT.sh" || echo "  [!] Split DNS refresh failed (non-fatal)"
@@ -2359,6 +2926,239 @@ check_dns_health() {
 # CONTAINER FUNCTIONS
 # -----------------------------
 
+# Execute an argv-safe command on a Proxmox node. Bridge policy is node-local,
+# so callers must not infer it from the cluster-wide resource configuration.
+bridge_policy_node_exec() {
+  local node="${1:-}" argument quoted command=""
+  shift || true
+  [[ -n "$node" && $# -gt 0 ]] || {
+    echo "ERROR: bridge_policy_node_exec requires a node and command." >&2
+    return 1
+  }
+  if declare -F run_on_node >/dev/null 2>&1; then
+    run_on_node "$node" "$@"
+    return
+  fi
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    "$@"
+    return
+  fi
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+="${command:+ }${quoted}"
+  done
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "$command"
+}
+
+# Print one TAB-separated "bridge entities" record for each vmbr<number>
+# paragraph in /etc/network/interfaces that has a standalone entities: label.
+# The label is case-insensitive and may follow descriptive text in a comment.
+bridge_policy_entries() {
+  local node="${1:-}" interfaces
+  [[ -n "$node" ]] || { echo "ERROR: Bridge policy node is required." >&2; return 1; }
+  interfaces=$(bridge_policy_node_exec "$node" cat /etc/network/interfaces) || {
+    echo "ERROR: Cannot read /etc/network/interfaces on ${node}." >&2
+    return 1
+  }
+  awk -v node="$node" '
+    BEGIN { RS=""; FS="\n"; OFS="\t"; invalid=0 }
+    {
+      bridge=""; entities=""; labels=0
+      for (i=1; i<=NF; i++) {
+        line=$i; sub(/\r$/, "", line)
+        probe=line; sub(/^[[:space:]]+/, "", probe)
+        if (probe ~ /^iface[[:space:]]+vmbr[0-9]+[[:space:]]/) {
+          split(probe, fields, /[[:space:]]+/)
+          bridge=fields[2]
+        }
+      }
+      for (i=1; i<=NF; i++) {
+        line=$i; sub(/\r$/, "", line); lower=tolower(line)
+        if (match(lower, /(^|[^[:alnum:]_])entities[[:space:]]*:/)) {
+          matched=substr(line, RSTART, RLENGTH)
+          colon=index(matched, ":")
+          value=substr(line, RSTART + colon)
+          sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value)
+          labels++
+          entities=value
+        }
+      }
+      if (bridge != "" && labels > 1) {
+        printf "ERROR: Bridge %s on %s has multiple entities: labels.\n", bridge, node > "/dev/stderr"
+        invalid=1
+      } else if (bridge != "" && labels == 1) {
+        print bridge, entities
+      }
+    }
+    END { exit invalid }
+  ' <<< "$interfaces"
+}
+
+# Resolve one bridge using exact identity, then CT/VM type, then wildcard *.
+# Results are returned in BRIDGE_POLICY_* globals to avoid mixing diagnostics
+# with command-substitution output.
+bridge_policy_select() {
+  local node="${1:-}" resource_type="${2:-}" resource_id="${3:-}" resource_name="${4:-}"
+  local entries line bridge entities token normalized rank reason suffix number
+  local best_bridge="" best_rank=99 best_number=2147483647 best_reason=""
+  local policies=""
+  local -a entity_tokens=()
+  declare -A seen_bridges=()
+
+  BRIDGE_POLICY_SELECTED=""
+  BRIDGE_POLICY_RANK=""
+  BRIDGE_POLICY_REASON=""
+  resource_type="${resource_type^^}"
+  [[ "$resource_type" == CT || "$resource_type" == VM ]] || {
+    echo "ERROR: Bridge policy type must be CT or VM (got '${resource_type}')." >&2
+    return 1
+  }
+  [[ "$resource_id" =~ ^[1-9][0-9]*$ && -n "$resource_name" ]] || {
+    echo "ERROR: Bridge policy requires a numeric ID and hostname/name." >&2
+    return 1
+  }
+  if ! entries=$(bridge_policy_entries "$node"); then
+    return 1
+  fi
+  [[ -n "$entries" ]] || {
+    echo "ERROR: No vmbr<number> entities: policies found on ${node}." >&2
+    return 1
+  }
+
+  while IFS=$'\t' read -r bridge entities; do
+    [[ -n "$bridge" ]] || continue
+    if [[ -n "${seen_bridges[$bridge]:-}" ]]; then
+      echo "ERROR: Bridge ${bridge} has more than one policy stanza on ${node}." >&2
+      return 1
+    fi
+    seen_bridges[$bridge]=1
+    [[ -n "$entities" ]] || {
+      echo "ERROR: Bridge ${bridge} on ${node} has an empty entities: policy." >&2
+      return 1
+    }
+    policies+="${policies:+; }${bridge}=[${entities}]"
+    rank=99; reason=""
+    normalized="${entities//,/ }"
+    read -r -a entity_tokens <<< "$normalized"
+    for token in "${entity_tokens[@]}"; do
+      [[ "$token" == "*" || "$token" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+        echo "ERROR: Bridge ${bridge} on ${node} has invalid entity token '${token}'." >&2
+        return 1
+      }
+      if [[ "$token" == "$resource_id" ]]; then
+        rank=1; reason="ID ${resource_id}"
+      elif [[ "${token,,}" == "${resource_name,,}" && $rank -gt 1 ]]; then
+        rank=1; reason="hostname/name ${resource_name}"
+      elif [[ "$token" == "$resource_type" && $rank -gt 2 ]]; then
+        rank=2; reason="type ${resource_type}"
+      elif [[ "$token" == "*" && $rank -gt 3 ]]; then
+        rank=3; reason="wildcard *"
+      fi
+    done
+    [[ "$rank" -lt 99 ]] || continue
+    suffix="${bridge#vmbr}"
+    number=$((10#$suffix))
+    if (( rank < best_rank || (rank == best_rank && number < best_number) )); then
+      best_bridge="$bridge"; best_rank="$rank"; best_number="$number"; best_reason="$reason"
+    fi
+  done <<< "$entries"
+
+  [[ -n "$best_bridge" ]] || {
+    echo "ERROR: No bridge policy on ${node} matches ${resource_type} ${resource_id} (${resource_name})." >&2
+    echo "       Discovered policies: ${policies}" >&2
+    return 1
+  }
+  BRIDGE_POLICY_SELECTED="$best_bridge"
+  BRIDGE_POLICY_RANK="$best_rank"
+  BRIDGE_POLICY_REASON="$best_reason"
+}
+
+bridge_policy_validate_runtime() {
+  local node="${1:-}" bridge="${2:-}"
+  [[ "$bridge" =~ ^vmbr[0-9]+$ ]] || {
+    echo "ERROR: Invalid selected bridge '${bridge}'." >&2
+    return 1
+  }
+  if ! bridge_policy_node_exec "$node" test -d "/sys/class/net/${bridge}/bridge"; then
+    echo "ERROR: Selected bridge ${bridge} does not exist as a Linux bridge on ${node}." >&2
+    return 1
+  fi
+}
+
+bridge_policy_resolve() {
+  local node="${1:-}" resource_type="${2:-}" resource_id="${3:-}" resource_name="${4:-}"
+  bridge_policy_select "$node" "$resource_type" "$resource_id" "$resource_name" || return 1
+  bridge_policy_validate_runtime "$node" "$BRIDGE_POLICY_SELECTED" || return 1
+}
+
+# Replace only bridge= and, when requested for an isolated restore, link_down=.
+bridge_policy_rewrite_nic() {
+  local value="${1:-}" bridge="${2:-}" force_link_down="${3:-false}"
+  local part result="" bridge_fields=0 link_fields=0
+  local -a parts=()
+  [[ -n "$value" && "$bridge" =~ ^vmbr[0-9]+$ ]] || return 1
+  IFS=',' read -r -a parts <<< "$value"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || { echo "ERROR: Malformed empty NIC field in '${value}'." >&2; return 1; }
+    if [[ "$part" == bridge=* ]]; then
+      bridge_fields=$((bridge_fields + 1))
+      part="bridge=${bridge}"
+    elif [[ "$part" == link_down=* && "$force_link_down" == true ]]; then
+      link_fields=$((link_fields + 1))
+      part="link_down=1"
+    fi
+    result+="${result:+,}${part}"
+  done
+  (( bridge_fields <= 1 && link_fields <= 1 )) || {
+    echo "ERROR: Malformed duplicate bridge/link_down fields in '${value}'." >&2
+    return 1
+  }
+  (( bridge_fields == 1 )) || result+=",bridge=${bridge}"
+  if [[ "$force_link_down" == true && $link_fields -eq 0 ]]; then
+    result+=",link_down=1"
+  fi
+  printf '%s' "$result"
+}
+
+# Reconcile every netN of a CT or VM to one policy-selected bridge.
+bridge_policy_reconcile_guest() {
+  local node="${1:-}" resource_type="${2:-}" resource_id="${3:-}" bridge="${4:-}"
+  local dry_run="${5:-false}" force_link_down="${6:-false}" config line key value target
+  local tool option nic_count=0 change_count=0
+  case "${resource_type^^}" in
+    CT) tool=pct; option=- ;;
+    VM) tool=qm; option=-- ;;
+    *) echo "ERROR: Cannot reconcile unknown resource type '${resource_type}'." >&2; return 1 ;;
+  esac
+  config=$(bridge_policy_node_exec "$node" "$tool" config "$resource_id") || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ ^net[0-9]+:[[:space:]] ]] || continue
+    key="${line%%:*}"
+    value="${line#*: }"
+    nic_count=$((nic_count + 1))
+    target=$(bridge_policy_rewrite_nic "$value" "$bridge" "$force_link_down") || return 1
+    [[ "$target" != "$value" ]] || continue
+    change_count=$((change_count + 1))
+    if [[ "$dry_run" == true ]]; then
+      echo "  [dry-run] ${key}: ${value} -> ${target}"
+    else
+      bridge_policy_node_exec "$node" "$tool" set "$resource_id" "${option}${key}" "$target"
+      if [[ "$force_link_down" == true ]]; then
+        echo "  [~] ${key}: bridge -> ${bridge}, link_down -> 1"
+      else
+        echo "  [~] ${key}: bridge -> ${bridge}"
+      fi
+    fi
+  done <<< "$config"
+  (( nic_count > 0 )) || {
+    echo "ERROR: ${resource_type^^} ${resource_id} has no netN devices to reconcile." >&2
+    return 1
+  }
+  if (( change_count == 0 )); then
+    echo "  [✓] All ${nic_count} NIC(s) already use ${bridge}"
+  fi
+}
+
 # Ensure swap is half of memory
 # Checks current CT config and adjusts swap if needed
 # Requires: CTID to be set
@@ -2375,6 +3175,236 @@ ensure_swap() {
     pct set "${CTID}" -swap "${expected_swap}"
     echo "  [\u2713] Swap adjusted"
   fi
+}
+
+# Apply (or remove) the VLAN tag on the CT's primary NIC (net0).
+# Args: $1 = CTID, $2 = desired VLAN id.
+#   empty  -> leave the CT's VLAN configuration untouched (no-op)
+#   0      -> remove any VLAN tag (unassign from all VLANs)
+#   1-4094 -> set tag=<id> on net0
+# Idempotent: reads the current net0, and only calls 'pct set' when the
+# resulting device string actually changes. The change takes effect on the
+# CT's next (re)start, which both createCT and refreshCT perform.
+# Decide whether applying VLAN $2 to CT $1's net0 would actually change it.
+# Side-effect free: never calls 'pct set'. Prints the resulting target net0
+# device string to stdout so callers (apply_vlan_tag) can reuse it.
+# Returns 0 when a change is PENDING (target differs from the current net0);
+# returns 1 when nothing would change: VLAN not requested (empty), invalid id,
+# no net0 device, or the tag already matches. This is the single source of
+# truth for the change decision and is used both by apply_vlan_tag and by
+# refreshCT to gate the mandatory UDM Pro fixed-IP release on a real VLAN change.
+vlan_change_pending() {
+  local ctid="$1" vlan="$2"
+
+  # Not requested -> no change
+  [[ -z "$vlan" ]] && return 1
+
+  # Invalid id -> no change (apply_vlan_tag emits the user-facing error)
+  if [[ ! "$vlan" =~ ^(0|[1-9][0-9]*)$ ]] || (( vlan > 4094 )); then
+    return 1
+  fi
+
+  local current_net0
+  current_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  [[ -z "$current_net0" ]] && return 1
+
+  # Strip any existing tag=<n> segment (net0 always starts with name=..., so a
+  # tag is preceded by a comma; the extra clauses are purely defensive).
+  local base_net0="$current_net0"
+  base_net0=$(echo "$base_net0" | sed -E 's/,tag=[0-9]+//; s/tag=[0-9]+,//; s/^tag=[0-9]+$//')
+
+  local target_net0="$base_net0"
+  if (( vlan >= 1 )); then
+    target_net0="${base_net0},tag=${vlan}"
+  fi
+
+  printf '%s' "$target_net0"
+  [[ "$target_net0" != "$current_net0" ]]
+}
+
+apply_vlan_tag() {
+  local ctid="$1" vlan="$2"
+
+  # Not requested -> leave the VLAN configuration untouched
+  if [[ -z "$vlan" ]]; then
+    return 0
+  fi
+
+  # Defensive re-validation (callers also validate at argument-parse time)
+  if [[ ! "$vlan" =~ ^(0|[1-9][0-9]*)$ ]] || (( vlan > 4094 )); then
+    echo "ERROR: --vlan must be an integer in range 0-4094 (got '${vlan}')" >&2
+    return 1
+  fi
+
+  local current_net0
+  current_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  if [[ -z "$current_net0" ]]; then
+    echo "  [!] CT ${ctid} has no net0 device; skipping VLAN change" >&2
+    return 0
+  fi
+
+  # vlan_change_pending is the single source of truth: it prints the target
+  # net0 string and returns 0 only when a real change is pending.
+  local target_net0
+  if ! target_net0=$(vlan_change_pending "${ctid}" "${vlan}"); then
+    if (( vlan == 0 )); then
+      echo "  [i] VLAN already unassigned (net0 has no tag)"
+    else
+      echo "  [i] VLAN already set to ${vlan}"
+    fi
+    return 0
+  fi
+
+  pct set "${ctid}" -net0 "${target_net0}"
+  if (( vlan == 0 )); then
+    echo "  [i] VLAN tag removed from CT ${ctid} (unassigned)"
+  else
+    echo "  [i] VLAN tag set to ${vlan} on CT ${ctid}"
+  fi
+}
+
+# After a VLAN change + hard restart, ensure the CT obtains a lease on the NEW
+# VLAN. Polls eth0 until it has an IPv4 address that DIFFERS from old_ip; if it
+# has not converged within the initial passive window, actively nudges the CT to
+# re-acquire DHCP and polls again. When old_ip is empty, any non-empty address
+# is accepted. Diagnostics go to stderr so stdout carries only the new IP.
+# Args: $1 - CTID, $2 - OLD_IP (may be empty)
+# Prints: the new IP. Returns 0 on success, 1 if no new IP within the timeouts.
+acquire_new_ip() {
+  local ctid="$1" old_ip="$2"
+  local ip="" i
+
+  # Phase 1: passive wait — a clean stop/start already triggers a fresh DORA.
+  for ((i=0; i<15; i++)); do
+    ip=$(ct_exec --timeout 10 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
+    if [[ -n "$ip" && "$ip" != "$old_ip" ]]; then
+      printf '%s' "$ip"; return 0
+    fi
+    sleep 3
+  done
+
+  # Phase 2: active nudge — restart networking (OpenRC/busybox) or, failing that,
+  # flush the stale address and force a fresh udhcpc lease.
+  echo "  [i] No new lease yet; forcing a DHCP re-acquire on eth0..." >&2
+  ct_exec --timeout 45 "${ctid}" 'if [ -e /etc/init.d/networking ]; then service networking restart >/dev/null 2>&1 || rc-service networking restart >/dev/null 2>&1 || true; else ip addr flush dev eth0 2>/dev/null; udhcpc -i eth0 -n -q -t 8 -T 3 >/dev/null 2>&1 || true; fi' 2>/dev/null
+
+  for ((i=0; i<10; i++)); do
+    ip=$(ct_exec --timeout 10 "${ctid}" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null)
+    if [[ -n "$ip" && "$ip" != "$old_ip" ]]; then
+      printf '%s' "$ip"; return 0
+    fi
+    sleep 3
+  done
+
+  return 1
+}
+
+# Roll a CT back to its pre-Phase-A state after a failed VLAN change: restore the
+# original net0 (old tag), re-pin the old fixed IP on UDM Pro, and hard-restart
+# so the CT reclaims its old-VLAN address. Best-effort — logs what it could not
+# restore for manual follow-up.
+# Args: $1 CTID, $2 hostname, $3 original_net0, $4 old_ip (may be empty)
+rollback_vlan_change() {
+  local ctid="$1" hostname="$2" original_net0="$3" old_ip="$4"
+
+  echo "  [!] Rolling back VLAN change for CT ${ctid}..."
+
+  if [[ -n "$original_net0" ]]; then
+    if pct set "${ctid}" -net0 "${original_net0}" 2>/dev/null; then
+      echo "    Restored net0: ${original_net0}"
+    else
+      echo "    [!] Failed to restore net0 (manual check needed)"
+    fi
+  fi
+
+  # Re-pin the old reservation so the old VLAN's DHCP hands back the old IP.
+  if [[ -n "$old_ip" ]]; then
+    local ct_mac
+    if ct_mac=$(get_ct_mac "${ctid}"); then
+      udmpro_make_static "${ct_mac}" "${old_ip}" "${hostname}" \
+        || echo "    [!] Failed to restore UDM Pro reservation for ${old_ip}"
+    fi
+  fi
+
+  if ! restart_ct_hard "${ctid}"; then
+    echo "    [!] CT ${ctid} did not come back cleanly during rollback (manual check needed)"
+    return 1
+  fi
+
+  # Best-effort verify the CT reclaimed its old address.
+  local now_ip
+  now_ip=$(read_ct_ip "${ctid}" || true)
+  if [[ -n "$old_ip" && "$now_ip" == "$old_ip" ]]; then
+    echo "    [✓] Rollback complete — CT ${ctid} back on ${old_ip}"
+  else
+    echo "    [!] Rollback finished but CT ${ctid} IP is '${now_ip:-<none>}' (expected '${old_ip:-<any>}')"
+  fi
+  return 0
+}
+
+# PHASE A — isolated VLAN switch. Handles a pending VLAN change end-to-end BEFORE
+# the routine refresh runs: release the UDM Pro reservation, apply the tag, hard
+# restart onto the new VLAN, wait for a fresh new-subnet lease, and re-pin the
+# reservation with the new IP. On failure past the mutation point, rolls the CT
+# back to its original VLAN/IP/reservation.
+# Args: $1 CTID, $2 hostname, $3 desired VLAN (empty / 0 / 1-4094)
+# Returns: 0 when nothing to do OR the change succeeded; 1 on fatal failure
+#          (rolled back where applicable — caller should mark the CT failed).
+reconcile_vlan_change() {
+  local ctid="$1" hostname="$2" vlan="$3"
+
+  # Signals to the caller whether this phase performed a full stop/start, so the
+  # routine refresh can skip its own (now-redundant) reboot and avoid extra
+  # restart churn. Reset on every call (including the no-op path).
+  VLAN_PHASE_RESTARTED=false
+
+  # No VLAN requested or no actual change -> nothing to do.
+  vlan_change_pending "${ctid}" "${vlan}" >/dev/null || return 0
+
+  echo "VLAN change requested for CT ${ctid} — handling as an isolated phase..."
+
+  # Capture pre-change state for a possible rollback.
+  local original_net0 old_ip
+  original_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  old_ip=$(read_ct_ip "${ctid}" || true)
+  echo "  Pre-change state: net0='${original_net0}' ip='${old_ip:-<none>}'"
+
+  # 1) Release the UDM Pro reservation. This runs before the tag write, so a
+  #    failure here needs no rollback (nothing has changed yet).
+  if ! udmpro_release_fixedip "${ctid}"; then
+    echo "  [✗] Could not release UDM Pro fixed IP — VLAN left unchanged"
+    return 1
+  fi
+
+  # 2) Write the new tag (config only; takes effect on the restart below).
+  apply_vlan_tag "${ctid}" "${vlan}"
+
+  # 3) Hard restart so Proxmox recreates the veth on the new VLAN bridge.
+  if ! restart_ct_hard "${ctid}"; then
+    echo "  [✗] CT ${ctid} failed to restart onto the new VLAN"
+    rollback_vlan_change "${ctid}" "${hostname}" "${original_net0}" "${old_ip}"
+    return 1
+  fi
+
+  # 4) Ensure the CT obtained a fresh lease on the new VLAN (IP != old_ip).
+  local new_ip
+  if ! new_ip=$(acquire_new_ip "${ctid}" "${old_ip}"); then
+    echo "  [✗] CT ${ctid} did not obtain a new IP on the new VLAN"
+    rollback_vlan_change "${ctid}" "${hostname}" "${original_net0}" "${old_ip}"
+    return 1
+  fi
+  echo "  [✓] CT ${ctid} moved to the new VLAN — IP ${new_ip} (was ${old_ip:-<none>})"
+  VLAN_PHASE_RESTARTED=true
+
+  # 5) Re-pin the reservation + local DNS with the new IP (non-fatal; Phase B's
+  #    check_dns_health retries).
+  local ct_mac
+  if ct_mac=$(get_ct_mac "${ctid}"); then
+    udmpro_make_static "${ct_mac}" "${new_ip}" "${hostname}" \
+      || echo "  [!] Re-pin of fixed IP failed (non-fatal; check_dns_health will retry)"
+  fi
+
+  return 0
 }
 
 # Build list of all containers
@@ -2456,6 +3486,35 @@ select_ct_interactive_single() {
   CTID="$selection"
   CT_HOSTNAME="${CT_MAP[$CTID]}"
   return 0
+}
+
+# Select an online destination node other than the source node.
+# Sets TARGET_NODE.
+select_target_node() {
+  local source_node="${1:-$(hostname -s)}"
+  local nodes_json node
+  local options=()
+
+  nodes_json=$(pvesh get /nodes --output-format json 2>/dev/null) || {
+    echo "ERROR: Cannot query cluster nodes." >&2
+    return 1
+  }
+
+  while IFS= read -r node; do
+    [[ -n "$node" && "$node" != "$source_node" ]] || continue
+    options+=("$node" "online" "OFF")
+  done < <(jq -r '.[] | select(.status == "online") | .node' <<< "$nodes_json" | sort)
+
+  if [[ ${#options[@]} -eq 0 ]]; then
+    echo "ERROR: No online target node is available." >&2
+    return 1
+  fi
+
+  TARGET_NODE=$(whiptail --title "Target Node" \
+    --radiolist "Move CT to:" 14 60 6 \
+    "${options[@]}" \
+    3>&1 1>&2 2>&3) || return 1
+  [[ -n "$TARGET_NODE" ]] || return 1
 }
 
 # Display interactive multi-select container menu using whiptail
@@ -2558,6 +3617,28 @@ resolve_ct_from_input() {
   return 0
 }
 
+# Refresh only the VMID membership of managed backup jobs when they exist.
+reconcile_backup_job_selections() {
+  local job_id resource_type vmids
+  validate_backup_config >/dev/null || return 1
+  for resource_type in lxc qemu; do
+    if [[ "$resource_type" == lxc ]]; then
+      job_id=$(config_get_backup_job_id)
+    else
+      job_id=$(config_get_backup_vm_job_id)
+    fi
+    pvesh get "/cluster/backup/${job_id}" >/dev/null 2>&1 || continue
+    vmids=$(backup_resource_ids "$resource_type") || return 1
+    if [[ -n "$vmids" ]]; then
+      pvesh set "/cluster/backup/${job_id}" --vmid "$vmids" --enabled 1 >/dev/null
+    else
+      pvesh set "/cluster/backup/${job_id}" --enabled 0 >/dev/null
+    fi
+  done
+}
+
+reconcile_backup_job_vmids() { reconcile_backup_job_selections; }
+
 # Check the health of a single Proxmox storage.
 # Verifies the storage exists/is active and, when it is a ZFS pool, that the pool
 # is ONLINE and not resilvering (i.e. its redundancy is intact). Non-ZFS storages
@@ -2566,6 +3647,121 @@ resolve_ct_from_input() {
 # Args: $1 = storage id
 # Output: on failure, echoes a human-readable reason to stdout
 # Returns: 0 if healthy, 1 if missing/inactive/degraded/resilvering
+probe_local_storage_mount_contract() {
+  local expected_path source root_source
+  local errors=()
+  root_source=$(findmnt -n -o SOURCE --target / 2>/dev/null || true)
+
+  for expected_path in /DATA /mnt/docker /mnt/docker-data; do
+    if [[ -L "$expected_path" ]]; then
+      errors+=("'${expected_path}' must not be a symlink")
+      continue
+    fi
+    if ! mountpoint -q "$expected_path"; then
+      errors+=("'${expected_path}' is not a mountpoint")
+      continue
+    fi
+    [[ -w "$expected_path" ]] || errors+=("'${expected_path}' is not writable")
+    source=$(findmnt -n -o SOURCE --target "$expected_path" 2>/dev/null || true)
+    if [[ -z "$source" || "$source" == "$root_source" ]]; then
+      errors+=("'${expected_path}' falls through to the root filesystem")
+    fi
+    if [[ "$expected_path" == "/DATA" && "$source" != "DATA" ]]; then
+      errors+=("'/DATA' must be backed by ZFS pool DATA (found '${source:-unknown}')")
+    fi
+  done
+
+  printf '%s\n' "${errors[@]}"
+  [[ ${#errors[@]} -eq 0 ]]
+}
+
+validate_node_storage_contract() {
+  local node="${1:-$(hostname -s)}"
+  local local_node
+  local node_context=" on node '${node}'"
+  [[ "${CONTRACT_NODE_HEADER_ACTIVE:-false}" != "true" ]] || node_context=""
+  local_node=$(hostname -s)
+  local errors=()
+  local storage config status type path content shared disabled nodes mount_errors
+
+  for storage in DATA DOCKER DOCKER-DATA; do
+    if ! config=$(pvesh get "/storage/${storage}" --output-format json 2>/dev/null); then
+      errors+=("storage '${storage}' is missing from the Proxmox configuration")
+      continue
+    fi
+
+    type=$(jq -r '.type // ""' <<< "$config")
+    content=$(jq -r '.content // ""' <<< "$config")
+    shared=$(jq -r '.shared // 0' <<< "$config")
+    disabled=$(jq -r '.disable // 0' <<< "$config")
+    nodes=$(jq -r '.nodes // ""' <<< "$config")
+
+    [[ "$shared" == "0" ]] || errors+=("storage '${storage}' must be node-local (shared=0)")
+    [[ "$disabled" == "0" ]] || errors+=("storage '${storage}' is disabled")
+    if [[ -n "$nodes" ]] && ! tr ',' '\n' <<< "$nodes" | grep -Fxq "$node"; then
+      errors+=("storage '${storage}' is not assigned to node '${node}'")
+    fi
+    if ! tr ',' '\n' <<< "$content" | grep -Fxq rootdir; then
+      errors+=("storage '${storage}' must support rootdir content")
+    fi
+
+    case "$storage" in
+      DATA)
+        path=$(jq -r '.mountpoint // ""' <<< "$config")
+        [[ "$type" == "zfspool" ]] || errors+=("storage 'DATA' must be type zfspool (found '${type:-unset}')")
+        [[ "$(jq -r '.pool // ""' <<< "$config")" == "DATA" ]] || errors+=("storage 'DATA' must use pool DATA")
+        [[ "$path" == "/DATA" ]] || errors+=("storage 'DATA' must use mountpoint /DATA (found '${path:-unset}')")
+        ;;
+      DOCKER)
+        path=$(jq -r '.path // ""' <<< "$config")
+        [[ "$type" == "dir" ]] || errors+=("storage 'DOCKER' must be type dir (found '${type:-unset}')")
+        [[ "$path" == "/mnt/docker" ]] || errors+=("storage 'DOCKER' must use path /mnt/docker (found '${path:-unset}')")
+        [[ "$(jq -r '."create-base-path" // 1' <<< "$config")" == "0" ]] || errors+=("storage 'DOCKER' must set create-base-path=0")
+        ;;
+      DOCKER-DATA)
+        path=$(jq -r '.path // ""' <<< "$config")
+        [[ "$type" == "dir" ]] || errors+=("storage 'DOCKER-DATA' must be type dir (found '${type:-unset}')")
+        [[ "$path" == "/mnt/docker-data" ]] || errors+=("storage 'DOCKER-DATA' must use path /mnt/docker-data (found '${path:-unset}')")
+        [[ "$(jq -r '."create-base-path" // 1' <<< "$config")" == "0" ]] || errors+=("storage 'DOCKER-DATA' must set create-base-path=0")
+        ;;
+    esac
+
+    if ! status=$(pvesh get "/nodes/${node}/storage/${storage}/status" --output-format json 2>/dev/null); then
+      errors+=("storage '${storage}' status is unavailable on node '${node}'")
+    elif [[ "$(jq -r '.active // 0' <<< "$status")" != "1" ]]; then
+      errors+=("storage '${storage}' is not active on node '${node}'")
+    fi
+  done
+
+  if [[ "$node" == "$local_node" ]]; then
+    if ! mount_errors=$(probe_local_storage_mount_contract); then
+      while IFS= read -r path_error; do
+        [[ -n "$path_error" ]] && errors+=("$path_error")
+      done <<< "$mount_errors"
+    fi
+  else
+    if ! mount_errors=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "$(declare -f probe_local_storage_mount_contract); probe_local_storage_mount_contract" 2>/dev/null); then
+      if [[ -z "$mount_errors" ]]; then
+        errors+=("cannot validate physical mounts over SSH")
+      else
+        while IFS= read -r path_error; do
+          [[ -n "$path_error" ]] && errors+=("$path_error")
+        done <<< "$mount_errors"
+      fi
+    fi
+  fi
+
+  if [[ ${#errors[@]} -gt 0 ]]; then
+    echo "ERROR: Storage contract validation failed${node_context}:" >&2
+    printf '  - %s\n' "${errors[@]}" >&2
+    return 1
+  fi
+
+  echo "  [✓] Storage contract valid${node_context}"
+  return 0
+}
+
 check_storage_health() {
   local storage="$1"
   local health
@@ -2595,17 +3791,129 @@ check_storage_health() {
   return 0
 }
 
+# Validate local-lvm as a CT rootfs target and enforce projected thin-pool headroom.
+# Args: $1 = node, $2 = additional provisioned GiB, $3 = minimum free percent
+validate_rootfs_target_capacity() {
+  local node="${1:-$(hostname -s)}"
+  local additional_gib="${2:-0}"
+  local reserve_percent="${3:-20}"
+  local config status type content shared disabled nodes vg thinpool
+  local pool_size_bytes data_percent metadata_percent virtual_bytes used_bytes committed_bytes projected_bytes limit_bytes
+  local node_context=" on node '${node}'"
+  [[ "${CONTRACT_NODE_HEADER_ACTIVE:-false}" != "true" ]] || node_context=""
+
+  [[ "$additional_gib" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { echo "ERROR: Additional rootfs capacity must be a non-negative GiB value." >&2; return 1; }
+  [[ "$reserve_percent" =~ ^[0-9]+$ && "$reserve_percent" -lt 100 ]] \
+    || { echo "ERROR: Rootfs reserve percent must be an integer below 100." >&2; return 1; }
+
+  config=$(pvesh get /storage/local-lvm --output-format json 2>/dev/null) || {
+    echo "ERROR: Storage 'local-lvm' is missing from the Proxmox configuration." >&2
+    return 1
+  }
+  type=$(jq -r '.type // ""' <<< "$config")
+  content=$(jq -r '.content // ""' <<< "$config")
+  shared=$(jq -r '.shared // 0' <<< "$config")
+  disabled=$(jq -r '.disable // 0' <<< "$config")
+  nodes=$(jq -r '.nodes // ""' <<< "$config")
+  vg=$(jq -r '.vgname // ""' <<< "$config")
+  thinpool=$(jq -r '.thinpool // ""' <<< "$config")
+
+  [[ "$type" == "lvmthin" ]] || { echo "ERROR: Storage 'local-lvm' must be type lvmthin." >&2; return 1; }
+  tr ',' '\n' <<< "$content" | grep -Fxq rootdir \
+    || { echo "ERROR: Storage 'local-lvm' must support rootdir content." >&2; return 1; }
+  [[ "$shared" == "0" && "$disabled" == "0" ]] \
+    || { echo "ERROR: Storage 'local-lvm' must be enabled and node-local." >&2; return 1; }
+  if [[ -n "$nodes" ]] && ! tr ',' '\n' <<< "$nodes" | grep -Fxq "$node"; then
+    echo "ERROR: Storage 'local-lvm' is not assigned to node '${node}'." >&2
+    return 1
+  fi
+  [[ "$vg" == "pve" && "$thinpool" == "data" ]] \
+    || { echo "ERROR: Storage 'local-lvm' must use thin pool pve/data." >&2; return 1; }
+
+  status=$(pvesh get "/nodes/${node}/storage/local-lvm/status" --output-format json 2>/dev/null) || {
+    echo "ERROR: Storage 'local-lvm' status is unavailable on node '${node}'." >&2
+    return 1
+  }
+  [[ "$(jq -r '.active // 0' <<< "$status")" == "1" ]] \
+    || { echo "ERROR: Storage 'local-lvm' is not active on node '${node}'." >&2; return 1; }
+
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    pool_size_bytes=$(lvs --noheadings --units b --nosuffix -o lv_size pve/data 2>/dev/null | xargs || true)
+    data_percent=$(lvs --noheadings --nosuffix -o data_percent pve/data 2>/dev/null | xargs || true)
+    metadata_percent=$(lvs --noheadings --nosuffix -o metadata_percent pve/data 2>/dev/null | xargs || true)
+    virtual_bytes=$(lvs --noheadings --units b --nosuffix -o lv_size,pool_lv 2>/dev/null \
+      | awk '$2 == "data" { sum += $1 } END { printf "%.0f", sum + 0 }' || true)
+  else
+    read -r pool_size_bytes data_percent metadata_percent < <(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "lvs --noheadings --units b --nosuffix -o lv_size,data_percent,metadata_percent pve/data 2>/dev/null" | xargs || true)
+    virtual_bytes=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "lvs --noheadings --units b --nosuffix -o lv_size,pool_lv 2>/dev/null | awk '\$2 == \"data\" { sum += \$1 } END { printf \"%.0f\", sum + 0 }'" || true)
+  fi
+  [[ "$pool_size_bytes" =~ ^[0-9]+([.][0-9]+)?$ \
+    && "$data_percent" =~ ^[0-9]+([.][0-9]+)?$ \
+    && "$metadata_percent" =~ ^[0-9]+([.][0-9]+)?$ \
+    && "$virtual_bytes" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: Cannot determine pve/data capacity${node_context}." >&2
+    return 1
+  }
+  awk -v metadata="$metadata_percent" 'BEGIN { exit !(metadata < 80) }' || {
+    echo "ERROR: pve/data metadata usage${node_context} is ${metadata_percent}% (limit: 80%)." >&2
+    return 1
+  }
+
+  used_bytes=$(awk -v size="$pool_size_bytes" -v used="$data_percent" 'BEGIN { printf "%.0f", size * used / 100 }')
+  if (( virtual_bytes > used_bytes )); then
+    committed_bytes="$virtual_bytes"
+  else
+    committed_bytes="$used_bytes"
+  fi
+  projected_bytes=$(awk -v used="$committed_bytes" -v gib="$additional_gib" 'BEGIN { printf "%.0f", used + gib * 1073741824 }')
+  limit_bytes=$(awk -v size="$pool_size_bytes" -v reserve="$reserve_percent" 'BEGIN { printf "%.0f", size * (100 - reserve) / 100 }')
+  if (( projected_bytes > limit_bytes )); then
+    echo "ERROR: local-lvm${node_context} lacks ${reserve_percent}% headroom after adding ${additional_gib} GiB." >&2
+    return 1
+  fi
+
+  echo "  [✓] local-lvm capacity valid${node_context} (${reserve_percent}% reserve)"
+}
+
+# Verify that the separate Proxmox OS filesystem is not already under pressure.
+# CT rootfs allocation does not consume this filesystem; this is a node-health gate.
+validate_os_root_headroom() {
+  local node="${1:-$(hostname -s)}"
+  local reserve_percent="${2:-20}"
+  local available_percent
+  local node_context=" on node '${node}'"
+  [[ "${CONTRACT_NODE_HEADER_ACTIVE:-false}" != "true" ]] || node_context=""
+
+  [[ "$reserve_percent" =~ ^[0-9]+$ && "$reserve_percent" -lt 100 ]] \
+    || { echo "ERROR: OS root reserve percent must be an integer below 100." >&2; return 1; }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    available_percent=$(df -P / | awk 'NR == 2 { gsub(/%/, "", $5); print 100 - $5 }')
+  else
+    available_percent=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+      "df -P / | awk 'NR == 2 { gsub(/%/, \"\", \$5); print 100 - \$5 }'" || true)
+  fi
+  [[ "$available_percent" =~ ^[0-9]+$ ]] \
+    || { echo "ERROR: Cannot determine OS root capacity${node_context}." >&2; return 1; }
+  (( available_percent >= reserve_percent )) || {
+    echo "ERROR: OS root filesystem${node_context} has ${available_percent}% free (minimum: ${reserve_percent}%)." >&2
+    return 1
+  }
+  echo "  [✓] OS root capacity valid${node_context} (${available_percent}% free)"
+}
+
 # Check the health of every storage VOLUME backing a container.
 # Inspects the CT's rootfs and any volume-backed mount points (mpN of the form
 # "storage:volume"); bind mounts (host paths starting with "/") are ignored.
 # Each distinct storage is validated with check_storage_health.
 # Args:
 #   $1 = CTID
-#   $2 = mode: "fatal" (exit 1 on first problem) or "warn" (print warning, continue)
-# Returns: 0 when all healthy or mode=warn; exits 1 when mode=fatal and a problem found.
+#   $2 = legacy mode argument (ignored; storage health is always advisory)
+# Returns: always 0; unhealthy storage is reported as a warning.
 check_ct_storage_health() {
   local ctid="$1"
-  local mode="${2:-warn}"
   local config storages storage reason
 
   config=$(pct config "$ctid" 2>/dev/null) || {
@@ -2622,10 +3930,6 @@ check_ct_storage_health() {
 
   for storage in $storages; do
     if ! reason=$(check_storage_health "$storage"); then
-      if [[ "$mode" == "fatal" ]]; then
-        echo "  [✗] CT ${ctid}: storage health check failed: ${reason}" >&2
-        exit 1
-      fi
       echo "  [!] CT ${ctid}: storage health warning: ${reason}" >&2
     fi
   done
@@ -2824,16 +4128,14 @@ sync_config_shared() {
 }
 
 # Run per-CT configure.sh script (if present)
-# Looks for ${DIR_DOCKER}/configure.sh on the Proxmox host and runs it
+# Looks for ${DIR_DOCKER}/_config/configure.sh on the Proxmox host and runs it
 # inside the CT via ct_exec. The script must be idempotent.
 #
-# If ${DIR_DOCKER}/configure.env exists, each line maps an env var name to
-# a jq path in commonCT.json. Resolved values are injected as environment
-# variables into the ct_exec call (secrets never touch CT disk).
-#
-# configure.env format (lines starting with # are ignored):
-#   ENV_VAR_NAME=jq.dot.path
-#   AUTHENTIK_API_TOKEN=authentik.apitoken
+# The CT's .env file (/mnt/docker/.env inside the CT) is the single source of
+# truth for configuration: configure.sh sources it directly (via load_env_file
+# from the shared lib) to obtain any values it needs — including AUTH_* OIDC
+# integration values written by update_env_file. There is no separate in-process
+# secret injection; everything flows through the .env that Docker Compose also reads.
 #
 # Args: none (uses global CTID, CT_HOSTNAME, DIR_DOCKER)
 # Returns: 0 on success or if no script exists, 1 on failure (non-fatal)
@@ -2850,32 +4152,6 @@ run_configure_script() {
   # Ensure the script is executable
   chmod +x "$configure_script"
 
-  # Build env var prefix from configure.env mappings
-  local env_prefix=""
-  local configure_env="${DIR_DOCKER}/_config/configure.env"
-
-  if [[ -f "$configure_env" ]] && config_exists; then
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      # Skip comments and blank lines
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      [[ -z "${line// /}" ]] && continue
-
-      local var_name="${line%%=*}"
-      local jq_path="${line#*=}"
-
-      # Convert dot path to jq filter: authentik.apitoken -> .authentik.apitoken
-      local jq_filter=".${jq_path}"
-      local value
-      value=$(jq -r "${jq_filter} // empty" "${CONFIG_FILE}" 2>/dev/null)
-
-      if [[ -n "$value" ]]; then
-        # Escape single quotes in value for safe shell injection
-        value="${value//\'/\'\\\'\'}"
-        env_prefix="${env_prefix}${var_name}='${value}' "
-      fi
-    done < "$configure_env"
-  fi
-
   # Wait for Docker containers to be healthy (up to 120s)
   echo "  Waiting for containers to be healthy..."
   local retries=24
@@ -2888,8 +4164,9 @@ run_configure_script() {
     sleep 5
   done
 
-  # Run the script inside the CT with injected env vars
-  if ct_exec --timeout 120 "cd /mnt/docker && ${env_prefix}sh ./_config/configure.sh '${CT_HOSTNAME}'" 2>&1; then
+  # Run the script inside the CT. configure.sh sources the CT .env itself for any
+  # values it needs (single source of truth), so no env vars are injected here.
+  if ct_exec --timeout 120 "cd /mnt/docker && sh ./_config/configure.sh '${CT_HOSTNAME}'" 2>&1; then
     echo "--- [✓] configure.sh completed ---"
     echo ""
   else
@@ -2956,10 +4233,48 @@ update_env_file() {
     sed -i "/^${key}=/d" "$env_file"
   }
   
-  # Update required configuration values
-  set_env_value "HOSTNAME" "${target_hostname}" "Site hostname (from CT container)"
+  # Update required configuration values.
+  # HOSTFQDN carries the CT's FQDN for compose interpolation. We deliberately do NOT
+  # use HOSTNAME here: HOSTNAME is a well-known shell variable (exported in some
+  # contexts), and Compose gives the process environment precedence over the .env,
+  # so a leaked shell HOSTNAME could silently override the .env value. HOSTFQDN has
+  # no such collision. remove_env_key cleans up the legacy HOSTNAME line on refresh.
+  set_env_value "HOSTFQDN" "${target_hostname}" "Site FQDN (from CT container)"
+  remove_env_key "HOSTNAME"
   set_env_value "CADDY_EMAIL" "${email}" "Caddy email for ACME (from commonCT.json)"
-  
+
+  # Authentik / OIDC provider values (product-agnostic AUTH_* names; the CT .env is
+  # the single source of truth, consumed by both compose interpolation and the per-CT
+  # configure.sh). AUTH_HOSTNAME is non-secret and is referenced by compose
+  # forward-auth labels, so it is written whenever an Authentik host is configured.
+  # The admin API token and flow slugs are only needed by a CT that self-registers
+  # an OIDC app from its _config/configure.sh (i.e. one that sources lib-authentik),
+  # so they are written ONLY for those CTs — keeping the admin token off the disk of
+  # every CT that never uses it.
+  local auth_host
+  auth_host=$(config_get_authentik_host)
+  if [[ -n "$auth_host" ]]; then
+    set_env_value "AUTH_HOSTNAME" "${auth_host}" "Authentik/OIDC provider hostname (from commonCT.json authentik.host)"
+  else
+    remove_env_key "AUTH_HOSTNAME"
+  fi
+
+  local ct_config_dir auth_token auth_authorization_flow auth_invalidation_flow
+  ct_config_dir="$(dirname "$env_file")/_config"
+  if [[ -n "$auth_host" && -f "${ct_config_dir}/configure.sh" ]] \
+     && grep -q 'lib-authentik' "${ct_config_dir}/configure.sh" 2>/dev/null; then
+    auth_token=$(config_get_authentik_token)
+    auth_authorization_flow=$(config_get_authentik_authorization_flow)
+    auth_invalidation_flow=$(config_get_authentik_invalidation_flow)
+    set_env_value "AUTH_API_TOKEN" "${auth_token}" "Authentik admin API token for OIDC self-registration (from commonCT.json authentik.apitoken)"
+    set_env_value "AUTH_AUTHORIZATION_FLOW" "${auth_authorization_flow}" "Authentik authorization flow slug (from commonCT.json)"
+    set_env_value "AUTH_INVALIDATION_FLOW" "${auth_invalidation_flow}" "Authentik invalidation flow slug (from commonCT.json)"
+  else
+    remove_env_key "AUTH_API_TOKEN"
+    remove_env_key "AUTH_AUTHORIZATION_FLOW"
+    remove_env_key "AUTH_INVALIDATION_FLOW"
+  fi
+
   if [[ "$ssl_type" == "step_ca" ]]; then
     local ca_name
     ca_name=$(config_get_ca_name "${domain}")
@@ -2978,6 +4293,37 @@ update_env_file() {
     remove_env_key "DNSIMPLE_ACCOUNT_ID"
   fi
   
+  # OTLP/HTTP telemetry endpoint for application SDKs (from commonCT.json).
+  # Resolved here so compose files never hardcode the telemetry host/port.
+  local telemetry_host otlp_http_port otlp_grpc_port
+  telemetry_host=$(config_get_telemetry_hostname)
+  otlp_http_port=$(config_get_telemetry_otlp_http_port)
+  otlp_grpc_port=$(config_get_telemetry_otlp_grpc_port)
+  if [[ -n "$telemetry_host" && -n "$otlp_http_port" ]]; then
+    set_env_value "OTEL_EXPORTER_OTLP_ENDPOINT" "http://${telemetry_host}:${otlp_http_port}" "OTLP/HTTP telemetry endpoint (from commonCT.json)"
+    # The endpoint above is the OTLP/HTTP port; OTEL SDKs default to gRPC, so the
+    # protocol must be declared explicitly or exporters silently fail (gRPC frames
+    # against an HTTP receiver). http/protobuf makes the SDK POST to /v1/{traces,metrics,logs}.
+    set_env_value "OTEL_EXPORTER_OTLP_PROTOCOL" "http/protobuf" "OTLP protocol matching the OTLP/HTTP endpoint port"
+  else
+    remove_env_key "OTEL_EXPORTER_OTLP_ENDPOINT"
+    remove_env_key "OTEL_EXPORTER_OTLP_PROTOCOL"
+  fi
+
+  # OTLP/gRPC telemetry endpoint (from commonCT.json). Consumed by components that
+  # export OTLP over gRPC rather than HTTP - notably Caddy's native `tracing` module
+  # (gRPC-only) and the per-CT `telemetry` sidecar collector. Kept separate from the
+  # SDK HTTP endpoint above because they target different receiver ports (4317 vs 4318).
+  if [[ -n "$telemetry_host" && -n "$otlp_grpc_port" ]]; then
+    set_env_value "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT" "http://${telemetry_host}:${otlp_grpc_port}" "OTLP/gRPC telemetry endpoint (from commonCT.json)"
+    # The collector's gRPC receiver is plaintext (no TLS); declare insecure so gRPC
+    # exporters do not attempt a TLS handshake against a cleartext endpoint.
+    set_env_value "OTEL_EXPORTER_OTLP_INSECURE" "true" "Use plaintext for the OTLP/gRPC exporter (collector receiver is non-TLS)"
+  else
+    remove_env_key "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT"
+    remove_env_key "OTEL_EXPORTER_OTLP_INSECURE"
+  fi
+
   # Add Newt/Pangolin placeholders if not already present
   if ! grep -q "^NEWT_ID=" "$env_file"; then
     echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
@@ -3027,7 +4373,6 @@ setup_mountpoints() {
 
   mkdir -p "$DIR_DOCKER"
   mkdir -p "$DIR_DOCKER_DATA"
-  mkdir -p "$DIR_DOCKER/caddy/data"
 
   echo "Created:"
   echo "  $DIR_DOCKER"
@@ -3096,4 +4441,317 @@ get_ct_dirs() {
   
   DIR_DOCKER="/mnt/docker/${hostname_lower}"
   DIR_DOCKER_DATA="/mnt/docker-data/${hostname_lower}"
+}
+
+# Quote one value for the POSIX shell used by pct exec.
+compose_permission_shell_quote() {
+  local value="${1//\'/\'\\\'\'}"
+  printf "'%s'" "$value"
+}
+
+compose_permission_ct_exec() {
+  local executor="${COMPOSE_PERMISSION_EXECUTOR:-ct_exec}"
+  "$executor" "$@"
+}
+
+# Resolve a managed CT-local bind source through the CT's actual mp configuration.
+# Prints the canonical host mount root and source path, tab-separated.
+compose_permission_host_mapping() {
+  local ctid="$1" source="$2" line spec host_root ct_root suffix candidate canonical_root canonical_candidate
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^mp[0-9]+:[[:space:]] ]] || continue
+    spec="${line#*: }"
+    host_root="${spec%%,*}"
+    ct_root=$(tr ',' '\n' <<< "$spec" | sed -n 's/^mp=//p' | head -1)
+    [[ -n "$host_root" && -n "$ct_root" && "$source" == "$ct_root"/* ]] || continue
+
+    suffix="${source#"$ct_root"}"
+    candidate="${host_root}${suffix}"
+    [[ -d "$host_root" && ! -L "$host_root" && ! -L "$candidate" ]] || return 1
+    canonical_root=$(readlink -f -- "$host_root") || return 1
+    canonical_candidate=$(readlink -m -- "$candidate") || return 1
+    [[ "$canonical_candidate" == "$canonical_root"/* ]] || return 1
+    printf '%s\t%s\n' "$canonical_root" "$canonical_candidate"
+    return 0
+  done < <(pct config "$ctid" 2>/dev/null)
+
+  return 1
+}
+
+# Remove empty host-root descendants that block an unprivileged CT from
+# recreating a Compose bind source. The mount root itself is never removed.
+remove_empty_host_root_bind_ancestors() {
+  local ctid="$1" source="$2" mapping host_root host_source cursor owner
+
+  mapping=$(compose_permission_host_mapping "$ctid" "$source") || return 1
+  IFS=$'\t' read -r host_root host_source <<< "$mapping"
+  cursor="$host_source"
+  while [[ "$cursor" != "$host_root" ]]; do
+    if [[ ! -e "$cursor" ]]; then
+      cursor=$(dirname "$cursor")
+      continue
+    fi
+    [[ -d "$cursor" && ! -L "$cursor" ]] || return 1
+    owner=$(stat -c %u:%g -- "$cursor") || return 1
+    [[ "$owner" == "0:0" ]] || return 1
+    [[ -z "$(find "$cursor" -mindepth 1 -print -quit)" ]] || return 1
+    rmdir -- "$cursor" || return 1
+    cursor=$(dirname "$cursor")
+  done
+  echo "  [i] Recreating empty host-root bind source inside CT: ${source}"
+}
+
+create_compose_bind_source() {
+  local ctid="$1" source="$2" owner="$3" quoted_source="$4"
+  local mapping host_root host_source original_mode
+
+  if compose_permission_ct_exec --timeout 30 "$ctid" \
+    "mkdir -p ${quoted_source} && chown ${owner} ${quoted_source}"; then
+    return 0
+  fi
+
+  remove_empty_host_root_bind_ancestors "$ctid" "$source" || return 1
+  mapping=$(compose_permission_host_mapping "$ctid" "$source") || return 1
+  IFS=$'\t' read -r host_root host_source <<< "$mapping"
+  original_mode=$(stat -c %a -- "$host_root") || return 1
+  (
+    trap 'chmod "$original_mode" -- "$host_root"' EXIT
+    chmod o+w -- "$host_root"
+    compose_permission_ct_exec --timeout 30 "$ctid" \
+      "mkdir -p ${quoted_source} && chown ${owner} ${quoted_source}"
+  )
+}
+
+# Resolve the effective numeric UID:GID for a rendered Compose service.
+# Precedence: repository override, Compose user, PUID/PGID, image Config.User.
+resolve_compose_service_user() {
+  local ctid="$1" compose_json="$2" service="$3"
+  local image override user_spec puid pgid quoted_image quoted_user uid gid
+
+  image=$(jq -r --arg service "$service" '.services[$service].image // empty' <<< "$compose_json")
+  [[ -n "$image" ]] || {
+    echo "Service '${service}' has writable binds but no image" >&2
+    return 1
+  }
+  override=$(jq -r --arg service "$service" \
+    '.services[$service].labels["permissions.thesaints.user"] // empty' <<< "$compose_json")
+  user_spec=$(jq -r --arg service "$service" '.services[$service].user // empty' <<< "$compose_json")
+  puid=$(jq -r --arg service "$service" '.services[$service].environment.PUID // empty' <<< "$compose_json")
+  pgid=$(jq -r --arg service "$service" '.services[$service].environment.PGID // empty' <<< "$compose_json")
+
+  if [[ -n "$override" ]]; then
+    user_spec="$override"
+  elif [[ -z "$user_spec" && ( -n "$puid" || -n "$pgid" ) ]]; then
+    [[ "$puid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ ]] || {
+      echo "Service '${service}' must define numeric PUID and PGID together" >&2
+      return 1
+    }
+    printf '%s:%s\n' "$puid" "$pgid"
+    return 0
+  elif [[ -z "$user_spec" ]]; then
+    quoted_image=$(compose_permission_shell_quote "$image")
+    user_spec=$(compose_permission_ct_exec --timeout 30 "$ctid" \
+      "docker image inspect --format '{{.Config.User}}' ${quoted_image}" 2>/dev/null) || {
+      echo "Could not inspect user for service '${service}' image '${image}'" >&2
+      return 1
+    }
+    if [[ -z "$user_spec" ]]; then
+      echo '0:0'
+      return 0
+    fi
+  fi
+
+  if [[ "$user_spec" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf '%s\n' "$user_spec"
+    return 0
+  fi
+  if [[ "$user_spec" =~ ^[0-9]+$ ]]; then
+    printf '%s:0\n' "$user_spec"
+    return 0
+  fi
+
+  quoted_image=$(compose_permission_shell_quote "$image")
+  quoted_user=$(compose_permission_shell_quote "$user_spec")
+  uid=$(compose_permission_ct_exec --timeout 60 "$ctid" \
+    "docker run --rm --user ${quoted_user} --entrypoint id ${quoted_image} -u" 2>/dev/null) || {
+    echo "Could not resolve user '${user_spec}' for service '${service}'" >&2
+    return 1
+  }
+  gid=$(compose_permission_ct_exec --timeout 60 "$ctid" \
+    "docker run --rm --user ${quoted_user} --entrypoint id ${quoted_image} -g" 2>/dev/null) || {
+    echo "Could not resolve group for user '${user_spec}' in service '${service}'" >&2
+    return 1
+  }
+  [[ "$uid" =~ ^[0-9]+$ && "$gid" =~ ^[0-9]+$ ]] || {
+    echo "Service '${service}' resolved to invalid UID:GID '${uid}:${gid}'" >&2
+    return 1
+  }
+  printf '%s:%s\n' "$uid" "$gid"
+}
+
+# Validate and reconcile all repository-managed Compose bind permissions. Every
+# mutation runs inside the CT, so LXC applies the active node's idmap.
+reconcile_compose_permissions() {
+  local ctid="${1:-$CTID}" mode="${2:-apply}" compose_json service owner source create_host_path skip recursive quoted_source
+  local existing_owner services_for_source secret_path quoted_secret quoted_parent planned_source uid gid
+  local -A source_owners=() source_services=() source_recursive=() source_create=() source_missing=()
+  local -a sources=() secrets=()
+
+  [[ "$mode" == "apply" || "$mode" == "--check" ]] || {
+    echo "  [!] Invalid permission reconciliation mode '${mode}'" >&2
+    return 1
+  }
+
+  compose_json=$(compose_permission_ct_exec --timeout 30 "$ctid" \
+    'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
+    echo "  [!] Could not render Compose permission plan" >&2
+    return 1
+  }
+
+  while IFS= read -r service; do
+    owner=$(resolve_compose_service_user "$ctid" "$compose_json" "$service") || return 1
+    skip=$(jq -r --arg service "$service" \
+      '.services[$service].labels["permissions.thesaints.skip"] // empty' <<< "$compose_json")
+    recursive=$(jq -r --arg service "$service" \
+      '.services[$service].labels["permissions.thesaints.recursive"] // "true"' <<< "$compose_json")
+    [[ "$recursive" == "true" || "$recursive" == "false" ]] || {
+      echo "  [!] Service '${service}' has invalid permissions.thesaints.recursive '${recursive}'" >&2
+      return 1
+    }
+
+    while IFS=$'\t' read -r source create_host_path; do
+      [[ -n "$source" ]] || continue
+      if [[ ",$skip," == *",$source,"* ]]; then
+        echo "  [i] ${service}: explicitly skipping ${source}"
+        continue
+      fi
+      case "$source" in
+        /mnt/docker/?*|/mnt/docker-data/?*) ;;
+        *)
+          echo "  [!] Refusing writable bind outside managed CT paths: ${service}:${source}" >&2
+          return 1
+          ;;
+      esac
+      existing_owner="${source_owners[$source]:-}"
+      if [[ -n "$existing_owner" && "$existing_owner" != "$owner" ]]; then
+        services_for_source="${source_services[$source]}"
+        echo "  [!] Conflicting writers for ${source}: ${services_for_source}=${existing_owner}, ${service}=${owner}" >&2
+        return 1
+      fi
+      if [[ -z "$existing_owner" ]]; then
+        for planned_source in "${sources[@]}"; do
+          if [[ "$source" == "$planned_source"/* || "$planned_source" == "$source"/* ]]; then
+            echo "  [!] Overlapping writable bind sources are unsafe: ${planned_source} and ${source}" >&2
+            return 1
+          fi
+        done
+        sources+=("$source")
+        source_owners[$source]="$owner"
+        source_recursive[$source]="$recursive"
+        source_create[$source]="$create_host_path"
+      elif [[ "${source_recursive[$source]}" != "$recursive" ]]; then
+        echo "  [!] Conflicting recursive policy for shared source ${source}" >&2
+        return 1
+      elif [[ "${source_create[$source]}" != "$create_host_path" ]]; then
+        echo "  [!] Conflicting create_host_path policy for shared source ${source}" >&2
+        return 1
+      fi
+      source_services[$source]="${source_services[$source]:+${source_services[$source]},}${service}"
+    done < <(jq -r --arg service "$service" '
+      .services[$service].volumes // [] | .[]
+      | select(type == "object" and .type == "bind" and (.read_only != true))
+      | [.source, (.bind.create_host_path // true)] | @tsv
+    ' <<< "$compose_json")
+  done < <(jq -r '
+    .services | to_entries[]
+    | select([.value.volumes[]?
+        | select(type == "object" and .type == "bind" and (.read_only != true))]
+        | length > 0)
+    | .key
+  ' <<< "$compose_json")
+
+  while IFS= read -r secret_path; do
+    [[ -n "$secret_path" ]] || continue
+    case "$secret_path" in
+      /mnt/docker/_secrets/?*) secrets+=("$secret_path") ;;
+      *)
+        echo "  [!] Refusing Compose secret outside /mnt/docker/_secrets: ${secret_path}" >&2
+        return 1
+        ;;
+    esac
+  done < <(jq -r '.secrets // {} | to_entries[] | .value.file // empty' <<< "$compose_json")
+
+  # Validate every source before the first mutation.
+  for source in "${sources[@]}"; do
+    quoted_source=$(compose_permission_shell_quote "$source")
+    if ! compose_permission_ct_exec --timeout 15 "$ctid" "
+      candidate=${quoted_source}
+      while test ! -e \"\$candidate\"; do candidate=\$(dirname \"\$candidate\"); done
+      canonical=\$(readlink -f \"\$candidate\") &&
+      case \"\$canonical\" in /mnt/docker|/mnt/docker/?*|/mnt/docker-data|/mnt/docker-data/?*) exit 0 ;; *) exit 1 ;; esac
+    " >/dev/null 2>&1; then
+      echo "  [!] Missing or unsafe writable bind source: ${source}" >&2
+      return 1
+    fi
+    if ! compose_permission_ct_exec --timeout 15 "$ctid" "test -e ${quoted_source}" >/dev/null 2>&1; then
+      [[ "${source_create[$source]}" == "true" ]] || {
+        echo "  [!] Writable bind source is missing and create_host_path is false: ${source}" >&2
+        return 1
+      }
+      source_missing[$source]=true
+    fi
+  done
+  for secret_path in "${secrets[@]}"; do
+    quoted_secret=$(compose_permission_shell_quote "$secret_path")
+    if ! compose_permission_ct_exec --timeout 15 "$ctid" \
+      "test -f ${quoted_secret} && test ! -L ${quoted_secret} &&
+       canonical=\$(readlink -f ${quoted_secret}) &&
+       case \"\$canonical\" in /mnt/docker/_secrets/?*) exit 0 ;; *) exit 1 ;; esac" >/dev/null 2>&1; then
+      echo "  [!] Missing or unsafe Compose secret: ${secret_path}" >&2
+      return 1
+    fi
+  done
+
+  if [[ "$mode" == "--check" ]]; then
+    for source in "${sources[@]}"; do
+      echo "  [check] ${source_services[$source]}: ${source} -> ${source_owners[$source]}${source_missing[$source]:+ (create directory)}"
+    done
+    for secret_path in "${secrets[@]}"; do
+      echo "  [check] Compose secret: ${secret_path}"
+    done
+    return 0
+  fi
+
+  for source in "${sources[@]}"; do
+    quoted_source=$(compose_permission_shell_quote "$source")
+    owner="${source_owners[$source]}"
+    uid="${owner%%:*}"
+    gid="${owner#*:}"
+    if [[ "${source_missing[$source]:-}" == "true" ]]; then
+      create_compose_bind_source "$ctid" "$source" "$owner" "$quoted_source" || return 1
+    fi
+    if [[ "${source_recursive[$source]}" == "true" ]]; then
+      if ! compose_permission_ct_exec --timeout 300 "$ctid" "
+        if find ${quoted_source} \( ! -user ${uid} -o ! -group ${gid} \) -print -quit | grep -q .; then
+          chown -R ${owner} ${quoted_source}
+        fi
+      "; then
+        [[ "${source_create[$source]}" == "true" ]] || return 1
+        remove_empty_host_root_bind_ancestors "$ctid" "$source" || return 1
+        create_compose_bind_source "$ctid" "$source" "$owner" "$quoted_source" || return 1
+      fi
+    else
+      compose_permission_ct_exec --timeout 30 "$ctid" \
+        "current=\$(stat -c %u:%g ${quoted_source}) && { test \"\$current\" = ${owner} || chown ${owner} ${quoted_source}; }" || return 1
+    fi
+    echo "  [✓] ${source_services[$source]}: ${source} -> ${owner}"
+  done
+  for secret_path in "${secrets[@]}"; do
+    quoted_secret=$(compose_permission_shell_quote "$secret_path")
+    quoted_parent=$(compose_permission_shell_quote "$(dirname "$secret_path")")
+    compose_permission_ct_exec --timeout 30 "$ctid" \
+      "chown 0:0 ${quoted_parent} ${quoted_secret} && chmod 700 ${quoted_parent} && chmod 444 ${quoted_secret}" || return 1
+    echo "  [✓] Compose secret permissions: ${secret_path}"
+  done
 }

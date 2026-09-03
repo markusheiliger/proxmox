@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # createCT.sh - Create a Proxmox LXC container with Docker pre-installed
+# Documentation: createCT.md
 #
 # DESCRIPTION:
 #   Provisions an Alpine Linux container on Proxmox VE with:
@@ -18,7 +19,7 @@
 #   meaning the same configuration can be re-applied to update existing CTs.
 #
 # USAGE:
-#   ./createCT.sh <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [--gpu] [key=value overrides...]
+#   ./createCT.sh <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [--vlan ID] [key=value overrides...]
 #
 # EXAMPLES:
 #   ./createCT.sh app.thesaints.home                   # Default size S, priority mid
@@ -27,7 +28,8 @@
 #   ./createCT.sh app.thesaints.home --size M --memory 3072   # Size M base, 3072 MB RAM
 #   ./createCT.sh app.thesaints.home --priority low    # Low priority (background)
 #   ./createCT.sh app.thesaints.home --size L          # Large size (e.g., Seafile)
-#   ./createCT.sh nvr.thesaints.home --gpu --priority high  # GPU + high priority
+#   ./createCT.sh nvr.thesaints.home --priority high
+#   ./createCT.sh app.thesaints.home --vlan 100        # Assign net0 to VLAN 100
 #   ./createCT.sh app.thesaints.home IP=10.0.0.50/24 GW=10.0.0.1
 #   ./createCT.sh ca.thesaints.home CTID=2000
 #   ./createCT.sh app.thesaints.home --monitor
@@ -40,12 +42,10 @@
 #   --size           T-shirt size: S, M, L (default: S, defined in commonCT.json)
 #   --cores          Override cores from the size base (e.g. --cores 3)
 #   --memory         Override memory in MB from the size base (e.g. --memory 3072)
-#   --gpu            Enable GPU passthrough for VAAPI hardware acceleration
+#   --vlan           VLAN id for net0 (1-4094 to assign, 0 to leave untagged;
+#                    omit to use the bridge default / no VLAN)
 #   CTID             Auto-allocated starting at 2000, step 100
-#   STORAGE          DATA (redundant ZFS mirror; override e.g. STORAGE=local-lvm
-#                    for write-heavy CTs that should stay on the NVMe). Creation
-#                    aborts if the chosen storage is missing or its ZFS pool is
-#                    DEGRADED/resilvering.
+#   STORAGE          local-lvm (fixed; node-local pve/data thin pool)
 #   DISK             16 (GB)
 #   BRIDGE           vmbr1
 #   IP               dhcp (or CIDR like 10.0.0.50/24)
@@ -99,10 +99,9 @@ DIR_DOCKER_DATA=""
 COMPOSE_FILE=""
 ENV_FILE=""
 MONITOR_AFTER=false
-GPU_PASSTHROUGH=false
 CT_SIZE="S"
 CT_PRIORITY="mid"
-IGNORE_STORAGE_HEALTH=false
+CT_VLAN=""
 
 # -----------------------------
 # FUNCTIONS
@@ -110,16 +109,14 @@ IGNORE_STORAGE_HEALTH=false
 
 # Show usage and exit
 usage() {
-  echo "Usage: $0 <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [--gpu] [key=value overrides]"
+  echo "Usage: $0 <hostname> [--size S|M|L] [--cores N] [--memory MB] [--priority low|mid|high] [key=value overrides]"
   echo ""
   echo "Options:"
   echo "  --size S|M|L             T-shirt size (default: S)"
   echo "  --cores N                Override cores from the size base (custom allocation)"
   echo "  --memory MB              Override memory in MB from the size base (custom allocation)"
   echo "  --priority low|mid|high  CPU priority (default: mid)"
-  echo "  --gpu                    Enable GPU passthrough (VAAPI)"
   echo "  --monitor                Start log monitor after creation"
-  echo "  --ignore-storage-health  Provision even if the target storage is degraded (bypass recommendation)"
   echo ""
   echo "Sizes (defined in commonCT.json):"
   echo "  S = Small  ($(config_get_size_cores S) cores, $(config_get_size_memory S) MB)"
@@ -173,11 +170,10 @@ set_defaults() {
   validate_size "${CT_SIZE}" || exit 1
   
   CTID="${CTID:-$(next_ctid)}"
-  STORAGE="${STORAGE:-DATA}"
+  STORAGE="local-lvm"
   DISK="${DISK:-16}"
   CORES="${CORES:-${SIZE_CORES}}"
   MEMORY="${MEMORY:-${SIZE_MEMORY}}"
-  BRIDGE="${BRIDGE:-vmbr1}"
   IP="${IP:-dhcp}"
   GW="${GW:-}"
   TEMPLATE_PREFIX="${TEMPLATE_PREFIX:-alpine-3}"
@@ -389,13 +385,24 @@ start_compose() {
       return
     fi
     echo "  [✓] Compose file is valid"
+
+    echo "  Pulling images..."
+    if ! compose_pull "${CTID}"; then
+      echo "ERROR: Failed to pull images before permission reconciliation." >&2
+      return 1
+    fi
+    if ! reconcile_compose_permissions "${CTID}"; then
+      echo "ERROR: Compose permission reconciliation failed." >&2
+      return 1
+    fi
     
     # Start services
     echo "  Starting services..."
     if compose_up "${CTID}"; then
       echo "  [✓] Docker Compose services started"
     else
-      echo "  [!] Warning: docker compose up failed"
+      echo "ERROR: docker compose up failed" >&2
+      return 1
     fi
   fi
 }
@@ -404,6 +411,7 @@ start_compose() {
 # MAIN
 # -----------------------------
 main() {
+  lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
   # Parse arguments
   [[ $# -lt 1 ]] && usage
   
@@ -437,17 +445,25 @@ main() {
         MEMORY="$2"
         shift 2
         ;;
-      --gpu)
-        GPU_PASSTHROUGH=true
-        shift
-        ;;
-      --ignore-storage-health)
-        IGNORE_STORAGE_HEALTH=true
-        shift
-        ;;
       --priority|-p)
         CT_PRIORITY="$2"
         shift 2
+        ;;
+      --vlan)
+        if [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ ]] || (( $2 > 4094 )); then
+          echo "ERROR: --vlan must be an integer in range 0-4094 (got '$2')" >&2
+          exit 1
+        fi
+        CT_VLAN="$2"
+        shift 2
+        ;;
+      STORAGE=*)
+        echo "ERROR: CT rootfs storage is fixed to local-lvm; STORAGE overrides are unsupported." >&2
+        exit 1
+        ;;
+      BRIDGE=*)
+        echo "ERROR: BRIDGE overrides are unsupported; bridge assignment is derived from node policy." >&2
+        exit 1
         ;;
       *=*)
         eval "$1"
@@ -468,6 +484,7 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Validating hostname..."
   validate_hostname "${HOSTNAME}" || exit 1
+  validate_node_storage_contract || exit 1
   
   # Check if a CT with this hostname already exists
   build_ct_list
@@ -496,8 +513,8 @@ main() {
       elif [[ -n "$CT_SIZE" ]]; then
         refresh_args+=("--size" "$CT_SIZE")
       fi
-      [[ "$GPU_PASSTHROUGH" == "true" ]] && refresh_args+=("--gpu")
       [[ -n "$CT_PRIORITY" ]] && refresh_args+=("--priority" "$CT_PRIORITY")
+      [[ -n "$CT_VLAN" ]] && refresh_args+=("--vlan" "$CT_VLAN")
       exec "${SCRIPT_DIR}/refreshCT.sh" "${refresh_args[@]}"
     else
       echo "Aborted."
@@ -507,37 +524,22 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
-  local storage_reason
-  if ! storage_reason=$(check_storage_health "${STORAGE}"); then
-    status_bar_cleanup
-    echo "  [!] Storage recommendation: '${STORAGE}' is not healthy: ${storage_reason}" >&2
-    echo "      Recommended: restore the storage/pool, or pass STORAGE=<other>." >&2
-    if [[ "$IGNORE_STORAGE_HEALTH" == "true" ]]; then
-      echo "  [!] Proceeding anyway (--ignore-storage-health)." >&2
-      status_bar_init
-    elif [[ -t 0 ]]; then
-      local storage_answer
-      read -rp "Provision on degraded storage anyway? [y/N]: " storage_answer
-      if [[ "$storage_answer" =~ ^[Yy]$ ]]; then
-        status_bar_init
-      else
-        echo "Aborted."
-        exit 0
-      fi
-    else
-      echo "      Aborting. Re-run with --ignore-storage-health to override." >&2
-      exit 1
-    fi
-  fi
+  bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$HOSTNAME" || exit 1
+  BRIDGE="$BRIDGE_POLICY_SELECTED"
+  echo "Bridge policy: ${BRIDGE} (${BRIDGE_POLICY_REASON}, rank ${BRIDGE_POLICY_RANK})"
+  validate_rootfs_target_capacity "$(hostname -s)" "${DISK}" 20 || exit 1
+  validate_os_root_headroom "$(hostname -s)" 20 || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Preparing template..."
   prepare_template
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Creating container..."
   create_ct
+  apply_vlan_tag "${CTID}" "${CT_VLAN}"
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring LXC for Docker..."
   configure_lxc_docker
+  reconcile_ct_gpu_config "${CTID}" || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Starting container..."
   start_ct
@@ -558,7 +560,8 @@ main() {
   install_docker
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Applying configuration..."
-  apply_ct_configuration "${CTID}" "${HOSTNAME}" "${GPU_PASSTHROUGH}"
+  apply_ct_configuration "${CTID}" "${HOSTNAME}"
+  finalize_ct_gpu_capability "${CTID}" || exit 1
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints
@@ -566,7 +569,7 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Verifying setup..."
   verify_setup
-  start_compose
+  start_compose || exit 1
   reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
 
   # MANDATORY: this CT is a Docker host — the post-compose reboot must leave the
@@ -586,11 +589,13 @@ main() {
   status_bar_cleanup
   
   print_summary
+  reconcile_backup_job_selections || echo "  [!] Could not refresh managed backup job membership."
 
   # Optionally start monitoring
   if [[ "$MONITOR_AFTER" == "true" ]]; then
     echo ""
     echo "Starting log monitor..."
+    lifecycle_log_stop 0
     exec "${SCRIPT_DIR}/monitorCT.sh" "$CTID"
   fi
 }

@@ -85,7 +85,16 @@ count=$((count + 1))
 - `createCT.sh` - Create new LXC containers
 - `refreshCT.sh` - Update existing containers with latest config
 - `deleteCT.sh` - Remove containers
+- `moveCT.sh` - Move containers and bind data between Proxmox nodes
+- `renameCT.sh` - Rename containers and all derived identity state
+- `upgradeCT.sh` - Upgrade Alpine releases with rollback points
+- `backupCT.sh` - Manage workload-aware cluster backups
 - `monitorCT.sh` - Stream container logs
+- `forwardAuthCT.sh` - Reconcile Caddy forward auth with Authentik
+- `forwardDNSCT.sh` - Reconcile secondary-domain split DNS
+
+Each user-facing lifecycle script has an adjacent `[scriptname].md` operator
+guide. Cross-cutting architecture and decisions live in `documentation/`.
 
 ## Configuration
 

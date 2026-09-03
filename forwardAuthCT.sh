@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # forwardAuthCT.sh - Enable or disable Caddy forward auth via Authentik
+# Documentation: forwardAuthCT.md
 #
 # DESCRIPTION:
 #   Manages Caddy forward auth labels in docker-compose.yaml files for
@@ -12,18 +13,27 @@
 #   label. After modifying the compose file, the CT is rebooted to apply
 #   the changes.
 #
-#   Also ensures the domain-level Authentik application/provider exists
-#   (idempotent - shared across all services on the domain).
+#   Also manages the per-host Authentik forward_single application/provider:
+#   created/ensured on enable, deleted on --remove, and deleted+recreated on
+#   --reset (shared delete step, with confirmation).
 #
 # USAGE:
 #   ./forwardAuthCT.sh [CTID or hostname]           # Enable forward auth
-#   ./forwardAuthCT.sh [CTID or hostname] --remove   # Disable forward auth
+#   ./forwardAuthCT.sh [CTID or hostname] --remove   # Disable: delete Authentik
+#                                                    # app/provider (after confirmation),
+#                                                    # then strip the Caddy labels.
+#   ./forwardAuthCT.sh [CTID or hostname] --reset    # Delete the existing Authentik
+#                                                    # app/provider for the host (after
+#                                                    # confirmation), then recreate it for
+#                                                    # forward auth. Use to replace a stale
+#                                                    # native-OIDC combo that shares the slug.
 #
 # EXAMPLES:
 #   ./forwardAuthCT.sh                        # Interactive multi-select, enable
 #   ./forwardAuthCT.sh --remove               # Interactive multi-select, disable
 #   ./forwardAuthCT.sh 3200                   # Enable on CT 3200
 #   ./forwardAuthCT.sh 3200 --remove          # Disable on CT 3200
+#   ./forwardAuthCT.sh 3200 --reset           # Reset+recreate Authentik objects on CT 3200
 #   ./forwardAuthCT.sh rust.thesaints.home    # Enable by hostname
 #
 # REQUIREMENTS:
@@ -45,9 +55,13 @@ source "${SCRIPT_DIR}/commonCT.sh"
 
 # Global flags
 REMOVE_MODE=false
+RESET_MODE=false
 
 # Injector-managed Caddy labels (indented for the YAML labels block).
-# AUTHENTIK_HOST is replaced with the actual Authentik host at insertion time.
+# The Authentik host is referenced as the ${AUTH_HOSTNAME} Docker Compose variable, written
+# into each CT's .env by update_env_file (from commonCT.json authentik.host). Docker Compose
+# interpolates it when reading the compose file, so the .env is the single source of truth and
+# the labels are rename-safe (renaming the Authentik CT only re-writes .env, never these labels).
 # These two entries live inside a `caddy.route` block (single source of truth):
 #   - 0_reverse_proxy : always forward the Authentik outpost path to the outpost, so the
 #                       OAuth callback is served from the application host and the proxy
@@ -55,16 +69,21 @@ REMOVE_MODE=false
 #                       even when the app and Authentik are under different parent domains.
 #                       Runs BEFORE forward_auth.
 #   - 50_forward_auth : authenticate everything that is not an explicit bypass route.
+# Host header: the upstream is dialed at ${AUTH_HOSTNAME} (so TLS SNI/cert match Authentik),
+# but the HTTP Host MUST be the application's own host ({http.request.host}). The embedded
+# outpost selects the forward_single provider by Host == provider.external_host, and scopes
+# the proxy session cookie to that host. Overriding Host to ${AUTH_HOSTNAME} makes the outpost
+# match no provider (404 "Not Found") and would set the cookie on the wrong domain.
 # The protected service owns the rest of the route via numeric-prefix bands:
 #   1_..49_   bypass routes (no auth), evaluated before forward_auth
 #   51_..98_  authenticated auxiliary routes
 #   99_       the app catch-all reverse_proxy
 FORWARD_AUTH_LABELS=(
-  'caddy.route.0_reverse_proxy: "/outpost.goauthentik.io/* https://AUTHENTIK_HOST"'
-  'caddy.route.0_reverse_proxy.header_up: "Host AUTHENTIK_HOST"'
-  'caddy.route.50_forward_auth: "https://AUTHENTIK_HOST"'
+  'caddy.route.0_reverse_proxy: "/outpost.goauthentik.io/* https://${AUTH_HOSTNAME}"'
+  'caddy.route.0_reverse_proxy.header_up: "Host {http.request.host}"'
+  'caddy.route.50_forward_auth: "https://${AUTH_HOSTNAME}"'
   'caddy.route.50_forward_auth.uri: "/outpost.goauthentik.io/auth/caddy"'
-  'caddy.route.50_forward_auth.header_up: "Host AUTHENTIK_HOST"'
+  'caddy.route.50_forward_auth.header_up: "Host {http.request.host}"'
   'caddy.route.50_forward_auth.copy_headers: "X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid"'
   'caddy.route.50_forward_auth.trusted_proxies: private_ranges'
 )
@@ -80,7 +99,6 @@ MANAGED_LABEL_REGEX='caddy\.route\.(0_reverse_proxy|50_forward_auth)'
 # non-conforming label layouts fail fast with guidance to normalize per the ct-compose skill.
 add_forward_auth_labels() {
   local compose_file="$1"
-  local ak_host="$2"
 
   # Match 'caddy:' as a standalone label key (site address), not 'caddy.something:'
   if ! grep -qP '^\s+caddy:\s' "$compose_file" 2>/dev/null; then
@@ -107,12 +125,9 @@ add_forward_auth_labels() {
     fi
   fi
 
-  # Build the canonical managed label block with placeholder replaced
-  local canonical_labels=()
-  local label_template
-  for label_template in "${FORWARD_AUTH_LABELS[@]}"; do
-    canonical_labels+=("${label_template//AUTHENTIK_HOST/$ak_host}")
-  done
+  # The managed label set is constant: the Authentik host is the literal ${AUTH_HOSTNAME}
+  # Compose variable (resolved from the CT .env by Docker Compose), so nothing is substituted here.
+  local canonical_labels=("${FORWARD_AUTH_LABELS[@]}")
 
   # Idempotency: if the managed labels already match exactly, nothing to do
   if grep -qP "^\s+${MANAGED_LABEL_REGEX}" "$compose_file" 2>/dev/null; then
@@ -231,7 +246,7 @@ process_ct() {
     fi
 
     echo "  Adding forward auth labels..."
-    add_forward_auth_labels "$compose_file" "$ak_host" || rc=$?
+    add_forward_auth_labels "$compose_file" || rc=$?
   fi
 
   # Only recreate containers if labels were actually changed
@@ -248,6 +263,7 @@ process_ct() {
 # MAIN
 # -----------------------------
 main() {
+  lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
   local ct_arg=""
 
   # Parse arguments
@@ -255,6 +271,10 @@ main() {
     case "$1" in
       --remove|-r)
         REMOVE_MODE=true
+        shift
+        ;;
+      --reset)
+        RESET_MODE=true
         shift
         ;;
       -*)
@@ -268,6 +288,11 @@ main() {
     esac
   done
 
+  if [[ "$RESET_MODE" == "true" && "$REMOVE_MODE" == "true" ]]; then
+    echo "Error: --reset and --remove cannot be combined (reset recreates, remove deletes)."
+    exit 1
+  fi
+
   # Verify Authentik config (unless removing)
   if [[ "$REMOVE_MODE" != "true" ]]; then
     if ! config_authentik_configured; then
@@ -275,7 +300,6 @@ main() {
       exit 1
     fi
   fi
-
   build_ct_list
 
   if [[ ${#CT_LIST[@]} -eq 0 ]]; then
@@ -320,10 +344,19 @@ main() {
 
     ensure_ct_running || continue
 
-    # Provision the per-host Authentik forward_single provider/application/outpost
-    # assignment before applying the Caddy labels. Failure here is fatal for this CT.
-    if [[ "$REMOVE_MODE" != "true" ]]; then
-      if ! configure_authentik_forward_auth "$CT_HOSTNAME"; then
+    # Provision/teardown the per-host Authentik forward_single provider/application before
+    # touching the Caddy labels.
+    #   --remove : delete the Authentik app/provider (shared step), then strip labels.
+    #   --reset  : delete the existing app/provider, then recreate it (handled inside
+    #              configure_authentik_forward_auth via the reset flag).
+    #   default  : create/ensure the app/provider.
+    # For --remove the Authentik deletion is non-fatal (declining the prompt still removes
+    # the Caddy labels); for the create/reset path a failure skips the CT.
+    if [[ "$REMOVE_MODE" == "true" ]]; then
+      delete_authentik_forward_auth "$CT_HOSTNAME" || true
+      echo ""
+    else
+      if ! configure_authentik_forward_auth "$CT_HOSTNAME" "$RESET_MODE"; then
         echo "  [!] Authentik forward auth provisioning failed for ${CT_HOSTNAME} — skipping"
         continue
       fi

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # forwardDNSCT.sh - Refresh split DNS mappings and UDM Pro forwarders
+# Documentation: forwardDNSCT.md
 #
 # Builds per-domain CoreDNS hosts/conf files from UDM Pro client fixed IP +
 # alias data and reconciles UDM Pro static DNS NS forwarders for non-primary
@@ -15,6 +16,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/commonCT.sh"
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
+fi
 
 usage() {
   cat <<'EOF'

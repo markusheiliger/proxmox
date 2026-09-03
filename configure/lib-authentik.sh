@@ -10,8 +10,8 @@
 # NEVER hand-edit the delivered copy under _config/shared.
 #
 # Requires: jq, curl (ensure via lib-common.sh ensure_tools jq curl).
-# Requires env (injected via _config/configure.env): AUTHENTIK_HOST,
-# AUTHENTIK_API_TOKEN. Call ak_init once before any other ak_* helper.
+# Requires env (loaded from the CT .env by configure.sh): AUTH_HOSTNAME,
+# AUTH_API_TOKEN. Call ak_init once before any other ak_* helper.
 #
 # Informational output goes to stderr so command substitution captures stay clean.
 
@@ -35,27 +35,27 @@ oidc_slug() {
   fi
 }
 
-# Initialise the Authentik API base URL from AUTHENTIK_HOST.
-# Returns 1 if AUTHENTIK_HOST / AUTHENTIK_API_TOKEN are not set.
+# Initialise the Authentik API base URL from AUTH_HOSTNAME.
+# Returns 1 if AUTH_HOSTNAME / AUTH_API_TOKEN are not set.
 ak_init() {
-  [ -n "${AUTHENTIK_HOST:-}" ] || { echo "  [!] ak_init: AUTHENTIK_HOST not set" >&2; return 1; }
-  [ -n "${AUTHENTIK_API_TOKEN:-}" ] || { echo "  [!] ak_init: AUTHENTIK_API_TOKEN not set" >&2; return 1; }
-  AK_API="https://${AUTHENTIK_HOST}/api/v3"
+  [ -n "${AUTH_HOSTNAME:-}" ] || { echo "  [!] ak_init: AUTH_HOSTNAME not set" >&2; return 1; }
+  [ -n "${AUTH_API_TOKEN:-}" ] || { echo "  [!] ak_init: AUTH_API_TOKEN not set" >&2; return 1; }
+  AK_API="https://${AUTH_HOSTNAME}/api/v3"
 }
 
 ak_get() {
-  curl -sk -H "Authorization: Bearer ${AUTHENTIK_API_TOKEN}" \
+  curl -sk -H "Authorization: Bearer ${AUTH_API_TOKEN}" \
     -H "Accept: application/json" "${AK_API}$1" 2>/dev/null
 }
 
 ak_post() {
-  curl -sk -X POST -H "Authorization: Bearer ${AUTHENTIK_API_TOKEN}" \
+  curl -sk -X POST -H "Authorization: Bearer ${AUTH_API_TOKEN}" \
     -H "Content-Type: application/json" -H "Accept: application/json" \
     "${AK_API}$1" -d "$2" 2>/dev/null
 }
 
 ak_patch() {
-  curl -sk -X PATCH -H "Authorization: Bearer ${AUTHENTIK_API_TOKEN}" \
+  curl -sk -X PATCH -H "Authorization: Bearer ${AUTH_API_TOKEN}" \
     -H "Content-Type: application/json" -H "Accept: application/json" \
     "${AK_API}$1" -d "$2" 2>/dev/null
 }
@@ -79,6 +79,42 @@ ak_resolve_scopes() {
   _ars_out=$(echo "$_ars_json" | jq -c --argjson names "$_ars_names" \
     '[.results[] | select(.scope_name as $s | $names | index($s)) | .pk]' 2>/dev/null)
   [ -n "$_ars_out" ] && echo "$_ars_out" || echo "[]"
+}
+
+# Idempotently ensure an OAuth2 scope mapping exists and matches the requested
+# expression. Echoes its pk on stdout.
+# Args: $1 = display name, $2 = scope name, $3 = expression
+ak_ensure_scope_mapping() {
+  _asm_name="$1"
+  _asm_scope="$2"
+  _asm_expression="$3"
+  _asm_list=$(ak_get "/propertymappings/provider/scope/?page_size=1000")
+  _asm_pk=$(echo "$_asm_list" | jq -r --arg scope "$_asm_scope" \
+    'first(.results[] | select(.scope_name == $scope) | .pk) // empty' 2>/dev/null)
+  _asm_payload=$(jq -n \
+    --arg name "$_asm_name" \
+    --arg scope "$_asm_scope" \
+    --arg expression "$_asm_expression" \
+    '{name:$name, scope_name:$scope, expression:$expression}')
+
+  if [ -n "$_asm_pk" ]; then
+    _asm_result=$(ak_patch "/propertymappings/provider/scope/${_asm_pk}/" "$_asm_payload")
+    if ! echo "$_asm_result" | jq -e '.pk' >/dev/null 2>&1; then
+      echo "  [!] Failed to update scope mapping '${_asm_scope}'" >&2
+      return 1
+    fi
+    echo "  [✓] Scope mapping '${_asm_scope}' already exists and was reconciled" >&2
+  else
+    _asm_result=$(ak_post "/propertymappings/provider/scope/" "$_asm_payload")
+    _asm_pk=$(echo "$_asm_result" | jq -r '.pk // empty' 2>/dev/null)
+    if [ -z "$_asm_pk" ]; then
+      _asm_err=$(echo "$_asm_result" | jq -r 'if .detail then .detail elif .non_field_errors then .non_field_errors[0] else tostring end' 2>/dev/null)
+      echo "  [!] Failed to create scope mapping '${_asm_scope}': ${_asm_err}" >&2
+      return 1
+    fi
+    echo "    Scope mapping '${_asm_scope}' created (pk: ${_asm_pk})" >&2
+  fi
+  echo "$_asm_pk"
 }
 
 # Resolve a certificate keypair to sign OIDC id_tokens with. Without a signing
@@ -137,7 +173,10 @@ ak_oidc_ensure_app() {
   # OIDC clients reject). Empty when Authentik has no key-bearing certificate.
   _aoe_signkey=$(ak_resolve_signing_key)
 
-  _aoe_existing=$(ak_get "/core/applications/?slug=${_aoe_slug}")
+  # The applications LIST endpoint hides apps the token can't reach via policy
+  # unless superuser_full_list=true is passed; without it an already-linked app
+  # looks "missing" and we wrongly fall through to the orphan/create branch.
+  _aoe_existing=$(ak_get "/core/applications/?slug=${_aoe_slug}&superuser_full_list=true")
   _aoe_provider_pk=$(echo "$_aoe_existing" | \
     jq -r ".results[] | select(.slug == \"${_aoe_slug}\") | .provider // empty" 2>/dev/null)
 
@@ -168,7 +207,6 @@ ak_oidc_ensure_app() {
     return 0
   fi
 
-  echo "  Creating Authentik OAuth2 provider..." >&2
   _aoe_auth_flow=$(ak_resolve_flow "$_aoe_auth_slug")
   _aoe_inval_flow=$(ak_resolve_flow "$_aoe_inval_slug")
   if [ -z "$_aoe_auth_flow" ] || [ -z "$_aoe_inval_flow" ]; then
@@ -176,25 +214,73 @@ ak_oidc_ensure_app() {
     return 1
   fi
 
-  _aoe_provider_result=$(ak_post "/providers/oauth2/" "$(jq -n \
-    --arg name "$_aoe_name" \
-    --arg auth_flow "$_aoe_auth_flow" \
-    --arg inval_flow "$_aoe_inval_flow" \
-    --arg redirect "$_aoe_redirect" \
-    --argjson grants "$_aoe_grants_json" \
-    --argjson scopes "$_aoe_scopes_json" \
-    --arg signkey "$_aoe_signkey" \
-    '{name:$name, authorization_flow:$auth_flow, invalidation_flow:$inval_flow, client_type:"confidential", grant_types:$grants, redirect_uris:[{matching_mode:"strict", url:$redirect}], property_mappings:$scopes, signing_key:(if $signkey=="" then null else $signkey end)}')")
-  _aoe_provider_pk=$(echo "$_aoe_provider_result" | jq -r '.pk // empty' 2>/dev/null)
-  if [ -z "$_aoe_provider_pk" ]; then
-    _aoe_err=$(echo "$_aoe_provider_result" | jq -r 'if .detail then .detail elif .name then .name[0] else tostring end' 2>/dev/null)
-    echo "  [!] Failed to create OAuth2 provider: ${_aoe_err}" >&2
-    return 1
+  # Provider names are unique in Authentik. A previous run may have created the
+  # provider but lost its application (deleted, or never linked), leaving an
+  # orphaned provider — POSTing a new one with the same name fails outright with
+  # "provider with this name already exists". Reuse the provider by name when
+  # present (PATCH to self-heal), otherwise create it.
+  # NOTE: Authentik IGNORES the ?name__iexact= filter on this endpoint and
+  # returns the full list, so NEVER take .results[0] — always re-select the
+  # exact-name match in jq, or we'd reuse the wrong (first-listed) provider.
+  _aoe_name_enc=$(printf '%s' "$_aoe_name" | jq -sRr @uri)
+  _aoe_provider_pk=$(ak_get "/providers/oauth2/?name__iexact=${_aoe_name_enc}&page_size=1000" | \
+    jq -r --arg n "$_aoe_name" 'first(.results[] | select(.name == $n) | .pk) // empty' 2>/dev/null)
+
+  if [ -n "$_aoe_provider_pk" ]; then
+    echo "  [i] Reusing orphaned OAuth2 provider '${_aoe_name}' (pk: ${_aoe_provider_pk})" >&2
+    ak_patch "/providers/oauth2/${_aoe_provider_pk}/" "$(jq -n \
+      --arg auth_flow "$_aoe_auth_flow" \
+      --arg inval_flow "$_aoe_inval_flow" \
+      --arg redirect "$_aoe_redirect" \
+      --argjson grants "$_aoe_grants_json" \
+      --argjson scopes "$_aoe_scopes_json" \
+      --arg signkey "$_aoe_signkey" \
+      '{authorization_flow:$auth_flow, invalidation_flow:$inval_flow, client_type:"confidential", grant_types:$grants, redirect_uris:[{matching_mode:"strict", url:$redirect}], property_mappings:$scopes}
+       + (if $signkey != "" then {signing_key:$signkey} else {} end)')" >/dev/null 2>&1
+    _aoe_provider_result=$(ak_get "/providers/oauth2/${_aoe_provider_pk}/")
+  else
+    echo "  Creating Authentik OAuth2 provider..." >&2
+    _aoe_provider_result=$(ak_post "/providers/oauth2/" "$(jq -n \
+      --arg name "$_aoe_name" \
+      --arg auth_flow "$_aoe_auth_flow" \
+      --arg inval_flow "$_aoe_inval_flow" \
+      --arg redirect "$_aoe_redirect" \
+      --argjson grants "$_aoe_grants_json" \
+      --argjson scopes "$_aoe_scopes_json" \
+      --arg signkey "$_aoe_signkey" \
+      '{name:$name, authorization_flow:$auth_flow, invalidation_flow:$inval_flow, client_type:"confidential", grant_types:$grants, redirect_uris:[{matching_mode:"strict", url:$redirect}], property_mappings:$scopes, signing_key:(if $signkey=="" then null else $signkey end)}')")
+    _aoe_provider_pk=$(echo "$_aoe_provider_result" | jq -r '.pk // empty' 2>/dev/null)
+    if [ -z "$_aoe_provider_pk" ]; then
+      _aoe_err=$(echo "$_aoe_provider_result" | jq -r 'if .detail then .detail elif .name then .name[0] else tostring end' 2>/dev/null)
+      echo "  [!] Failed to create OAuth2 provider: ${_aoe_err}" >&2
+      return 1
+    fi
+    echo "    Provider created (pk: ${_aoe_provider_pk})" >&2
   fi
-  OIDC_CLIENT_ID=$(echo "$_aoe_provider_result" | jq -r '.client_id' 2>/dev/null)
-  OIDC_CLIENT_SECRET=$(echo "$_aoe_provider_result" | jq -r '.client_secret' 2>/dev/null)
+
+  OIDC_CLIENT_ID=$(echo "$_aoe_provider_result" | jq -r '.client_id // empty' 2>/dev/null)
+  OIDC_CLIENT_SECRET=$(echo "$_aoe_provider_result" | jq -r '.client_secret // empty' 2>/dev/null)
   OIDC_PROVIDER_PK="$_aoe_provider_pk"
-  echo "    Provider created (pk: ${_aoe_provider_pk})" >&2
+
+  # Link the application to the provider. The application may already exist with
+  # a stale/empty provider (the reason this create branch was reached), so patch
+  # it when present and create it otherwise. Two Authentik quirks matter here:
+  #   1. Application detail/PATCH endpoints are keyed by SLUG (not an integer pk).
+  #   2. The applications LIST endpoint hides apps the token can't reach via
+  #      policy unless superuser_full_list=true is passed, so an orphaned app is
+  #      otherwise invisible to the lookup yet still blocks creation on its
+  #      unique slug. Pass superuser_full_list=true, and as a belt-and-suspenders
+  #      fall back to PATCH-by-slug if the create still reports a duplicate slug.
+  _aoe_app_exists=$(ak_get "/core/applications/?slug=${_aoe_slug}&superuser_full_list=true" | \
+    jq -r --arg s "$_aoe_slug" '[.results[] | select(.slug == $s)] | length' 2>/dev/null)
+  if [ "${_aoe_app_exists:-0}" -gt 0 ] 2>/dev/null; then
+    ak_patch "/core/applications/${_aoe_slug}/" "$(jq -n \
+      --argjson provider "$_aoe_provider_pk" \
+      --arg launch "$_aoe_launch" \
+      '{provider:$provider, meta_launch_url:$launch}')" >/dev/null 2>&1
+    echo "  [✓] Linked existing application '${_aoe_slug}' to provider (pk: ${_aoe_provider_pk})" >&2
+    return 0
+  fi
 
   _aoe_app_result=$(ak_post "/core/applications/" "$(jq -n \
     --arg name "$_aoe_name" \
@@ -203,6 +289,16 @@ ak_oidc_ensure_app() {
     --arg launch "$_aoe_launch" \
     '{name:$name, slug:$slug, provider:$provider, meta_launch_url:$launch}')")
   if ! echo "$_aoe_app_result" | jq -e '.pk' >/dev/null 2>&1; then
+    # Create failed — most often because the slug already exists but was hidden
+    # from the list lookup above. Recover by PATCHing the existing app by slug.
+    _aoe_app_patch=$(ak_patch "/core/applications/${_aoe_slug}/" "$(jq -n \
+      --argjson provider "$_aoe_provider_pk" \
+      --arg launch "$_aoe_launch" \
+      '{provider:$provider, meta_launch_url:$launch}')")
+    if echo "$_aoe_app_patch" | jq -e '.slug' >/dev/null 2>&1; then
+      echo "  [✓] Linked existing application '${_aoe_slug}' to provider (pk: ${_aoe_provider_pk})" >&2
+      return 0
+    fi
     _aoe_err=$(echo "$_aoe_app_result" | jq -r 'if .detail then .detail elif .slug then .slug[0] else tostring end' 2>/dev/null)
     echo "  [!] Failed to create application: ${_aoe_err}" >&2
     return 1

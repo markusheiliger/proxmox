@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # refreshCT.sh - Refresh and update a Proxmox LXC container
+# Documentation: refreshCT.md
 #
 # DESCRIPTION:
 #   Updates an existing LXC container on Proxmox VE by re-applying all
@@ -23,18 +24,18 @@
 #   - OTEL hosts (otel.*): Skip logging, syslog (would loop)
 #
 # USAGE:
-#   ./refreshCT.sh [CTID or hostname] [--size S|M|L | --cores N --memory MB] [--priority low|mid|high] [--gpu] [--monitor] [--reset]
+#   ./refreshCT.sh [CTID or hostname] [--size S|M|L | --cores N --memory MB] [--priority low|mid|high] [--vlan ID] [--monitor] [--reset]
 #
 # EXAMPLES:
 #   ./refreshCT.sh                           # Interactive multi-select
-#   ./refreshCT.sh --gpu                     # Interactive single-select + GPU
 #   ./refreshCT.sh 2100                      # Refresh by CTID
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
 #   ./refreshCT.sh 2100 --size L             # Resize to a named size and refresh
 #   ./refreshCT.sh 2100 --cores 3 --memory 3072  # Resize to a CUSTOM allocation
 #   ./refreshCT.sh 2100 --priority high      # Set high priority
-#   ./refreshCT.sh 2600 --gpu                # Enable GPU passthrough
+#   ./refreshCT.sh 2100 --vlan 100           # Assign net0 to VLAN 100
+#   ./refreshCT.sh 2100 --vlan 0             # Remove any VLAN tag (unassign)
 #   ./refreshCT.sh 2100 --reset              # Wipe data subfolders, then re-init
 #
 #   Sizing is either a named t-shirt size (--size, validated against commonCT.json)
@@ -42,9 +43,18 @@
 #   exclusive. With a custom allocation, any dimension you omit keeps the CT's
 #   current value. Swap is always re-derived as half of memory.
 #
+#   --vlan sets the VLAN tag on net0: 1-4094 assigns the CT to that VLAN, 0
+#   removes any tag (unassign). Omit --vlan to leave the CT's VLAN untouched.
+#   When --vlan actually changes the CT's VLAN, it is handled as an isolated
+#   phase BEFORE the routine refresh: the UDM Pro fixed IP + local DNS record are
+#   released, the tag is applied, the CT is fully stopped/started so it re-wires
+#   onto the new VLAN, and once it obtains a fresh lease on the new subnet the
+#   fixed IP + local DNS are re-pinned to the new IP. If the CT fails to obtain a
+#   new IP the change is rolled back to the previous VLAN/IP (fatal for that CT).
+#
 # BEHAVIOR:
 #   - Without arguments: multi-select dialog to choose multiple containers
-#   - With options only (--gpu, --size, --cores, --memory, --monitor, --reset): single-select dialog
+#   - With options only (--size, --cores, --memory, --vlan, --monitor, --reset): single-select dialog
 #   - With CTID/hostname: operates on that specific container
 #   - All configuration functions are idempotent (safe to run repeatedly)
 #   - A resize (--size/--cores/--memory) waits up to 5 minutes for an active
@@ -78,11 +88,11 @@ source "${SCRIPT_DIR}/commonCT.sh"
 
 # Global flags
 MONITOR_AFTER=false
-GPU_PASSTHROUGH=false
 CT_SIZE=""
 CT_CORES=""
 CT_MEMORY=""
 CT_PRIORITY=""
+CT_VLAN=""
 RESET=false
 
 # -----------------------------
@@ -200,8 +210,8 @@ reset_docker() {
   while ! ct_exec --timeout 10 'docker info >/dev/null 2>&1' 2>/dev/null; do
     waited=$((waited + 10))
     if [[ $waited -ge $max_wait ]]; then
-      echo "  [!] Warning: Docker daemon not responding after ${max_wait}s, skipping"
-      return
+      echo "  [✗] Docker daemon not responding after ${max_wait}s"
+      return 1
     fi
     sleep 5
   done
@@ -209,10 +219,14 @@ reset_docker() {
   
   # Validate compose file
   echo "  Validating docker-compose.yaml..."
-  if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
-    echo "  [!] Warning: docker-compose.yaml validation failed, skipping start"
+  local compose_validation_output
+  if ! compose_validation_output=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>&1); then
+    echo "  [✗] docker-compose.yaml validation failed"
+    if [[ -n "$compose_validation_output" ]]; then
+      echo "$compose_validation_output" | sed 's/^/      /'
+    fi
     echo "      Fix the compose file and run: pct exec ${CTID} -- sh -c 'cd /mnt/docker && docker compose up -d'"
-    return
+    return 1
   fi
   echo "  [✓] Compose file is valid"
   
@@ -241,97 +255,117 @@ reset_docker() {
     reset_cleanup_folders
   fi
 
+  if ! reconcile_compose_permissions "${CTID}"; then
+    return 1
+  fi
+
   # Deploy (uses pre-pulled/cached images)
   echo "  Starting services..."
-  compose_up "${CTID}"
-  
-  # Fix permissions after containers are created
-  fix_mount_permissions
-  
-  # Restart to apply permission fixes
-  ct_exec --timeout 60 'cd /mnt/docker && docker compose restart' 2>/dev/null || true
+  if ! compose_up "${CTID}"; then
+    echo "  [!] Failed to start Docker Compose services"
+    return 1
+  fi
+
+  if ! wait_for_initialization_services; then
+    return 1
+  fi
   
   # Cleanup unused images
   echo "  Cleaning up unused images..."
   ct_exec --timeout 30 'docker image prune -f' 2>/dev/null || true
-  
-  echo "  [✓] Docker Compose services running"
+
+  # Final guard: a refresh must NEVER leave the CT with a torn-down stack. If no
+  # services are running after the deploy (e.g. a transient 'compose up' failure
+  # following the earlier 'compose down'), retry the deploy once and report if it
+  # is still down.
+  local running_count
+  running_count=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r')
+  if [[ -z "$running_count" || "$running_count" -eq 0 ]]; then
+    echo "  [!] No running services after deploy — retrying 'docker compose up -d'..."
+    ct_exec --timeout 120 'cd /mnt/docker && docker compose up -d' 2>/dev/null || true
+    running_count=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r')
+  fi
+  if [[ -z "$running_count" || "$running_count" -eq 0 ]]; then
+    echo "  [✗] Stack is DOWN after deploy attempts — manual intervention needed"
+    return 1
+  fi
+
+  echo "  [✓] Docker Compose services running (${running_count} up)"
 }
 
-# Fix permissions on bind mounts based on container UIDs
-fix_mount_permissions() {
-  echo "  Fixing bind mount permissions..."
-  
-  # Get compose config as JSON from CT
-  local compose_json
+# Wait for every service explicitly configured with restart: "no". A refresh
+# must not report success while initialization is still running, and any
+# non-zero initializer exit is fatal for this CT.
+wait_for_initialization_services() {
+  local compose_json services service container_ids container_id container_name
+  local state exit_code elapsed latest_log
+
   compose_json=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
-    echo "  [!] Could not get compose config"
-    return
+    echo "  [!] Could not inspect Compose initialization services"
+    return 1
   }
-  
-  # Extract services and their details using jq
-  local services
-  services=$(echo "$compose_json" | jq -r '.services | keys[]') || return
-  
-  for svc in $services; do
-    # Get image for this service
-    local image
-    image=$(echo "$compose_json" | jq -r --arg s "$svc" '.services[$s].image // empty')
-    [ -z "$image" ] && continue
-    
-    # Get UID from image metadata (no container run needed)
-    local user_spec uid
-    user_spec=$(ct_exec --timeout 30 "docker image inspect --format '{{.Config.User}}' '$image'" 2>/dev/null) || user_spec=""
-    
-    # Parse user spec: could be "uid", "uid:gid", "username", or empty
-    if [[ -z "$user_spec" ]]; then
-      uid="0"  # No USER directive = root
-    elif [[ "$user_spec" =~ ^[0-9]+(:.*)?$ ]]; then
-      uid="${user_spec%%:*}"  # Extract UID from "uid" or "uid:gid"
-    else
-      # Username specified - try to resolve, fallback to 0
-      uid=$(ct_exec --timeout 60 "docker run --rm --entrypoint id '$image' -u" 2>/dev/null) || uid="0"
+  services=$(echo "$compose_json" | jq -r '
+    .services | to_entries[] | select(.value.restart == "no") | .key
+  ') || return 1
+
+  if [[ -z "$services" ]]; then
+    return 0
+  fi
+
+  for service in $services; do
+    container_ids=$(ct_exec --timeout 30 "cd /mnt/docker && docker compose ps -a -q '$service'" 2>/dev/null) || {
+      echo "  [!] Could not find initialization service '$service'"
+      return 1
+    }
+    if [[ -z "$container_ids" ]]; then
+      echo "  [!] Initialization service '$service' has no container"
+      return 1
     fi
-    [ -z "$uid" ] && uid="0"
-    
-    # Get writable bind mounts (type=bind, not read_only)
-    local mounts
-    mounts=$(echo "$compose_json" | jq -r --arg s "$svc" '
-      .services[$s].volumes // [] 
-      | .[] 
-      | select(type == "object" and .type == "bind" and (.read_only != true))
-      | .source
-    ' 2>/dev/null)
-    
-    # Also handle short syntax volumes (strings like "/host:/container")
-    local short_mounts
-    short_mounts=$(echo "$compose_json" | jq -r --arg s "$svc" '
-      .services[$s].volumes // [] 
-      | .[] 
-      | select(type == "string" and (contains(":ro") | not))
-      | split(":")[0]
-    ' 2>/dev/null)
-    
-    # Combine and filter to /mnt/docker paths
-    for mount_path in $mounts $short_mounts; do
-      [[ "$mount_path" != /mnt/docker* ]] && continue
-      
-      # Check and fix permissions on host
-      get_ct_dirs "${CT_HOSTNAME}"
-      local host_path="${mount_path/#\/mnt\/docker/${DIR_DOCKER}}"
-      
-      if [[ -e "$host_path" ]]; then
-        local current_uid
-        current_uid=$(stat -c %u "$host_path" 2>/dev/null) || current_uid="0"
-        if [[ "$current_uid" != "$uid" ]]; then
-          echo "    $svc: chown $uid on $host_path"
-          chown -R "$uid:$uid" "$host_path" 2>/dev/null || true
-        fi
+
+    for container_id in $container_ids; do
+      container_name=$(ct_exec --timeout 15 "docker inspect --format '{{.Name}}' '$container_id'" 2>/dev/null)
+      container_name=${container_name#/}
+      echo "  Waiting for initialization service ${container_name:-$service}..."
+      elapsed=0
+      while true; do
+        state=$(ct_exec --timeout 15 "docker inspect --format '{{.State.Status}}' '$container_id'" 2>/dev/null | tail -1 | tr -d '[:space:]') || {
+          echo "  [!] Could not inspect initialization service '${container_name:-$service}'"
+          return 1
+        }
+        case "$state" in
+          exited|dead)
+            break
+            ;;
+          created|running|restarting)
+            sleep 30
+            elapsed=$((elapsed + 30))
+            latest_log=$(ct_exec --timeout 15 "docker logs --tail 20 '$container_id' 2>&1" 2>/dev/null | awk 'NF { line=$0 } END { print line }' || true)
+            if [[ -n "$latest_log" ]]; then
+              echo "  [i] ${container_name:-$service} still running (${elapsed}s): ${latest_log}"
+            else
+              echo "  [i] ${container_name:-$service} still running (${elapsed}s)"
+            fi
+            ;;
+          *)
+            echo "  [!] Initialization service '${container_name:-$service}' has unexpected state '${state:-unknown}'"
+            return 1
+            ;;
+        esac
+      done
+
+      exit_code=$(ct_exec --timeout 15 "docker inspect --format '{{.State.ExitCode}}' '$container_id'" 2>/dev/null | tail -1 | tr -d '[:space:]') || {
+        echo "  [!] Could not read exit code for initialization service '${container_name:-$service}'"
+        return 1
+      }
+      if [[ ! "$exit_code" =~ ^[0-9]+$ || "$exit_code" -ne 0 ]]; then
+        echo "  [!] Initialization service '${container_name:-$service}' exited with code ${exit_code:-unknown}"
+        echo "      Recent logs:"
+        ct_exec --timeout 15 "docker logs --tail 20 '$container_id' 2>&1" 2>/dev/null | sed 's/^/        /' || true
+        return 1
       fi
+      echo "  [✓] Initialization service ${container_name:-$service} completed"
     done
   done
-  
-  echo "  [✓] Permissions checked"
 }
 
 # Print summary
@@ -427,6 +461,7 @@ apply_priority() {
 # MAIN
 # -----------------------------
 main() {
+  lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
   local ct_arg=""
   local has_options=false
   
@@ -453,13 +488,17 @@ main() {
         has_options=true
         shift 2
         ;;
-      --gpu)
-        GPU_PASSTHROUGH=true
-        has_options=true
-        shift
-        ;;
       --priority|-p)
         CT_PRIORITY="$2"
+        has_options=true
+        shift 2
+        ;;
+      --vlan)
+        if [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ ]] || (( $2 > 4094 )); then
+          echo "ERROR: --vlan must be an integer in range 0-4094 (got '$2')" >&2
+          exit 1
+        fi
+        CT_VLAN="$2"
         has_options=true
         shift 2
         ;;
@@ -502,6 +541,8 @@ main() {
     resolve_ct_from_input "$ct_arg" || exit 1
     cts_to_process=("$CTID")
   fi
+
+  validate_node_storage_contract || exit 1
   
   # Process each selected CT
   local total=${#cts_to_process[@]}
@@ -509,7 +550,7 @@ main() {
   local failed_cts=()
   
   # Initialize status bar for progress tracking
-  local steps_per_ct=7
+  local steps_per_ct=8
   local total_steps=$((total * steps_per_ct))
   local overall_step=0
   
@@ -527,40 +568,84 @@ main() {
     echo ""
     
     check_ct_storage_health "${CTID}" warn
+
+    overall_step=$((base_step + 1)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Reconciling bridge policy..."
+    if ! bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$CT_HOSTNAME" \
+        || ! bridge_policy_reconcile_guest "$(hostname -s)" CT "$CTID" "$BRIDGE_POLICY_SELECTED"; then
+      echo "  [✗] FATAL: bridge policy reconciliation failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): bridge policy reconciliation")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
+    echo "  [✓] Bridge policy selected ${BRIDGE_POLICY_SELECTED} (${BRIDGE_POLICY_REASON})"
+
+    if ! reconcile_ct_gpu_config "${CTID}"; then
+      echo "  [✗] FATAL: GPU reconciliation failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU reconciliation")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
     
     ensure_ct_running || { overall_step=$((base_step + steps_per_ct)); continue; }
-    
-    overall_step=$((base_step + 1)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Resizing..."
+
+    # PHASE A — isolated VLAN switch. When --vlan changes the CT's VLAN, handle
+    # the whole disruptive switch here (release UDM Pro reservation, retag, hard
+    # stop/start onto the new VLAN, wait for a fresh new-subnet lease, re-pin)
+    # and roll back to the old VLAN/IP on failure — all BEFORE the routine
+    # refresh below. No-op when no VLAN change is pending.
+    if ! reconcile_vlan_change "${CTID}" "${CT_HOSTNAME}" "${CT_VLAN}"; then
+      echo "  [✗] FATAL: VLAN reconciliation failed for CT ${CTID} (rolled back) — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): VLAN reconciliation")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
+
+    overall_step=$((base_step + 2)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Resizing..."
     resize_ct
     ensure_swap
     apply_priority
     
-    overall_step=$((base_step + 2)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Verifying mountpoints..."
+    overall_step=$((base_step + 3)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Verifying mountpoints..."
     setup_mountpoints
     
-    overall_step=$((base_step + 3)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Applying configuration..."
-    apply_ct_configuration "${CTID}" "${CT_HOSTNAME}" "${GPU_PASSTHROUGH}"
+    overall_step=$((base_step + 4)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Applying configuration..."
+    apply_ct_configuration "${CTID}" "${CT_HOSTNAME}"
+    if ! finalize_ct_gpu_capability "${CTID}"; then
+      echo "  [✗] FATAL: GPU verification failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU verification")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
     
-    overall_step=$((base_step + 4)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Restarting Docker..."
-    reset_docker || echo "  [!] Docker reset failed (non-fatal)"
+    overall_step=$((base_step + 5)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Restarting Docker..."
+    if ! reset_docker; then
+      echo "  [✗] FATAL: Docker deployment or initialization failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): Docker Compose deployment/initialization")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
     
-    overall_step=$((base_step + 5)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Rebooting..."
-    reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
+    overall_step=$((base_step + 6)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Rebooting..."
+    if [[ "${VLAN_PHASE_RESTARTED:-false}" == "true" ]]; then
+      echo "  [i] Skipping reboot — the VLAN phase already stopped/started this CT"
+    else
+      reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
+    fi
 
     # MANDATORY: every CT is a Docker host — a reboot that leaves the daemon
     # dead means the whole stack is down. Verify (with active recovery) and
     # treat a hard failure as fatal for this CT.
     if ! ensure_docker_running "${CTID}"; then
       echo "  [✗] FATAL: Docker daemon is not running in CT ${CTID} after reboot — skipping remaining steps"
-      failed_cts+=("${CTID} (${CT_HOSTNAME})")
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): Docker daemon after reboot")
       overall_step=$((base_step + steps_per_ct))
       continue
     fi
 
-    overall_step=$((base_step + 6)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Checking DNS..."
+    overall_step=$((base_step + 7)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Checking DNS..."
     check_dns_health || echo "  [!] DNS health check failed (non-fatal)"
     
-    overall_step=$((base_step + 7)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Running configure script..."
+    overall_step=$((base_step + 8)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Running configure script..."
     get_ct_dirs
     sync_config_shared
     run_configure_script
@@ -576,7 +661,7 @@ main() {
 
   if [[ ${#failed_cts[@]} -gt 0 ]]; then
     echo ""
-    echo "  [✗] Docker daemon FAILED to come up after reboot on:"
+    echo "  [✗] Refresh FAILED on:"
     for f in "${failed_cts[@]}"; do
       echo "        - ${f}"
     done
@@ -587,8 +672,11 @@ main() {
   if [[ "$MONITOR_AFTER" == "true" && $total -eq 1 ]]; then
     echo ""
     echo "Starting log monitor..."
+    lifecycle_log_stop 0
     exec "${SCRIPT_DIR}/monitorCT.sh" "${cts_to_process[0]}"
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

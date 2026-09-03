@@ -72,19 +72,20 @@ detect_default_target() {
 }
 
 read_ct_release() {
-  local rootfs volume root_path
+  local rootfs volume root_path node
+  node=$(get_ct_owner_node "$CTID") || return 1
   if [[ "$(get_ct_status "$CTID")" == "running" ]]; then
     ct_exec --timeout 15 "$CTID" 'cut -d. -f1,2 /etc/alpine-release'
     return
   fi
 
-  rootfs=$(pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
+  rootfs=$(pct_config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
   volume="${rootfs%%,*}"
-  root_path=$(pvesm path "$volume" 2>/dev/null) || {
+  root_path=$(run_on_node "$node" pvesm path "$volume" 2>/dev/null) || {
     echo "ERROR: Cannot resolve the root filesystem for stopped CT ${CTID}." >&2
     return 1
   }
-  cut -d. -f1,2 "${root_path}/etc/alpine-release"
+  run_on_node "$node" cut -d. -f1,2 "${root_path}/etc/alpine-release"
 }
 
 rewrite_repositories_command() {
@@ -107,7 +108,7 @@ wait_for_running() {
 
 reboot_and_wait() {
   local old_boot_id="$1" deadline=$(( $(date +%s) + 180 )) current_boot_id
-  pct reboot "$CTID"
+  pct_reboot "$CTID"
   while (( $(date +%s) < deadline )); do
     current_boot_id=$(ct_exec --timeout 5 "$CTID" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null || true)
     if [[ -n "$current_boot_id" && "$current_boot_id" != "$old_boot_id" ]]; then
@@ -135,23 +136,23 @@ rollback() {
 
   if [[ "$SNAPSHOT_CREATED" != "true" ]]; then
     if [[ "$ORIGINAL_STATUS" == "running" && "$(get_ct_status "$CTID")" != "running" ]]; then
-      pct start "$CTID" || true
+      pct_start "$CTID" || true
     fi
     exit "$exit_code"
   fi
 
   echo "[!] Upgrade failed; rolling CT ${CTID} back to ${SNAPSHOT_NAME}." >&2
   if [[ "$(get_ct_status "$CTID")" == "running" ]]; then
-    pct stop "$CTID" || true
+    pct_stop "$CTID" || true
   fi
   if [[ "$SNAPSHOT_METHOD" == "zfs" ]]; then
-    zfs rollback -r "$ZFS_SNAPSHOT"
-  elif ! pct rollback "$CTID" "$SNAPSHOT_NAME"; then
+    run_on_node "$(get_ct_owner_node "$CTID")" zfs rollback -r "$ZFS_SNAPSHOT"
+  elif ! pct_rollback "$CTID" "$SNAPSHOT_NAME"; then
     echo "[✗] Automatic rollback failed. Snapshot '${SNAPSHOT_NAME}' is retained." >&2
     exit "$exit_code"
   fi
   if [[ "$ORIGINAL_STATUS" == "running" ]]; then
-    pct start "$CTID"
+    pct_start "$CTID"
   fi
   echo "[✓] CT ${CTID} restored to its pre-upgrade snapshot." >&2
   exit "$exit_code"
@@ -163,8 +164,8 @@ capture_failure_diagnostics() {
     echo "=== upgrade failure diagnostics ==="
     echo "CT ${CTID} (${CT_HOSTNAME}) upgrade failure diagnostics"
     echo "Captured: $(date -Is)"
-    pct status "$CTID" 2>&1 || true
-    pct exec "$CTID" -- sh -c '
+    pct_status "$CTID" 2>&1 || true
+    ct_exec "$CTID" '
       echo "=== Alpine ==="
       cat /etc/alpine-release 2>&1 || true
       echo "=== Docker packages ==="
@@ -186,22 +187,23 @@ capture_failure_diagnostics() {
 }
 
 create_rollback_point() {
-  local rootfs volume root_path dataset snapshot_error
+  local rootfs volume root_path dataset snapshot_error node
+  node=$(get_ct_owner_node "$CTID") || return 1
 
-  rootfs=$(pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
+  rootfs=$(pct_config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
   volume="${rootfs%%,*}"
-  root_path=$(pvesm path "$volume" 2>/dev/null || true)
-  dataset=$(zfs list -H -o name "$root_path" 2>/dev/null || true)
+  root_path=$(run_on_node "$node" pvesm path "$volume" 2>/dev/null || true)
+  dataset=$(run_on_node "$node" zfs list -H -o name "$root_path" 2>/dev/null || true)
   if [[ -n "$dataset" ]]; then
     ZFS_SNAPSHOT="${dataset}@${SNAPSHOT_NAME}"
-    zfs snapshot "$ZFS_SNAPSHOT"
+    run_on_node "$node" zfs snapshot "$ZFS_SNAPSHOT"
     SNAPSHOT_METHOD="zfs"
     SNAPSHOT_CREATED=true
     echo "  [✓] Rootfs ZFS snapshot created: ${ZFS_SNAPSHOT}"
     return 0
   fi
 
-  if snapshot_error=$(pct snapshot "$CTID" "$SNAPSHOT_NAME" \
+  if snapshot_error=$(pct_snapshot "$CTID" "$SNAPSHOT_NAME" \
     --description "Before Alpine upgrade" 2>&1); then
     SNAPSHOT_METHOD="pct"
     SNAPSHOT_CREATED=true
@@ -311,7 +313,7 @@ prepare_upgrade() {
     echo "ERROR: Unsupported CT status '${ORIGINAL_STATUS}'." >&2
     return 1
   }
-  lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+  lock=$(pct_config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   [[ -z "$lock" ]] || {
     echo "ERROR: CT ${CTID} is locked (${lock})." >&2
     return 1
@@ -343,9 +345,11 @@ print_upgrade_preview() {
 
 prepare_upgrade_bridge() {
   local dry_run="${1:-false}"
-  bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$CT_HOSTNAME" || return 1
+  local node
+  node=$(get_ct_owner_node "$CTID") || return 1
+  bridge_policy_resolve "$node" CT "$CTID" "$CT_HOSTNAME" || return 1
   echo "Bridge policy: ${BRIDGE_POLICY_SELECTED} (${BRIDGE_POLICY_REASON}, rank ${BRIDGE_POLICY_RANK})"
-  bridge_policy_reconcile_guest "$(hostname -s)" CT "$CTID" "$BRIDGE_POLICY_SELECTED" "$dry_run"
+  bridge_policy_reconcile_guest "$node" CT "$CTID" "$BRIDGE_POLICY_SELECTED" "$dry_run"
 }
 
 perform_upgrade() {
@@ -357,13 +361,13 @@ perform_upgrade() {
   warn_storage_health
   trap rollback ERR
   if [[ "$(get_ct_status "$CTID")" == "running" ]]; then
-    pct shutdown "$CTID" --timeout 60 || pct stop "$CTID"
+    pct_shutdown "$CTID" --timeout 60 || pct_stop "$CTID"
     ensure_ct_stopped "$CTID"
   fi
   SNAPSHOT_NAME="pre-alpine-${current//./-}-$(date +%Y%m%d%H%M%S)"
   create_rollback_point
 
-  pct start "$CTID"
+  pct_start "$CTID"
   wait_for_running
   ensure_upgrade_docker "$current"
   reconcile_compose_permissions "$CTID"
@@ -373,7 +377,7 @@ perform_upgrade() {
   verify_workload
 
   if [[ "$ORIGINAL_STATUS" == "stopped" ]]; then
-    pct shutdown "$CTID" --timeout 60 || pct stop "$CTID"
+    pct_shutdown "$CTID" --timeout 60 || pct_stop "$CTID"
     ensure_ct_stopped "$CTID"
   fi
   COMMITTED=true

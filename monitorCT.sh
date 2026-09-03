@@ -109,14 +109,9 @@ parse_args() {
 verify_compose() {
   get_ct_dirs "$CT_HOSTNAME"
   COMPOSE_FILE="${DIR_DOCKER}/docker-compose.yaml"
-  
-  if [[ ! -f "$COMPOSE_FILE" ]]; then
-    # Try .yml extension
-    COMPOSE_FILE="${DIR_DOCKER}/docker-compose.yml"
-    if [[ ! -f "$COMPOSE_FILE" ]]; then
-      echo "Error: No docker-compose.yaml found in ${DIR_DOCKER}"
-      exit 1
-    fi
+  if ! ct_exec --timeout 15 "$CTID" 'test -f /mnt/docker/docker-compose.yaml'; then
+    echo "Error: No docker-compose.yaml found for CT ${CTID} on ${CT_NODE[$CTID]}"
+    exit 1
   fi
 }
 
@@ -140,7 +135,7 @@ stream_logs() {
   fi
   
   # Execute in container
-  pct exec "$CTID" -- sh -c "$cmd"
+  ct_exec "$CTID" "$cmd"
 }
 
 # -----------------------------

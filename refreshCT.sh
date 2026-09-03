@@ -107,15 +107,16 @@ RESET=false
 # basename does NOT start with "_". Top-level files (docker-compose.yaml, .env)
 # are never listed. Requires get_ct_dirs to have set DIR_DOCKER/DIR_DOCKER_DATA.
 reset_list_candidates() {
-  local base d name
+  local base d name node
+  node=$(get_ct_owner_node "$CTID") || return 1
   for base in "$DIR_DOCKER" "$DIR_DOCKER_DATA"; do
-    [[ -d "$base" ]] || continue
-    for d in "$base"/*/; do
-      [[ -d "$d" ]] || continue          # skip when glob has no match
+    node_path_is_dir "$node" "$base" || continue
+    while IFS= read -r d; do
+      [[ -n "$d" ]] || continue
       name="$(basename "$d")"
       [[ "$name" == _* ]] && continue     # exclude "_"-prefixed subfolders
-      echo "${d%/}"
-    done
+      echo "$d"
+    done < <(run_on_node "$node" find "$base" -mindepth 1 -maxdepth 1 -type d -print | sort)
   done
 }
 
@@ -128,7 +129,8 @@ reset_list_candidates() {
 reset_cleanup_folders() {
   get_ct_dirs "${CT_HOSTNAME}"
 
-  local candidates=()
+  local candidates=() node
+  node=$(get_ct_owner_node "$CTID") || return 1
   mapfile -t candidates < <(reset_list_candidates)
 
   if [[ ${#candidates[@]} -eq 0 ]]; then
@@ -161,7 +163,7 @@ reset_cleanup_folders() {
   for c in "${candidates[@]}"; do
     name="$(basename "$c")"
     [[ "$name" == "caddy" ]] && continue
-    rm -rf "$c" && echo "    Deleted: $c"
+    node_remove_tree "$node" "$c" "$c" && echo "    Deleted: ${node}:$c"
   done
 
   # Dedicated confirmation for each caddy folder (cert re-issuance risk).
@@ -171,7 +173,7 @@ reset_cleanup_folders() {
     local caddy_reply
     read -p "  Also delete ${c}? This wipes LE/ACME certs and forces re-issuance (rate limits). [y/N]: " caddy_reply
     if [[ "$caddy_reply" =~ ^[Yy]$ ]]; then
-      rm -rf "$c" && echo "    Deleted: $c"
+      node_remove_tree "$node" "$c" "$c" && echo "    Deleted: ${node}:$c"
     else
       echo "    Kept: $c"
     fi
@@ -411,8 +413,8 @@ resize_ct() {
       echo "ERROR: --memory must be a positive integer in MB (got '${CT_MEMORY}')" >&2
       exit 1
     fi
-    SIZE_CORES="${CT_CORES:-$(pct config "${CTID}" 2>/dev/null | grep -oP '^cores:\s*\K\d+' || echo "")}"
-    SIZE_MEMORY="${CT_MEMORY:-$(pct config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "")}"
+    SIZE_CORES="${CT_CORES:-$(pct_config "${CTID}" 2>/dev/null | grep -oP '^cores:\s*\K\d+' || echo "")}"
+    SIZE_MEMORY="${CT_MEMORY:-$(pct_config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "")}"
     if [[ -z "$SIZE_CORES" || -z "$SIZE_MEMORY" ]]; then
       echo "ERROR: could not determine target cores/memory for CT ${CTID}" >&2
       exit 1
@@ -422,22 +424,22 @@ resize_ct() {
 
   # Check if CT needs to be stopped for resize
   local was_running=false
-  if pct status "${CTID}" | grep -q 'status: running'; then
+  if pct_status "${CTID}" | grep -q 'status: running'; then
     was_running=true
     echo "  Stopping CT for resize..."
-    pct stop "${CTID}"
+    pct_stop "${CTID}"
     sleep 2
   fi
   
   # Apply new resource settings (swap = half of memory)
   local swap_size=$((SIZE_MEMORY / 2))
-  pct set "${CTID}" -cores "${SIZE_CORES}" -memory "${SIZE_MEMORY}" -swap "${swap_size}"
+  pct_set "${CTID}" -cores "${SIZE_CORES}" -memory "${SIZE_MEMORY}" -swap "${swap_size}"
   echo "  [✓] CT resized to ${SIZE_CORES} cores, ${SIZE_MEMORY} MB RAM, ${swap_size} MB swap"
   
   # Restart if it was running
   if [[ "$was_running" == "true" ]]; then
     echo "  Restarting CT..."
-    pct start "${CTID}"
+    pct_start "${CTID}"
     sleep 3
   fi
 }
@@ -446,14 +448,14 @@ resize_ct() {
 apply_priority() {
   if [[ -z "$CT_PRIORITY" ]]; then
     local current_units
-    current_units=$(pct config "${CTID}" | grep -oP 'cpuunits:\s*\K\d+' || echo "1024")
+    current_units=$(pct_config "${CTID}" | grep -oP 'cpuunits:\s*\K\d+' || echo "1024")
     echo "  [i] Priority unchanged (current: ${current_units} CPU units)"
     return
   fi
   
   echo "Setting priority to ${CT_PRIORITY}..."
   validate_priority "${CT_PRIORITY}" || exit 1
-  pct set "${CTID}" -cpuunits "${PRIORITY_CPUUNITS}"
+  pct_set "${CTID}" -cpuunits "${PRIORITY_CPUUNITS}"
   echo "  [✓] Priority set to ${CT_PRIORITY} (${PRIORITY_CPUUNITS} CPU units)"
 }
 
@@ -542,8 +544,6 @@ main() {
     cts_to_process=("$CTID")
   fi
 
-  validate_node_storage_contract || exit 1
-  
   # Process each selected CT
   local total=${#cts_to_process[@]}
   local current=0
@@ -559,6 +559,7 @@ main() {
   for CTID in "${cts_to_process[@]}"; do
     current=$((current + 1))
     CT_HOSTNAME="${CT_MAP[$CTID]}"
+    local ct_node="${CT_NODE[$CTID]}"
     local base_step=$(( (current - 1) * steps_per_ct ))
     
     echo ""
@@ -570,8 +571,9 @@ main() {
     check_ct_storage_health "${CTID}" warn
 
     overall_step=$((base_step + 1)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Reconciling bridge policy..."
-    if ! bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$CT_HOSTNAME" \
-        || ! bridge_policy_reconcile_guest "$(hostname -s)" CT "$CTID" "$BRIDGE_POLICY_SELECTED"; then
+    if ! validate_node_storage_contract "$ct_node" \
+      || ! bridge_policy_resolve "$ct_node" CT "$CTID" "$CT_HOSTNAME" \
+      || ! bridge_policy_reconcile_guest "$ct_node" CT "$CTID" "$BRIDGE_POLICY_SELECTED"; then
       echo "  [✗] FATAL: bridge policy reconciliation failed for CT ${CTID} — skipping remaining steps"
       failed_cts+=("${CTID} (${CT_HOSTNAME}): bridge policy reconciliation")
       overall_step=$((base_step + steps_per_ct))
@@ -579,7 +581,7 @@ main() {
     fi
     echo "  [✓] Bridge policy selected ${BRIDGE_POLICY_SELECTED} (${BRIDGE_POLICY_REASON})"
 
-    if ! reconcile_ct_gpu_config "${CTID}"; then
+    if ! reconcile_ct_gpu_config "${CTID}" "$ct_node"; then
       echo "  [✗] FATAL: GPU reconciliation failed for CT ${CTID} — skipping remaining steps"
       failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU reconciliation")
       overall_step=$((base_step + steps_per_ct))
@@ -610,7 +612,7 @@ main() {
     
     overall_step=$((base_step + 4)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Applying configuration..."
     apply_ct_configuration "${CTID}" "${CT_HOSTNAME}"
-    if ! finalize_ct_gpu_capability "${CTID}"; then
+    if ! finalize_ct_gpu_capability "${CTID}" "$ct_node"; then
       echo "  [✗] FATAL: GPU verification failed for CT ${CTID} — skipping remaining steps"
       failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU verification")
       overall_step=$((base_step + steps_per_ct))

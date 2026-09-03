@@ -102,6 +102,7 @@ MONITOR_AFTER=false
 CT_SIZE="S"
 CT_PRIORITY="mid"
 CT_VLAN=""
+CREATE_NODE="$(hostname -s)"
 
 # -----------------------------
 # FUNCTIONS
@@ -138,7 +139,8 @@ next_ctid() {
   local base=2000
   local max=10000
   local used
-  used=$(pct list | awk '{print $1}' | grep -E '^[0-9]+$' | sort -n)
+  used=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null \
+    | jq -r '.[] | .vmid // empty' | sort -n)
 
   # First pass: step by 100
   local candidate=$base
@@ -187,10 +189,10 @@ set_defaults() {
 # Find and download template
 prepare_template() {
   echo "Searching for latest template matching prefix '${TEMPLATE_PREFIX}'..."
-  pveam update >/dev/null
+  run_on_node "$CREATE_NODE" pveam update >/dev/null
 
   local latest_template
-  latest_template=$(pveam available | awk '{print $2}' \
+  latest_template=$(run_on_node "$CREATE_NODE" pveam available | awk '{print $2}' \
     | grep "^${TEMPLATE_PREFIX}" \
     | sort -V \
     | tail -n 1)
@@ -203,9 +205,9 @@ prepare_template() {
   echo "Latest matching template: ${latest_template}"
   TEMPLATE_PATH="${TEMPLATE_STORE}:vztmpl/${latest_template}"
 
-  if ! pveam list "${TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${latest_template}"; then
+  if ! run_on_node "$CREATE_NODE" pveam list "${TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${latest_template}"; then
     echo "Template not found locally. Downloading ${latest_template}..."
-    pveam download "${TEMPLATE_STORE}" "${latest_template}"
+    run_on_node "$CREATE_NODE" pveam download "${TEMPLATE_STORE}" "${latest_template}"
   else
     echo "Template already present locally."
   fi
@@ -213,7 +215,8 @@ prepare_template() {
 
 # Create the container
 create_ct() {
-  if pct status "${CTID}" &>/dev/null; then
+  if pvesh get "/cluster/resources" --type vm --output-format json 2>/dev/null \
+      | jq -e --argjson id "$CTID" '.[] | select(.vmid == $id)' >/dev/null; then
     echo "CT ${CTID} already exists, skipping creation."
     return
   fi
@@ -226,7 +229,7 @@ create_ct() {
   # Validate and get CPU units for priority
   validate_priority "${CT_PRIORITY}" || exit 1
   
-  pct create "${CTID}" "${TEMPLATE_PATH}" \
+  run_on_node "$CREATE_NODE" pct create "${CTID}" "${TEMPLATE_PATH}" \
     --hostname "${HOSTNAME}" \
     --cores "${CORES}" \
     --memory "${MEMORY}" \
@@ -237,6 +240,7 @@ create_ct() {
     --unprivileged 0 \
     --features nesting=1,fuse=1,keyctl=1 \
     --onboot 1
+  CT_NODE["$CTID"]="$CREATE_NODE"
 }
 
 # Configure LXC for Docker capabilities support
@@ -261,11 +265,11 @@ configure_lxc_docker() {
   # Restart CT if config was changed and CT is running
   if [[ "$needs_restart" == "true" ]]; then
     echo "  LXC config updated, restarting CT..."
-    if pct status "${CTID}" | grep -q "status: running"; then
-      pct stop "${CTID}"
+    if pct_status "${CTID}" | grep -q "status: running"; then
+      pct_stop "${CTID}"
       sleep 2
     fi
-    pct start "${CTID}"
+    pct_start "${CTID}"
     sleep 3
   else
     echo "  LXC config already correct."
@@ -274,9 +278,9 @@ configure_lxc_docker() {
 
 # Start the container
 start_ct() {
-  if ! pct status "${CTID}" | grep -q "status: running"; then
+  if ! pct_status "${CTID}" | grep -q "status: running"; then
     echo "Starting CT ${CTID}..."
-    pct start "${CTID}"
+    pct_start "${CTID}"
     sleep 3
   fi
 }
@@ -330,7 +334,7 @@ verify_setup() {
   echo "Verifying CT ${CTID}..."
 
   # Wait for CT to be running
-  if ! wait_for "CT running" "pct status '${CTID}' | grep -q 'status: running'" 30; then
+  if ! wait_for "CT running" "pct_status '${CTID}' | grep -q 'status: running'" 30; then
     echo "ERROR: CT ${CTID} failed to start after reboot."
     exit 1
   fi
@@ -425,6 +429,11 @@ main() {
         MONITOR_AFTER=true
         shift
         ;;
+      --node)
+        [[ -n "${2:-}" ]] || { echo "ERROR: --node requires a node." >&2; exit 1; }
+        CREATE_NODE="$2"
+        shift 2
+        ;;
       --size|-s)
         CT_SIZE="$2"
         shift 2
@@ -484,7 +493,11 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Validating hostname..."
   validate_hostname "${HOSTNAME}" || exit 1
-  validate_node_storage_contract || exit 1
+  if ! online_cluster_nodes | grep -Fxq "$CREATE_NODE"; then
+    echo "ERROR: Target node '${CREATE_NODE}' is not online." >&2
+    exit 1
+  fi
+  validate_node_storage_contract "$CREATE_NODE" || exit 1
   
   # Check if a CT with this hostname already exists
   build_ct_list
@@ -524,11 +537,11 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting defaults..."
   set_defaults
-  bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$HOSTNAME" || exit 1
+  bridge_policy_resolve "$CREATE_NODE" CT "$CTID" "$HOSTNAME" || exit 1
   BRIDGE="$BRIDGE_POLICY_SELECTED"
   echo "Bridge policy: ${BRIDGE} (${BRIDGE_POLICY_REASON}, rank ${BRIDGE_POLICY_RANK})"
-  validate_rootfs_target_capacity "$(hostname -s)" "${DISK}" 20 || exit 1
-  validate_os_root_headroom "$(hostname -s)" 20 || exit 1
+  validate_rootfs_target_capacity "$CREATE_NODE" "${DISK}" 20 || exit 1
+  validate_os_root_headroom "$CREATE_NODE" 20 || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Preparing template..."
   prepare_template
@@ -539,7 +552,7 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring LXC for Docker..."
   configure_lxc_docker
-  reconcile_ct_gpu_config "${CTID}" || exit 1
+  reconcile_ct_gpu_config "${CTID}" "$CREATE_NODE" || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Starting container..."
   start_ct
@@ -561,7 +574,7 @@ main() {
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Applying configuration..."
   apply_ct_configuration "${CTID}" "${HOSTNAME}"
-  finalize_ct_gpu_capability "${CTID}" || exit 1
+  finalize_ct_gpu_capability "${CTID}" "$CREATE_NODE" || exit 1
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints

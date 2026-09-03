@@ -226,17 +226,25 @@ restart_compose() {
 # Process a single CT
 process_ct() {
   local compose_file="${DIR_DOCKER}/docker-compose.yaml"
+  local node stage_dir staged_compose original_compose
+  node=$(get_ct_owner_node "$CTID") || return 1
 
-  if [[ ! -f "$compose_file" ]]; then
-    echo "  [!] No docker-compose.yaml found at ${compose_file}"
+  if ! node_path_is_file "$node" "$compose_file"; then
+    echo "  [!] No docker-compose.yaml found at ${node}:${compose_file}"
     return 0
   fi
+
+  stage_dir=$(mktemp -d)
+  staged_compose="${stage_dir}/docker-compose.yaml"
+  original_compose="${stage_dir}/docker-compose.original.yaml"
+  node_download_file "$node" "$compose_file" "$staged_compose"
+  cp -a "$staged_compose" "$original_compose"
 
   local rc=0
 
   if [[ "$REMOVE_MODE" == "true" ]]; then
     echo "  Removing forward auth labels..."
-    remove_forward_auth_labels "$compose_file" || rc=$?
+    remove_forward_auth_labels "$staged_compose" || rc=$?
   else
     local ak_host
     ak_host=$(config_get_authentik_host)
@@ -246,17 +254,31 @@ process_ct() {
     fi
 
     echo "  Adding forward auth labels..."
-    add_forward_auth_labels "$compose_file" || rc=$?
+    add_forward_auth_labels "$staged_compose" || rc=$?
   fi
 
   # Only recreate containers if labels were actually changed
   if [[ "$rc" -eq 2 ]]; then
     echo "  [✓] No changes, skipping restart"
+    rm -rf "$stage_dir"
     return 0
   fi
 
-  # Recreate containers to apply label changes
-  restart_compose
+  node_upload_file "$node" "$staged_compose" "$compose_file" 0644
+  if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
+    echo "  [!] Modified Compose file is invalid; restoring original"
+    node_upload_file "$node" "$original_compose" "$compose_file" 0644 || true
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if ! restart_compose; then
+    echo "  [!] Compose recreation failed; restoring original file"
+    node_upload_file "$node" "$original_compose" "$compose_file" 0644 || true
+    rm -rf "$stage_dir"
+    return 1
+  fi
+  rm -rf "$stage_dir"
 }
 
 # -----------------------------
@@ -363,7 +385,10 @@ main() {
       echo ""
     fi
 
-    process_ct
+    if ! process_ct; then
+      echo "  [!] Forward auth update failed for ${CT_HOSTNAME}"
+      continue
+    fi
 
     echo ""
     local done_label="enabled"

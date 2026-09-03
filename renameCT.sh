@@ -59,6 +59,7 @@ NEW_HOSTNAME=""
 CTID=""
 CT_MAC=""
 CT_IP=""
+CT_OWNER_NODE=""
 OLD_DOCKER=""
 OLD_DATA=""
 NEW_DOCKER=""
@@ -71,6 +72,7 @@ RENAME_BRIDGE=""
 RENAME_BRIDGE_REASON=""
 COMMONCT_OCCURRENCES=0
 declare -a RENAME_ENV_FILES=()
+declare -a RENAME_ENV_NODES=()
 declare -a RENAME_ENV_COUNTS=()
 declare -a REFRESH_HOSTS=()
 
@@ -156,6 +158,7 @@ validate_inputs() {
     echo "ERROR: no CT found with hostname '${OLD_HOSTNAME}'."
     exit 1
   fi
+  CT_OWNER_NODE=$(get_ct_owner_node "$CTID") || exit 1
 
   # c) NEW must not already exist.
   for id in "${CT_LIST[@]}"; do
@@ -172,10 +175,10 @@ validate_inputs() {
   get_ct_dirs "$NEW_HOSTNAME"
   NEW_DOCKER="$DIR_DOCKER"
   NEW_DATA="$DIR_DOCKER_DATA"
-  if [[ -e "$NEW_DOCKER" || -e "$NEW_DATA" ]]; then
+  if node_path_exists "$CT_OWNER_NODE" "$NEW_DOCKER" || node_path_exists "$CT_OWNER_NODE" "$NEW_DATA"; then
     echo "ERROR: target folders already exist:"
-    [[ -e "$NEW_DOCKER" ]] && echo "  $NEW_DOCKER"
-    [[ -e "$NEW_DATA" ]] && echo "  $NEW_DATA"
+    node_path_exists "$CT_OWNER_NODE" "$NEW_DOCKER" && echo "  ${CT_OWNER_NODE}:$NEW_DOCKER"
+    node_path_exists "$CT_OWNER_NODE" "$NEW_DATA" && echo "  ${CT_OWNER_NODE}:$NEW_DATA"
     exit 1
   fi
 
@@ -192,24 +195,28 @@ validate_inputs() {
 
   # Capture MAC + IP now (CT is running). The UDM Pro alias update in step (e)
   # needs them, and a stopped CT exposes no IP.
-  CT_MAC=$(pct config "$CTID" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]' || true)
+  CT_MAC=$(pct_config "$CTID" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]' || true)
   CT_IP=$(ct_exec --timeout 15 "$CTID" 'ip -4 addr show eth0 2>/dev/null | grep "inet " | tr -s " " | cut -d" " -f3 | cut -d"/" -f1' 2>/dev/null || true)
 }
 
 build_rename_plan() {
-  local file count id host
+  local file count id host node
   ORIGINAL_STATUS=$(get_ct_status "$CTID")
-  ORIGINAL_MOUNTS=$(pct config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  ORIGINAL_MOUNTS=$(pct_config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
   COMMONCT_OCCURRENCES=$(grep -Fo "$OLD_HOSTNAME" "$CONFIG_FILE" 2>/dev/null | wc -l | tr -d ' ' || true)
   RENAME_ENV_FILES=()
+  RENAME_ENV_NODES=()
   RENAME_ENV_COUNTS=()
   REFRESH_HOSTS=("$NEW_HOSTNAME")
 
-  for file in /mnt/docker/*/.env; do
-    [[ -f "$file" ]] || continue
-    count=$(grep -Fo "$OLD_HOSTNAME" "$file" 2>/dev/null | wc -l | tr -d ' ' || true)
+  for id in "${CT_LIST[@]}"; do
+    file="/mnt/docker/${CT_MAP[$id]}/.env"
+    node="${CT_NODE[$id]}"
+    node_path_is_file "$node" "$file" || continue
+    count=$(run_node_shell "$node" "grep -Fo '$OLD_HOSTNAME' '$file' 2>/dev/null | wc -l" | tr -d ' ' || true)
     if [[ "${count:-0}" -gt 0 ]]; then
       RENAME_ENV_FILES+=("$file")
+      RENAME_ENV_NODES+=("$node")
       RENAME_ENV_COUNTS+=("$count")
     fi
   done
@@ -222,7 +229,7 @@ build_rename_plan() {
 }
 
 prepare_rename_bridge() {
-  bridge_policy_resolve "$(hostname -s)" CT "$CTID" "$NEW_HOSTNAME" || return 1
+  bridge_policy_resolve "$CT_OWNER_NODE" CT "$CTID" "$NEW_HOSTNAME" || return 1
   RENAME_BRIDGE="$BRIDGE_POLICY_SELECTED"
   RENAME_BRIDGE_REASON="$BRIDGE_POLICY_REASON"
 }
@@ -235,11 +242,11 @@ confirm_rename() {
   echo "  CT:           ${CTID} [${ORIGINAL_STATUS}] (would stop, rename, then start)"
   echo "  Hostname:     ${OLD_HOSTNAME}  ->  ${NEW_HOSTNAME}"
   echo "  Bridge:       all NICs -> ${RENAME_BRIDGE} (${RENAME_BRIDGE_REASON})"
-  bridge_policy_reconcile_guest "$(hostname -s)" CT "$CTID" "$RENAME_BRIDGE" true
-  size=$(du -sh -- "$OLD_DOCKER" 2>/dev/null | awk '{print $1}' || true)
-  echo "  Docker dir:   ${OLD_DOCKER}  ->  ${NEW_DOCKER} (${size:-unknown size})"
-  size=$(du -sh -- "$OLD_DATA" 2>/dev/null | awk '{print $1}' || true)
-  echo "  Data dir:     ${OLD_DATA}  ->  ${NEW_DATA} (${size:-unknown size})"
+  bridge_policy_reconcile_guest "$CT_OWNER_NODE" CT "$CTID" "$RENAME_BRIDGE" true
+  size=$(node_du "$CT_OWNER_NODE" "$OLD_DOCKER" 2>/dev/null | awk '{print $1}' || true)
+  echo "  Docker dir:   ${CT_OWNER_NODE}:${OLD_DOCKER}  ->  ${NEW_DOCKER} (${size:-unknown size})"
+  size=$(node_du "$CT_OWNER_NODE" "$OLD_DATA" 2>/dev/null | awk '{print $1}' || true)
+  echo "  Data dir:     ${CT_OWNER_NODE}:${OLD_DATA}  ->  ${NEW_DATA} (${size:-unknown size})"
   if [[ -d "$OLD_BACKUP_HISTORY" ]]; then
     echo "  Backups:      ${OLD_BACKUP_HISTORY} -> ${NEW_BACKUP_HISTORY}"
   else
@@ -263,7 +270,7 @@ confirm_rename() {
   else
     echo "  Env files:"
     for index in "${!RENAME_ENV_FILES[@]}"; do
-      echo "    ${RENAME_ENV_FILES[$index]} (${RENAME_ENV_COUNTS[$index]} replacement(s))"
+      echo "    ${RENAME_ENV_NODES[$index]}:${RENAME_ENV_FILES[$index]} (${RENAME_ENV_COUNTS[$index]} replacement(s))"
     done
   fi
   echo "  Refresh order:"
@@ -288,7 +295,7 @@ confirm_rename() {
 
 recheck_rename_preconditions() {
   local lock
-  if [[ -e "$NEW_DOCKER" || -e "$NEW_DATA" ]]; then
+  if node_path_exists "$CT_OWNER_NODE" "$NEW_DOCKER" || node_path_exists "$CT_OWNER_NODE" "$NEW_DATA"; then
     echo "ERROR: target folders appeared after planning; aborting." >&2
     return 1
   fi
@@ -296,7 +303,11 @@ recheck_rename_preconditions() {
     echo "ERROR: target backup history appeared after planning; aborting." >&2
     return 1
   fi
-  lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+  [[ "$(get_ct_owner_node "$CTID")" == "$CT_OWNER_NODE" ]] || {
+    echo "ERROR: CT ${CTID} owner changed after planning; aborting." >&2
+    return 1
+  }
+  lock=$(pct_config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   if [[ -n "$lock" ]]; then
     echo "ERROR: CT ${CTID} is locked (${lock}); aborting." >&2
     return 1
@@ -306,9 +317,9 @@ recheck_rename_preconditions() {
 # Stop the target CT and wait until it is fully stopped.
 stop_ct() {
   echo "Stopping CT ${CTID}..."
-  pct stop "$CTID"
+  pct_stop "$CTID"
   local waited=0
-  while [[ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" != "stopped" ]]; do
+  while [[ "$(pct_status "$CTID" 2>/dev/null | awk '{print $2}')" != "stopped" ]]; do
     sleep 2
     waited=$((waited + 2))
     if [[ $waited -ge 120 ]]; then
@@ -323,13 +334,13 @@ stop_ct() {
 update_mounts() {
   echo "Updating mount points..."
   local config_output mp
-  config_output=$(pct config "$CTID" 2>/dev/null)
+  config_output=$(pct_config "$CTID" 2>/dev/null)
   for mp in $(echo "$config_output" | awk -F: '/^mp[0-9]+/ {print $1}'); do
     echo "  deleting $mp"
-    pct set "$CTID" -delete "$mp"
+    pct_set "$CTID" -delete "$mp"
   done
-  pct set "$CTID" -mp0 "${NEW_DOCKER},mp=/mnt/docker"
-  pct set "$CTID" -mp1 "${NEW_DATA},mp=/mnt/docker-data"
+  pct_set "$CTID" -mp0 "${NEW_DOCKER},mp=/mnt/docker"
+  pct_set "$CTID" -mp1 "${NEW_DATA},mp=/mnt/docker-data"
   echo "  mp0 -> ${NEW_DOCKER}"
   echo "  mp1 -> ${NEW_DATA}"
 }
@@ -380,23 +391,30 @@ patch_commonct_json() {
 # target's own .env at its new path).
 patch_env_files() {
   echo "Patching .env files..."
-  local esc_old f patched=0
+  local esc_old f node patched=0 index stage_dir staged
   esc_old=$(escape_old_hostname)
-  for f in /mnt/docker/*/.env; do
-    [[ -f "$f" ]] || continue
-    if grep -Fq "$OLD_HOSTNAME" "$f"; then
-      sed -i "s/${esc_old}/${NEW_HOSTNAME}/g" "$f"
-      echo "  [~] $f"
-      patched=$((patched + 1))
+  stage_dir=$(mktemp -d)
+  for index in "${!RENAME_ENV_FILES[@]}"; do
+    f="${RENAME_ENV_FILES[$index]}"
+    node="${RENAME_ENV_NODES[$index]}"
+    if [[ "$node" == "$CT_OWNER_NODE" && "$f" == "${OLD_DOCKER}/.env" ]]; then
+      f="${NEW_DOCKER}/.env"
     fi
+    staged="${stage_dir}/${index}.env"
+    node_download_file "$node" "$f" "$staged"
+    sed -i "s/${esc_old}/${NEW_HOSTNAME}/g" "$staged"
+    node_upload_file "$node" "$staged" "$f" 0600
+    echo "  [~] ${node}:$f"
+    patched=$((patched + 1))
   done
+  rm -rf "$stage_dir"
   echo "  [i] Patched ${patched} .env file(s)."
 }
 
 # Start the target CT.
 start_ct() {
   echo "Starting CT ${CTID}..."
-  pct start "$CTID"
+  pct_start "$CTID"
   echo "  CT ${CTID} started."
 }
 
@@ -406,14 +424,14 @@ do_rename() {
   stop_ct
   # b) rename the CT hostname
   echo "Setting CT ${CTID} hostname to ${NEW_HOSTNAME}..."
-  pct set "$CTID" -hostname "$NEW_HOSTNAME"
+  pct_set "$CTID" -hostname "$NEW_HOSTNAME"
   echo "Reconciling all CT NICs to ${RENAME_BRIDGE}..."
-  bridge_policy_reconcile_guest "$(hostname -s)" CT "$CTID" "$RENAME_BRIDGE"
+  bridge_policy_reconcile_guest "$CT_OWNER_NODE" CT "$CTID" "$RENAME_BRIDGE"
   # c) move the per-CT folders
   echo "Moving folders..."
-  mv "$OLD_DOCKER" "$NEW_DOCKER"
+  run_on_node "$CT_OWNER_NODE" mv -- "$OLD_DOCKER" "$NEW_DOCKER"
   echo "  ${OLD_DOCKER} -> ${NEW_DOCKER}"
-  mv "$OLD_DATA" "$NEW_DATA"
+  run_on_node "$CT_OWNER_NODE" mv -- "$OLD_DATA" "$NEW_DATA"
   echo "  ${OLD_DATA} -> ${NEW_DATA}"
   if [[ -d "$OLD_BACKUP_HISTORY" ]]; then
     mv "$OLD_BACKUP_HISTORY" "$NEW_BACKUP_HISTORY"
@@ -483,8 +501,8 @@ main() {
   NEW_HOSTNAME=$(echo "${positional[1]}" | tr '[:upper:]' '[:lower:]')
 
   ensure_jq
-  validate_node_storage_contract || exit 1
   validate_inputs
+  validate_node_storage_contract "$CT_OWNER_NODE" || exit 1
   prepare_rename_bridge || exit 1
   build_rename_plan
   confirm_rename

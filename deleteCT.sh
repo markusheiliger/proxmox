@@ -50,6 +50,7 @@ DRY_RUN=false
 DELETE_FOLDERS=false
 DIR_DOCKER=""
 DIR_DOCKER_DATA=""
+CT_OWNER_NODE=""
 
 # -----------------------------
 # FUNCTIONS
@@ -87,9 +88,9 @@ EOF
 
 validate_cleanup_path() {
   local path="$1" expected="$2" canonical
-  [[ -e "$path" ]] || return 0
-  [[ ! -L "$path" ]] || { echo "ERROR: Refusing symlink cleanup path '${path}'." >&2; return 1; }
-  canonical=$(realpath -e "$path") || return 1
+  node_path_exists "$CT_OWNER_NODE" "$path" || return 0
+  ! node_path_is_symlink "$CT_OWNER_NODE" "$path" || { echo "ERROR: Refusing symlink cleanup path '${CT_OWNER_NODE}:${path}'." >&2; return 1; }
+  canonical=$(node_realpath "$CT_OWNER_NODE" "$path") || return 1
   [[ "$canonical" == "$expected" ]] || {
     echo "ERROR: Cleanup path drifted: expected '${expected}', found '${canonical}'." >&2
     return 1
@@ -99,7 +100,8 @@ validate_cleanup_path() {
 select_folder_cleanup() {
   get_ct_dirs "$CT_HOSTNAME"
 
-  if [[ ! -d "$DIR_DOCKER" && ! -d "$DIR_DOCKER_DATA" ]]; then
+  if ! node_path_is_dir "$CT_OWNER_NODE" "$DIR_DOCKER" \
+      && ! node_path_is_dir "$CT_OWNER_NODE" "$DIR_DOCKER_DATA"; then
     echo "No related folders found."
     DELETE_FOLDERS=false
     return 0
@@ -107,8 +109,8 @@ select_folder_cleanup() {
 
   echo ""
   echo "Related folders found:"
-  [[ -d "$DIR_DOCKER" ]] && echo "  $DIR_DOCKER"
-  [[ -d "$DIR_DOCKER_DATA" ]] && echo "  $DIR_DOCKER_DATA"
+  node_path_is_dir "$CT_OWNER_NODE" "$DIR_DOCKER" && echo "  ${CT_OWNER_NODE}:$DIR_DOCKER"
+  node_path_is_dir "$CT_OWNER_NODE" "$DIR_DOCKER_DATA" && echo "  ${CT_OWNER_NODE}:$DIR_DOCKER_DATA"
 
   if [[ "$FORCE" == "true" ]]; then
     DELETE_FOLDERS=true
@@ -122,7 +124,7 @@ select_folder_cleanup() {
 
 print_delete_plan() {
   local volumes folder size
-  volumes=$(pct config "$CTID" 2>/dev/null | grep -E '^(rootfs|mp[0-9]+):' || true)
+  volumes=$(pct_config "$CTID" 2>/dev/null | grep -E '^(rootfs|mp[0-9]+):' || true)
 
   echo ""
   echo "Deletion plan:"
@@ -136,12 +138,12 @@ print_delete_plan() {
   echo "  Split DNS: would reconcile before CT destruction"
 
   for folder in "$DIR_DOCKER" "$DIR_DOCKER_DATA"; do
-    [[ -e "$folder" ]] || continue
-    size=$(du -sh -- "$folder" 2>/dev/null | awk '{print $1}' || true)
+    node_path_exists "$CT_OWNER_NODE" "$folder" || continue
+    size=$(node_du "$CT_OWNER_NODE" "$folder" 2>/dev/null | awk '{print $1}' || true)
     if [[ "$DELETE_FOLDERS" == "true" ]]; then
-      echo "  Data:     delete ${folder} (${size:-unknown size})"
+      echo "  Data:     delete ${CT_OWNER_NODE}:${folder} (${size:-unknown size})"
     else
-      echo "  Data:     retain ${folder} (${size:-unknown size})"
+      echo "  Data:     retain ${CT_OWNER_NODE}:${folder} (${size:-unknown size})"
     fi
   done
 }
@@ -155,7 +157,7 @@ destroy_ct() {
     "${SCRIPT_DIR}/forwardDNSCT.sh" >/dev/null 2>&1 || true
   fi
 
-  pct destroy "$CTID" --purge --force
+  pct_destroy "$CTID" --purge --force
   echo "CT ${CTID} destroyed."
 }
 
@@ -166,8 +168,10 @@ cleanup_folders() {
     return 0
   fi
 
-  [[ -d "$DIR_DOCKER" ]] && rm -rf --one-file-system -- "$DIR_DOCKER" && echo "Deleted: $DIR_DOCKER"
-  [[ -d "$DIR_DOCKER_DATA" ]] && rm -rf --one-file-system -- "$DIR_DOCKER_DATA" && echo "Deleted: $DIR_DOCKER_DATA"
+  node_remove_tree "$CT_OWNER_NODE" "$DIR_DOCKER" "/mnt/docker/${CT_HOSTNAME}" \
+    && echo "Deleted: ${CT_OWNER_NODE}:$DIR_DOCKER"
+  node_remove_tree "$CT_OWNER_NODE" "$DIR_DOCKER_DATA" "/mnt/docker-data/${CT_HOSTNAME}" \
+    && echo "Deleted: ${CT_OWNER_NODE}:$DIR_DOCKER_DATA"
 }
 
 # -----------------------------
@@ -203,7 +207,8 @@ main() {
     resolve_ct_from_input "$container_arg" || exit 1
   fi
 
-  validate_node_storage_contract || exit 1
+  CT_OWNER_NODE=$(get_ct_owner_node "$CTID") || exit 1
+  validate_node_storage_contract "$CT_OWNER_NODE" || exit 1
 
   confirm_destruction
   select_folder_cleanup

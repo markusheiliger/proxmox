@@ -49,14 +49,24 @@ if [[ -z "$PRIMARY_DOMAIN" ]]; then
   exit 1
 fi
 
-COREDNS_DIR="/mnt/docker/${SPLITDNS_HOSTNAME_LOWER}/coredns"
+build_ct_list
+if ! resolve_ct_from_input "$SPLITDNS_HOSTNAME"; then
+  echo "  [!] Could not resolve split DNS CT: ${SPLITDNS_HOSTNAME}"
+  exit 1
+fi
+SPLITDNS_CTID="$CTID"
+SPLITDNS_NODE="${CT_NODE[$CTID]}"
+REMOTE_COREDNS_DIR="/mnt/docker/${SPLITDNS_HOSTNAME_LOWER}/coredns"
+COREDNS_STAGE=$(mktemp -d)
+COREDNS_DIR="${COREDNS_STAGE}/coredns"
 CONF_DIR="${COREDNS_DIR}/conf.d"
 LEGACY_HOSTS_DIR="${COREDNS_DIR}/hosts"
 
-if [[ ! -d "$COREDNS_DIR" ]]; then
-  echo "[!] Split DNS CoreDNS directory not found: ${COREDNS_DIR}"
+if ! node_path_is_dir "$SPLITDNS_NODE" "$REMOTE_COREDNS_DIR"; then
+  echo "[!] Split DNS CoreDNS directory not found: ${SPLITDNS_NODE}:${REMOTE_COREDNS_DIR}"
   exit 1
 fi
+node_fetch_tree "$SPLITDNS_NODE" "$REMOTE_COREDNS_DIR" "$COREDNS_DIR"
 
 if ! config_udmpro_configured; then
   echo "[!] UDM Pro not configured, cannot refresh split DNS"
@@ -498,13 +508,10 @@ for conf_file in "$CONF_DIR"/*.conf; do
 done
 
 echo "CoreDNS mapping summary: created=${MAP_CREATED} updated=${MAP_UPDATED} deleted=${MAP_DELETED} unchanged=${MAP_UNCHANGED} failed=${MAP_FAILED}"
+node_sync_tree "$SPLITDNS_NODE" "$COREDNS_DIR" "$REMOTE_COREDNS_DIR"
+rm -rf "$COREDNS_STAGE"
 # Reload CoreDNS in split DNS CT
-build_ct_list
-if ! resolve_ct_from_input "$SPLITDNS_HOSTNAME"; then
-  echo "  [!] Could not resolve split DNS CT: ${SPLITDNS_HOSTNAME}"
-  exit 1
-fi
-
+CTID="$SPLITDNS_CTID"
 ensure_ct_running "$CTID" >/dev/null || true
 if ct_exec --timeout 20 "$CTID" 'cd /mnt/docker && docker kill -s SIGUSR1 coredns >/dev/null 2>&1'; then
   echo "  [✓] CoreDNS reload signal sent"

@@ -114,9 +114,193 @@ CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/commonCT.json}"
 
 declare -A CT_MAP
 declare -A CT_STATUS
+declare -A CT_NODE
 declare -a CT_LIST
 CTID=""
 CT_HOSTNAME=""
+
+# Execute one argv-safe command on a Proxmox node. Lifecycle scripts are kept
+# only on the administrative node; worker nodes need SSH and native PVE tools,
+# but never a copy of this repository or commonCT.json.
+run_on_node() {
+  local node="${1:-}" argument quoted command=""
+  shift || true
+  [[ -n "$node" && $# -gt 0 ]] || {
+    echo "ERROR: run_on_node requires a node and command." >&2
+    return 1
+  }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    "$@"
+    return
+  fi
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+="${command:+ }${quoted}"
+  done
+  ssh -o BatchMode=yes -o ConnectTimeout=10 \
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$node" "$command"
+}
+
+run_node_shell() {
+  local node="${1:-}" command="${2:-}"
+  [[ -n "$node" && -n "$command" ]] || {
+    echo "ERROR: run_node_shell requires a node and command." >&2
+    return 1
+  }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    sh -c "$command"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=10 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$node" "$command"
+  fi
+}
+
+online_cluster_nodes() {
+  pvesh get /nodes --output-format json 2>/dev/null \
+    | jq -r '.[] | select(.status == "online") | .node' \
+    | sort
+}
+
+# Resolve a CT owner. Cached inventory is preferred, but an existing CT is
+# never silently treated as local when inventory has not yet been built.
+get_ct_owner_node() {
+  local ctid="${1:-${CTID:-}}" resources node
+  [[ "$ctid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: A numeric CTID is required to resolve its owner." >&2
+    return 1
+  }
+  if [[ -n "${CT_NODE[$ctid]:-}" ]]; then
+    printf '%s\n' "${CT_NODE[$ctid]}"
+    return 0
+  fi
+  resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || {
+    echo "ERROR: Cannot query cluster resources for CT ${ctid}." >&2
+    return 1
+  }
+  node=$(jq -r --argjson id "$ctid" \
+    '[.[] | select(.type == "lxc" and .vmid == $id) | .node] | if length == 1 then .[0] else empty end' \
+    <<< "$resources")
+  [[ -n "$node" ]] || {
+    echo "ERROR: Cannot resolve exactly one owner for CT ${ctid}." >&2
+    return 1
+  }
+  CT_NODE["$ctid"]="$node"
+  printf '%s\n' "$node"
+}
+
+ct_pct() {
+  local ctid="${1:-}" subcommand="${2:-}" node
+  shift 2 || true
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && -n "$subcommand" ]] || {
+    echo "ERROR: ct_pct requires a CTID and pct subcommand." >&2
+    return 1
+  }
+  node=$(get_ct_owner_node "$ctid") || return 1
+  run_on_node "$node" pct "$subcommand" "$ctid" "$@"
+}
+
+pct_config() { ct_pct "$1" config; }
+pct_status() { ct_pct "$1" status; }
+pct_start() { ct_pct "$1" start "${@:2}"; }
+pct_stop() { ct_pct "$1" stop "${@:2}"; }
+pct_shutdown() { ct_pct "$1" shutdown "${@:2}"; }
+pct_reboot() { ct_pct "$1" reboot "${@:2}"; }
+pct_set() { ct_pct "$1" set "${@:2}"; }
+pct_destroy() { ct_pct "$1" destroy "${@:2}"; }
+pct_snapshot() { ct_pct "$1" snapshot "${@:2}"; }
+pct_rollback() { ct_pct "$1" rollback "${@:2}"; }
+
+node_path_exists() { run_on_node "$1" test -e "$2"; }
+node_path_is_dir() { run_on_node "$1" test -d "$2"; }
+node_path_is_file() { run_on_node "$1" test -f "$2"; }
+node_path_is_symlink() { run_on_node "$1" test -L "$2"; }
+node_mkdir() { run_on_node "$1" mkdir -p -- "${@:2}"; }
+node_realpath() { run_on_node "$1" realpath -e -- "$2"; }
+node_du() { run_on_node "$1" du -sh -- "$2"; }
+
+node_download_file() {
+  local node="${1:-}" remote_path="${2:-}" local_path="${3:-}"
+  [[ -n "$node" && -n "$remote_path" && -n "$local_path" ]] || {
+    echo "ERROR: node_download_file requires node, remote path, and local path." >&2
+    return 1
+  }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    cp -a -- "$remote_path" "$local_path"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" cat -- "$remote_path" > "$local_path"
+  fi
+}
+
+node_upload_file() {
+  local node="${1:-}" local_path="${2:-}" remote_path="${3:-}" mode="${4:-0600}"
+  local quoted_path quoted_mode command
+  [[ -n "$node" && -f "$local_path" && -n "$remote_path" && "$mode" =~ ^0?[0-7]{3,4}$ ]] || {
+    echo "ERROR: node_upload_file received invalid arguments." >&2
+    return 1
+  }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    install -D -o root -g root -m "$mode" "$local_path" "$remote_path"
+    return
+  fi
+  printf -v quoted_path '%q' "$remote_path"
+  printf -v quoted_mode '%q' "$mode"
+  command="set -eu; target=${quoted_path}; tmp=\"\${target}.tmp.\$$\"; umask 077; mkdir -p -- \"\$(dirname -- \"\$target\")\"; cat > \"\$tmp\"; chmod ${quoted_mode} \"\$tmp\"; chown root:root \"\$tmp\"; mv -f -- \"\$tmp\" \"\$target\""
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "$command" < "$local_path"
+}
+
+node_sync_tree() {
+  local node="${1:-}" local_dir="${2:-}" remote_dir="${3:-}" quoted_dir
+  [[ -n "$node" && -d "$local_dir" && -n "$remote_dir" ]] || {
+    echo "ERROR: node_sync_tree received invalid arguments." >&2
+    return 1
+  }
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    rm -rf -- "$remote_dir"
+    mkdir -p -- "$remote_dir"
+    cp -a "${local_dir}/." "$remote_dir/"
+    return
+  fi
+  printf -v quoted_dir '%q' "$remote_dir"
+  tar -C "$local_dir" -cf - . | ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+    "set -eu; rm -rf -- ${quoted_dir}; mkdir -p -- ${quoted_dir}; tar -C ${quoted_dir} -xf -"
+}
+
+node_fetch_tree() {
+  local node="${1:-}" remote_dir="${2:-}" local_dir="${3:-}" quoted_dir
+  [[ -n "$node" && -n "$remote_dir" && -n "$local_dir" ]] || {
+    echo "ERROR: node_fetch_tree received invalid arguments." >&2
+    return 1
+  }
+  rm -rf -- "$local_dir"
+  mkdir -p -- "$local_dir"
+  if [[ "$node" == "$(hostname -s)" ]]; then
+    cp -a "${remote_dir}/." "$local_dir/"
+    return
+  fi
+  printf -v quoted_dir '%q' "$remote_dir"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+    "set -eu; tar -C ${quoted_dir} -cf - ." | tar -C "$local_dir" -xf -
+}
+
+node_remove_tree() {
+  local node="${1:-}" path="${2:-}" expected="${3:-}" canonical
+  if [[ "$path" != "$expected" ]] \
+      || [[ "$path" != /mnt/docker/?* && "$path" != /mnt/docker-data/?* ]]; then
+    echo "ERROR: Refusing unsafe node cleanup path '${node}:${path}'." >&2
+    return 1
+  fi
+  node_path_exists "$node" "$path" || return 0
+  if node_path_is_symlink "$node" "$path"; then
+    echo "ERROR: Refusing symlink cleanup path '${node}:${path}'." >&2
+    return 1
+  fi
+  canonical=$(node_realpath "$node" "$path") || return 1
+  [[ "$canonical" == "$expected" ]] || {
+    echo "ERROR: Cleanup path drifted on ${node}: expected '${expected}', found '${canonical}'." >&2
+    return 1
+  }
+  run_on_node "$node" rm -rf --one-file-system -- "$path"
+}
 
 # Status bar state
 STATUS_BAR_ENABLED=false
@@ -1654,7 +1838,7 @@ UNIT'
 
     # Write arping script and cron entry idempotently
     # Uses a wrapper script to avoid awk/dollar-sign quoting issues in ct_exec
-    pct exec "${CTID}" -- sh -c 'cat > /usr/local/bin/arping-gw.sh << '"'"'SCRIPT'"'"'
+    ct_exec "${CTID}" 'cat > /usr/local/bin/arping-gw.sh << '"'"'SCRIPT'"'"'
 #!/bin/sh
 GW=$(ip route | awk '"'"'"'"'"'"'"'"'/default/ {print $3}'"'"'"'"'"'"'"'"')
 [ -n "$GW" ] && arping -c 1 -A -I eth0 $GW >/dev/null 2>&1 || true
@@ -1785,7 +1969,7 @@ configure_docker_watchdog() {
 
   # Write the OpenRC unit with a quoted heredoc so the in-script $variables are
   # NOT expanded by the host shell (same pattern as configure_arping_service).
-  pct exec "${ctid}" -- sh -c 'cat > /etc/init.d/docker-watchdog << '"'"'WATCHDOG'"'"'
+  ct_exec "${ctid}" 'cat > /etc/init.d/docker-watchdog << '"'"'WATCHDOG'"'"'
 #!/sbin/openrc-run
 
 description="Retry Docker startup at boot until the daemon is responsive"
@@ -2306,21 +2490,23 @@ reconcile_ct_gpu_config() {
   fi
 
   if [[ "$original_status" == "running" ]]; then
-    pct stop "$ctid"
+    pct_stop "$ctid"
     ensure_ct_stopped "$ctid" || return 1
   fi
   reconcile_stopped_ct_gpu_config "$ctid" || return 1
   if [[ "$original_status" == "running" ]]; then
-    pct start "$ctid"
+    pct_start "$ctid"
     ensure_ct_running "$ctid" || return 1
   fi
 }
 
 finalize_ct_gpu_capability() {
   local ctid="${1:-${CTID}}"
+  local node="${2:-}"
   local index device gid group
 
-  detect_node_gpu_capability || return 1
+  [[ -n "$node" ]] || node=$(get_ct_owner_node "$ctid") || return 1
+  detect_node_gpu_capability "$node" || return 1
   [[ "$NODE_GPU_STATE" == "available" ]] || return 0
 
   for index in "${!NODE_GPU_RENDER_DEVICES[@]}"; do
@@ -2467,8 +2653,9 @@ compose_up() {
   local ctid="${1:-${CTID}}"
   
   # Get hostname for this CT
-  local hostname
-  hostname=$(pct config "$ctid" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}')
+  local hostname node
+  hostname=$(pct_config "$ctid" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}')
+  node=$(get_ct_owner_node "$ctid") || return 1
   
   # Get newt configuration
   local newt_id newt_secret newt_endpoint
@@ -2489,20 +2676,24 @@ compose_up() {
   hostname_lower=$(echo "$hostname" | tr '[:upper:]' '[:lower:]')
   local env_file="/mnt/docker/${hostname_lower}/.env"
   
-  if [[ -f "$env_file" ]]; then
+  if node_path_is_file "$node" "$env_file"; then
+    local stage_dir stage_env
+    stage_dir=$(mktemp -d)
+    stage_env="${stage_dir}/.env"
+    node_download_file "$node" "$env_file" "$stage_env"
     set_or_add_env() {
       local key="$1"
       local value="$2"
-      if grep -q "^${key}=" "$env_file"; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$env_file"
+      if grep -q "^${key}=" "$stage_env"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$stage_env"
       else
-        echo "${key}=${value}" >> "$env_file"
+        echo "${key}=${value}" >> "$stage_env"
       fi
     }
 
     remove_env() {
       local key="$1"
-      sed -i "/^${key}=/d" "$env_file"
+      sed -i "/^${key}=/d" "$stage_env"
     }
 
     # Update or add NEWT values
@@ -2520,6 +2711,8 @@ compose_up() {
       remove_env "DNSIMPLE_API_ACCESS_TOKEN"
       remove_env "DNSIMPLE_ACCOUNT_ID"
     fi
+    node_upload_file "$node" "$stage_env" "$env_file" 0600
+    rm -rf "$stage_dir"
   fi
   
   # Build compose command with optional published profile
@@ -2601,14 +2794,14 @@ reboot_ct() {
   local ctid="${1:-${CTID}}"
   
   echo "Rebooting CT ${ctid}..."
-  pct reboot "${ctid}"
+  pct_reboot "${ctid}"
   
   # Wait for CT status to be running
   echo "  Waiting for CT to start..."
   local timeout=30
   local running=false
   for ((i=1; i<=timeout; i++)); do
-    if pct status "${ctid}" 2>/dev/null | grep -q "status: running"; then
+    if pct_status "${ctid}" 2>/dev/null | grep -q "status: running"; then
       running=true
       break
     fi
@@ -2624,7 +2817,7 @@ reboot_ct() {
   echo "  Waiting for CT to become responsive..."
   local responsive=false
   for ((i=1; i<=timeout; i++)); do
-    if pct exec "${ctid}" -- true 2>/dev/null; then
+    if ct_exec --timeout 5 "${ctid}" 'true' 2>/dev/null; then
       responsive=true
       break
     fi
@@ -2652,10 +2845,10 @@ restart_ct_hard() {
   local timeout=60 i
 
   echo "  Stopping CT ${ctid}..."
-  pct stop "${ctid}" 2>/dev/null
+  pct_stop "${ctid}" 2>/dev/null
   local stopped=false
   for ((i=1; i<=timeout; i++)); do
-    if pct status "${ctid}" 2>/dev/null | grep -q "status: stopped"; then
+    if pct_status "${ctid}" 2>/dev/null | grep -q "status: stopped"; then
       stopped=true; break
     fi
     sleep 1
@@ -2666,10 +2859,10 @@ restart_ct_hard() {
   fi
 
   echo "  Starting CT ${ctid}..."
-  pct start "${ctid}" 2>/dev/null
+  pct_start "${ctid}" 2>/dev/null
   local running=false
   for ((i=1; i<=timeout; i++)); do
-    if pct status "${ctid}" 2>/dev/null | grep -q "status: running"; then
+    if pct_status "${ctid}" 2>/dev/null | grep -q "status: running"; then
       running=true; break
     fi
     sleep 1
@@ -2682,7 +2875,7 @@ restart_ct_hard() {
   echo "  Waiting for CT ${ctid} to become responsive..."
   local responsive=false
   for ((i=1; i<=timeout; i++)); do
-    if pct exec "${ctid}" -- true 2>/dev/null; then
+    if ct_exec --timeout 5 "${ctid}" 'true' 2>/dev/null; then
       responsive=true; break
     fi
     sleep 1
@@ -2830,7 +3023,7 @@ read_ct_ip() {
 get_ct_mac() {
   local ctid="${1:-${CTID}}"
   local mac
-  mac=$(pct config "${ctid}" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
+  mac=$(pct_config "${ctid}" 2>/dev/null | grep -oP 'hwaddr=\K[^,]+' | tr '[:upper:]' '[:lower:]')
   [[ -n "$mac" ]] || return 1
   printf '%s' "$mac"
 }
@@ -3166,13 +3359,13 @@ ensure_swap() {
   local current_memory current_swap expected_swap
   
   # Get current memory and swap from CT config
-  current_memory=$(pct config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "0")
-  current_swap=$(pct config "${CTID}" 2>/dev/null | grep -oP '^swap:\s*\K\d+' || echo "0")
+  current_memory=$(pct_config "${CTID}" 2>/dev/null | grep -oP '^memory:\s*\K\d+' || echo "0")
+  current_swap=$(pct_config "${CTID}" 2>/dev/null | grep -oP '^swap:\s*\K\d+' || echo "0")
   expected_swap=$((current_memory / 2))
   
   if [[ "$current_swap" -ne "$expected_swap" ]]; then
     echo "Adjusting swap: ${current_swap} MB -> ${expected_swap} MB (half of ${current_memory} MB RAM)"
-    pct set "${CTID}" -swap "${expected_swap}"
+    pct_set "${CTID}" -swap "${expected_swap}"
     echo "  [\u2713] Swap adjusted"
   fi
 }
@@ -3205,7 +3398,7 @@ vlan_change_pending() {
   fi
 
   local current_net0
-  current_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  current_net0=$(pct_config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
   [[ -z "$current_net0" ]] && return 1
 
   # Strip any existing tag=<n> segment (net0 always starts with name=..., so a
@@ -3237,7 +3430,7 @@ apply_vlan_tag() {
   fi
 
   local current_net0
-  current_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  current_net0=$(pct_config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
   if [[ -z "$current_net0" ]]; then
     echo "  [!] CT ${ctid} has no net0 device; skipping VLAN change" >&2
     return 0
@@ -3255,7 +3448,7 @@ apply_vlan_tag() {
     return 0
   fi
 
-  pct set "${ctid}" -net0 "${target_net0}"
+  pct_set "${ctid}" -net0 "${target_net0}"
   if (( vlan == 0 )); then
     echo "  [i] VLAN tag removed from CT ${ctid} (unassigned)"
   else
@@ -3310,7 +3503,7 @@ rollback_vlan_change() {
   echo "  [!] Rolling back VLAN change for CT ${ctid}..."
 
   if [[ -n "$original_net0" ]]; then
-    if pct set "${ctid}" -net0 "${original_net0}" 2>/dev/null; then
+    if pct_set "${ctid}" -net0 "${original_net0}" 2>/dev/null; then
       echo "    Restored net0: ${original_net0}"
     else
       echo "    [!] Failed to restore net0 (manual check needed)"
@@ -3365,7 +3558,7 @@ reconcile_vlan_change() {
 
   # Capture pre-change state for a possible rollback.
   local original_net0 old_ip
-  original_net0=$(pct config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
+  original_net0=$(pct_config "${ctid}" 2>/dev/null | grep -oP '^net0:\s*\K.*' || echo "")
   old_ip=$(read_ct_ip "${ctid}" || true)
   echo "  Pre-change state: net0='${original_net0}' ip='${old_ip:-<none>}'"
 
@@ -3413,22 +3606,21 @@ build_ct_list() {
   CT_MAP=()
   CT_LIST=()
   CT_STATUS=()
-  
-  # Parse pct list output: VMID, Status, Lock, Name
-  # Skip header line, extract all info in one pass
-  # Use $NF for Name (last field) since Lock column may be empty
-  while IFS= read -r line; do
-    local id status name
-    id=$(echo "$line" | awk '{print $1}')
-    [[ "$id" =~ ^[0-9]+$ ]] || continue
-    
-    status=$(echo "$line" | awk '{print $2}')
-    name=$(echo "$line" | awk '{print $NF}')
-    
+  CT_NODE=()
+
+  local resources id status name node
+  resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || {
+    echo "ERROR: Cannot query cluster containers." >&2
+    return 1
+  }
+  while IFS=$'\t' read -r id status name node; do
+    [[ "$id" =~ ^[1-9][0-9]*$ && -n "$name" && -n "$node" ]] || continue
     CT_MAP["$id"]="$name"
-    CT_STATUS["$id"]="$status"
+    CT_STATUS["$id"]="${status:-unknown}"
+    CT_NODE["$id"]="$node"
     CT_LIST+=("$id")
-  done < <(pct list)
+  done < <(jq -r '.[] | select(.type == "lxc") | [.vmid, (.status // "unknown"), (.name // ""), (.node // "")] | @tsv' \
+    <<< "$resources" | sort -n)
 }
 
 # Display interactive single-select container menu using whiptail
@@ -3454,7 +3646,7 @@ select_ct_interactive_single() {
     status="${CT_STATUS[$id]}"
     hostname="${CT_MAP[$id]}"
     # Pad text to fixed width for consistent listbox appearance
-    item_text=$(printf "%-${item_width}s" "${hostname} [${status}]")
+    item_text=$(printf "%-${item_width}s" "${hostname} [${status}@${CT_NODE[$id]}]")
     # Pre-select first item
     if [[ "$first" == "true" ]]; then
       selected="ON"
@@ -3539,7 +3731,7 @@ select_ct_interactive_multi() {
     status="${CT_STATUS[$id]}"
     hostname="${CT_MAP[$id]}"
     # Pad text to fixed width for consistent listbox appearance
-    item_text=$(printf "%-${item_width}s" "${hostname} [${status}]")
+    item_text=$(printf "%-${item_width}s" "${hostname} [${status}@${CT_NODE[$id]}]")
     checklist_args+=("$id" "$item_text" "OFF")
   done
   
@@ -3914,9 +4106,10 @@ validate_os_root_headroom() {
 # Returns: always 0; unhealthy storage is reported as a warning.
 check_ct_storage_health() {
   local ctid="$1"
-  local config storages storage reason
+  local config storages storage reason node
 
-  config=$(pct config "$ctid" 2>/dev/null) || {
+  node=$(get_ct_owner_node "$ctid" 2>/dev/null || true)
+  config=$(pct_config "$ctid" 2>/dev/null) || {
     echo "  [!] Cannot read config for CT ${ctid}; skipping storage health check" >&2
     return 0
   }
@@ -3929,7 +4122,13 @@ check_ct_storage_health() {
     | sort -u)
 
   for storage in $storages; do
-    if ! reason=$(check_storage_health "$storage"); then
+    reason=""
+    if [[ "$node" == "$(hostname -s)" ]]; then
+      reason=$(check_storage_health "$storage") || true
+    else
+      reason=$(run_node_shell "$node" "$(declare -f check_storage_health); check_storage_health '$storage'" 2>/dev/null) || true
+    fi
+    if [[ -n "$reason" ]]; then
       echo "  [!] CT ${ctid}: storage health warning: ${reason}" >&2
     fi
   done
@@ -3942,7 +4141,7 @@ check_ct_storage_health() {
 # Returns: status string (running, stopped, etc.)
 get_ct_status() {
   local ctid="${1:-$CTID}"
-  pct status "$ctid" 2>/dev/null | awk '{print $2}'
+  pct_status "$ctid" 2>/dev/null | awk '{print $2}'
 }
 
 # Wait for a CT to become unlocked AND running, polling with exponential backoff.
@@ -3961,7 +4160,7 @@ wait_for_ct_unlock() {
   local lock_reason announced=false
 
   while true; do
-    lock_reason=$(pct config "${ctid}" 2>/dev/null | grep -oP '^lock:\s*\K\S+' || true)
+    lock_reason=$(pct_config "${ctid}" 2>/dev/null | grep -oP '^lock:\s*\K\S+' || true)
 
     if [[ -z "$lock_reason" ]] && [[ "$(get_ct_status "$ctid")" == "running" ]]; then
       [[ "$announced" == "true" ]] && echo "  [✓] CT ${ctid} is unlocked and running"
@@ -4013,7 +4212,7 @@ ensure_ct_running() {
   
   if [[ "$status" == "stopped" ]]; then
     echo "CT ${ctid} is stopped, starting it..."
-    pct start "$ctid"
+    pct_start "$ctid"
     sleep 3
     
     # Verify it started
@@ -4077,15 +4276,18 @@ ct_exec() {
     cmd="$*"
   fi
   
+  local node
+  node=$(get_ct_owner_node "$ctid") || return 1
+
   if [[ -n "$ct_timeout" ]]; then
     local rc=0
-    timeout "${ct_timeout}" pct exec "$ctid" -- sh -c "$cmd" || rc=$?
+    run_on_node "$node" timeout "${ct_timeout}" pct exec "$ctid" -- sh -c "$cmd" || rc=$?
     if [[ $rc -eq 124 ]]; then
       echo "  [!] Timeout: command exceeded ${ct_timeout}s in CT ${ctid}" >&2
     fi
     return $rc
   else
-    pct exec "$ctid" -- sh -c "$cmd"
+    run_on_node "$node" pct exec "$ctid" -- sh -c "$cmd"
   fi
 }
 
@@ -4094,7 +4296,7 @@ ct_exec() {
 # Returns: 0 if exists, 1 if not
 ct_exists() {
   local ctid="$1"
-  pct status "$ctid" &>/dev/null
+  get_ct_owner_node "$ctid" &>/dev/null
 }
 
 # Mirror the shared configure library into the CT before configure.sh runs.
@@ -4110,9 +4312,11 @@ ct_exists() {
 sync_config_shared() {
   local src="${SCRIPT_DIR}/configure"
   local dest="${DIR_DOCKER}/_config/shared"
+  local node
+  node=$(get_ct_owner_node "$CTID") || return 1
 
   # Only CTs that ship a _config/ (i.e. have a configure.sh) need the library.
-  if [[ ! -d "${DIR_DOCKER}/_config" ]]; then
+  if ! node_path_is_dir "$node" "${DIR_DOCKER}/_config"; then
     return 0
   fi
 
@@ -4121,9 +4325,7 @@ sync_config_shared() {
     return 0
   fi
 
-  rm -rf "$dest"
-  mkdir -p "$dest"
-  cp -a "${src}/." "${dest}/"
+  node_sync_tree "$node" "$src" "$dest"
   echo "  [✓] Synced shared configure library -> _config/shared"
 }
 
@@ -4141,8 +4343,10 @@ sync_config_shared() {
 # Returns: 0 on success or if no script exists, 1 on failure (non-fatal)
 run_configure_script() {
   local configure_script="${DIR_DOCKER}/_config/configure.sh"
+  local node
+  node=$(get_ct_owner_node "$CTID") || return 1
 
-  if [[ ! -f "$configure_script" ]]; then
+  if ! node_path_is_file "$node" "$configure_script"; then
     return 0
   fi
 
@@ -4150,7 +4354,7 @@ run_configure_script() {
   echo "--- configure.sh (${CT_HOSTNAME}) ---"
 
   # Ensure the script is executable
-  chmod +x "$configure_script"
+  run_on_node "$node" chmod +x -- "$configure_script"
 
   # Wait for Docker containers to be healthy (up to 120s)
   echo "  Waiting for containers to be healthy..."
@@ -4371,8 +4575,10 @@ setup_mountpoints() {
   DIR_DOCKER="/mnt/docker/${hostname_lower}"
   DIR_DOCKER_DATA="/mnt/docker-data/${hostname_lower}"
 
-  mkdir -p "$DIR_DOCKER"
-  mkdir -p "$DIR_DOCKER_DATA"
+  local node stage_dir stage_compose stage_env
+  node=$(get_ct_owner_node "$CTID") || return 1
+
+  node_mkdir "$node" "$DIR_DOCKER" "$DIR_DOCKER_DATA"
 
   echo "Created:"
   echo "  $DIR_DOCKER"
@@ -4381,20 +4587,31 @@ setup_mountpoints() {
   COMPOSE_FILE="${DIR_DOCKER}/docker-compose.yaml"
   ENV_FILE="${DIR_DOCKER}/.env"
 
-  if [[ ! -f "$COMPOSE_FILE" ]]; then
+  stage_dir=$(mktemp -d)
+  stage_compose="${stage_dir}/docker-compose.yaml"
+  stage_env="${stage_dir}/.env"
+  if ! node_path_is_file "$node" "$COMPOSE_FILE"; then
     echo "Creating template docker-compose.yaml at $COMPOSE_FILE"
-    create_compose_template "$COMPOSE_FILE"
+    create_compose_template "$stage_compose"
+    node_upload_file "$node" "$stage_compose" "$COMPOSE_FILE" 0644
   fi
 
   echo "Updating .env at $ENV_FILE"
-  update_env_file "$ENV_FILE"
+  if node_path_is_file "$node" "$ENV_FILE"; then
+    node_download_file "$node" "$ENV_FILE" "$stage_env"
+  else
+    : > "$stage_env"
+  fi
+  update_env_file "$stage_env"
+  node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600
+  rm -rf "$stage_dir"
 
   # Idempotent mount setup: only reconfigure if mounts are missing or incorrect
   echo "Verifying bind mounts..."
   
   local current_mp0 current_mp1 needs_update=0
   local config_output
-  config_output=$(pct config "$CTID" 2>/dev/null)
+  config_output=$(pct_config "$CTID" 2>/dev/null)
   
   # Extract current mp0 and mp1 paths (format: mp0: /path/on/host,mp=/path/in/ct)
   # `|| true`: a fresh CT has no mp lines, so grep exits 1; under `set -euo pipefail`
@@ -4415,13 +4632,13 @@ setup_mountpoints() {
     echo "Removing existing mountpoints..."
     for mp in $(echo "$config_output" | awk -F: '/^mp[0-9]+/ {print $1}'); do
       echo "  deleting $mp"
-      pct set "$CTID" -delete "$mp"
+      pct_set "$CTID" -delete "$mp"
     done
     
     # Add correct mounts
     echo "Adding correct bind mounts..."
-    pct set "$CTID" -mp0 "${DIR_DOCKER},mp=/mnt/docker"
-    pct set "$CTID" -mp1 "${DIR_DOCKER_DATA},mp=/mnt/docker-data"
+    pct_set "$CTID" -mp0 "${DIR_DOCKER},mp=/mnt/docker"
+    pct_set "$CTID" -mp1 "${DIR_DOCKER_DATA},mp=/mnt/docker-data"
     echo "Mountpoints updated."
   else
     echo "Mountpoints already correct:"
@@ -4474,7 +4691,7 @@ compose_permission_host_mapping() {
     [[ "$canonical_candidate" == "$canonical_root"/* ]] || return 1
     printf '%s\t%s\n' "$canonical_root" "$canonical_candidate"
     return 0
-  done < <(pct config "$ctid" 2>/dev/null)
+  done < <(pct_config "$ctid" 2>/dev/null)
 
   return 1
 }

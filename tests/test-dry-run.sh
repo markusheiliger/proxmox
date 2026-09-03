@@ -25,7 +25,7 @@ run_delete_dry_run() {
   local output="$2" mutations="$3"
   (
     source "${SCRIPT_DIR}/deleteCT.sh"
-    build_ct_list() { CT_LIST=(2100); CT_MAP[2100]="app.thesaints.home"; CT_STATUS[2100]="running"; }
+    build_ct_list() { CT_LIST=(2100); CT_MAP[2100]="app.thesaints.home"; CT_STATUS[2100]="running"; CT_NODE[2100]="pve01"; }
     resolve_ct_from_input() { CTID=2100; CT_HOSTNAME="app.thesaints.home"; }
     validate_node_storage_contract() { return 0; }
     get_ct_dirs() {
@@ -85,7 +85,14 @@ run_rename_dry_run() {
       CT_MAP[2200]="other.thesaints.home"
       CT_STATUS[2100]="running"
       CT_STATUS[2200]="running"
+      CT_NODE[2100]="pve01"
+      CT_NODE[2200]="pve01"
     }
+    get_ct_owner_node() { echo pve01; }
+    node_path_exists() { [[ -e "$2" ]]; }
+    node_path_is_file() { [[ -f "$2" ]]; }
+    node_du() { du -sh -- "$2"; }
+    run_node_shell() { sh -c "$2"; }
     get_ct_dirs() {
       DIR_DOCKER="${TEST_ROOT}/docker/$1"
       DIR_DOCKER_DATA="${TEST_ROOT}/docker-data/$1"

@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/commonCT.sh"
 
 TARGET_NODE=""
-SOURCE_NODE="$(hostname -s)"
+SOURCE_NODE=""
 DRY_RUN=false
 FORCE=false
 MOVE_ACTION="move"
@@ -215,25 +215,6 @@ remote() {
     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$TARGET_NODE" "$@"
 }
 
-run_on_node() {
-  local node="${1:-}" argument quoted command=""
-  shift || true
-  if [[ "$node" == "$SOURCE_NODE" ]]; then
-    "$@"
-    return
-  fi
-  if [[ "$node" == "$TARGET_NODE" ]]; then
-    for argument in "$@"; do
-      printf -v quoted '%q' "$argument"
-      command+="${command:+ }${quoted}"
-    done
-    remote "$command"
-    return
-  fi
-  echo "ERROR: Move command requested for unexpected node '${node}'." >&2
-  return 1
-}
-
 # Match ct_exec's calling convention while executing against the target node.
 target_ct_exec() {
   local ct_timeout="" ctid cmd quoted_cmd command_prefix=""
@@ -250,7 +231,7 @@ target_ct_exec() {
 }
 
 collect_device_requirements() {
-  local compose_json="" source service
+  local compose_json="" source service compose_copy="" source_node="${SOURCE_NODE:-$(hostname -s)}"
   DEVICE_REQUIREMENTS=()
 
   if [[ "$ORIGINAL_STATUS" == "running" ]]; then
@@ -275,6 +256,11 @@ collect_device_requirements() {
           or any(.value.deploy.resources.reservations.devices[]?; any(.capabilities[]?; . == "gpu")))
       | "\($service)\tGPU_REQUEST"' <<< "$compose_json")
   else
+    compose_copy=$(mktemp)
+    node_download_file "$source_node" "$DIR_DOCKER/docker-compose.yaml" "$compose_copy" || {
+      rm -f "$compose_copy"
+      return 1
+    }
     # The fallback is intentionally limited to YAML list items whose value
     # starts with /dev. Searching every /dev token also mistakes command
     # redirections such as ">/dev/null" for host-device mappings.
@@ -300,7 +286,8 @@ collect_device_requirements() {
         split(value, fields, ":")
         print service "\t" fields[1]
       }
-    ' "$DIR_DOCKER/docker-compose.yaml" 2>/dev/null | sort -u || true)
+    ' "$compose_copy" 2>/dev/null | sort -u || true)
+    rm -f "$compose_copy"
   fi
 }
 
@@ -355,7 +342,7 @@ capture_original_networks() {
     value="${line#*: }"
     ORIGINAL_NETWORK_KEYS+=("$key")
     ORIGINAL_NETWORK_VALUES+=("$value")
-  done < <(pct config "$CTID" 2>/dev/null | grep -E '^net[0-9]+:' || true)
+  done < <(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | grep -E '^net[0-9]+:' || true)
   (( ${#ORIGINAL_NETWORK_KEYS[@]} > 0 )) || {
     echo "ERROR: CT ${CTID} has no netN devices to migrate." >&2
     return 1
@@ -407,7 +394,7 @@ validate_ct_storage_scope() {
         failures+=("${key}: unsupported managed mount storage '${storage}'")
       fi
     fi
-  done < <(pct config "$CTID" 2>/dev/null | grep -E '^(rootfs|mp[0-9]+):' || true)
+  done < <(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | grep -E '^(rootfs|mp[0-9]+):' || true)
 
   [[ "$docker_mount" == true ]] \
     || failures+=("required bind mount '${DIR_DOCKER},mp=/mnt/docker' is missing")
@@ -430,7 +417,7 @@ capture_original_mounts() {
     value="${line#*: }"
     ORIGINAL_MOUNT_KEYS+=("$key")
     ORIGINAL_MOUNT_VALUES+=("$value")
-  done < <(pct config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  done < <(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
 }
 
 validate_mounts_unchanged() {
@@ -439,7 +426,7 @@ validate_mounts_unchanged() {
     expected+="${ORIGINAL_MOUNT_KEYS[$index]}: ${ORIGINAL_MOUNT_VALUES[$index]}"$'\n'
   done
   expected="${expected%$'\n'}"
-  current=$(pct config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  current=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
   if [[ "$current" != "$expected" ]]; then
     echo "ERROR: CT bind mount configuration changed during pre-copy; refusing migration." >&2
     return 1
@@ -451,9 +438,9 @@ detach_source_mounts() {
   validate_mounts_unchanged || return 1
   MOUNT_TRANSACTION_STARTED=true
   for key in "${ORIGINAL_MOUNT_KEYS[@]}"; do
-    if pct config "$CTID" 2>/dev/null | grep -qE "^${key}:"; then
+    if run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | grep -qE "^${key}:"; then
       echo "  Detaching ${key} for rootfs migration"
-      pct set "$CTID" -delete "$key" || return 1
+      run_on_node "$SOURCE_NODE" pct set "$CTID" -delete "$key" || return 1
     fi
   done
 }
@@ -464,7 +451,7 @@ restore_source_mounts() {
     key="${ORIGINAL_MOUNT_KEYS[$index]}"
     value="${ORIGINAL_MOUNT_VALUES[$index]}"
     echo "  Restoring ${key} on ${SOURCE_NODE}"
-    pct set "$CTID" "-${key}" "$value" || return 1
+    run_on_node "$SOURCE_NODE" pct set "$CTID" "-${key}" "$value" || return 1
   done
   MOUNT_TRANSACTION_STARTED=false
 }
@@ -474,16 +461,16 @@ ensure_source_mounts_restored() {
   for index in "${!ORIGINAL_MOUNT_KEYS[@]}"; do
     key="${ORIGINAL_MOUNT_KEYS[$index]}"
     expected="${ORIGINAL_MOUNT_VALUES[$index]}"
-    current=$(pct config "$CTID" 2>/dev/null | sed -n "s/^${key}:[[:space:]]*//p" || true)
+    current=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n "s/^${key}:[[:space:]]*//p" || true)
     if [[ "$current" != "$expected" ]]; then
       echo "  Restoring ${key} on ${SOURCE_NODE}"
-      pct set "$CTID" "-${key}" "$expected" || return 1
+      run_on_node "$SOURCE_NODE" pct set "$CTID" "-${key}" "$expected" || return 1
     fi
   done
   for index in "${!ORIGINAL_MOUNT_KEYS[@]}"; do
     key="${ORIGINAL_MOUNT_KEYS[$index]}"
     expected="${ORIGINAL_MOUNT_VALUES[$index]}"
-    current=$(pct config "$CTID" 2>/dev/null | sed -n "s/^${key}:[[:space:]]*//p" || true)
+    current=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n "s/^${key}:[[:space:]]*//p" || true)
     [[ "$current" == "$expected" ]] || {
       echo "ERROR: Source mount ${key} does not match its original value after restoration." >&2
       return 1
@@ -517,7 +504,7 @@ detach_target_mounts() {
 
 get_ct_rootfs_size_gib() {
   local rootfs size
-  rootfs=$(pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
+  rootfs=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^rootfs:[[:space:]]*//p')
   size=$(sed -nE 's/.*(^|,)size=([0-9]+([.][0-9]+)?)([KMGT]).*/\2 \4/p' <<< "$rootfs")
   [[ -n "$size" ]] || { echo "ERROR: Cannot determine rootfs size for CT ${CTID}." >&2; return 1; }
   awk '$2 == "K" { print $1 / 1048576 }
@@ -686,18 +673,24 @@ wait_for_migration_task() {
 sync_to_target() {
   local delete_flag="${1:-false}"
   local options=(-aHAXS --numeric-ids --modify-window=-1 --human-readable --info=progress2,stats1)
+  local command option
   [[ "$delete_flag" == "true" ]] && options+=(--delete)
-  rsync "${options[@]}" -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
-    "${DIR_DOCKER}/" "${TARGET_NODE}:${DIR_DOCKER}/"
-  rsync "${options[@]}" -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
-    "${DIR_DOCKER_DATA}/" "${TARGET_NODE}:${DIR_DOCKER_DATA}/"
+  command="rsync"
+  for option in "${options[@]}"; do printf -v option '%q' "$option"; command+=" ${option}"; done
+  command+=" -e 'ssh -o BatchMode=yes -o ConnectTimeout=10'"
+  run_node_shell "$SOURCE_NODE" "${command} '${DIR_DOCKER}/' '${TARGET_NODE}:${DIR_DOCKER}/'"
+  run_node_shell "$SOURCE_NODE" "${command} '${DIR_DOCKER_DATA}/' '${TARGET_NODE}:${DIR_DOCKER_DATA}/'"
 }
 
 verify_target_tree() {
-  local path="$1" label="$2" differences
-  if ! differences=$(rsync -aHAXSnic --delete --modify-window=-1 \
-    --out-format='%i %n%L' -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
-    "${path}/" "${TARGET_NODE}:${path}/"); then
+  local path="$1" label="$2" differences source_node="${SOURCE_NODE:-$(hostname -s)}"
+  if [[ "$source_node" == "$(hostname -s)" ]]; then
+    differences=$(rsync -aHAXSnic --delete --modify-window=-1 \
+      --out-format='%i %n%L' -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
+      "${path}/" "${TARGET_NODE}:${path}/") \
+      || abort_move "${label} verification could not compare source and target."
+  elif ! differences=$(run_node_shell "$source_node" \
+    "rsync -aHAXSnic --delete --modify-window=-1 --out-format='%i %n%L' -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' '${path}/' '${TARGET_NODE}:${path}/'"); then
     abort_move "${label} verification could not compare source and target."
   fi
   if [[ -n "$differences" ]]; then
@@ -707,10 +700,8 @@ verify_target_tree() {
 }
 
 sync_back_to_source() {
-  rsync -aHAXS --numeric-ids --delete --human-readable --info=progress2,stats1 -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
-    "${TARGET_NODE}:${DIR_DOCKER}/" "${DIR_DOCKER}/"
-  rsync -aHAXS --numeric-ids --delete --human-readable --info=progress2,stats1 -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' \
-    "${TARGET_NODE}:${DIR_DOCKER_DATA}/" "${DIR_DOCKER_DATA}/"
+  remote "rsync -aHAXS --numeric-ids --delete --human-readable --info=progress2,stats1 -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' '${DIR_DOCKER}/' '${SOURCE_NODE}:${DIR_DOCKER}/'"
+  remote "rsync -aHAXS --numeric-ids --delete --human-readable --info=progress2,stats1 -e 'ssh -o BatchMode=yes -o ConnectTimeout=10' '${DIR_DOCKER_DATA}/' '${SOURCE_NODE}:${DIR_DOCKER_DATA}/'"
 }
 
 find_backup_seed() {
@@ -765,7 +756,7 @@ seed_target_or_fallback() {
 
 restore_original_gpu_config() {
   local config_file="/etc/pve/lxc/${CTID}.conf"
-  sed -i \
+  run_on_node "$SOURCE_NODE" sed -i \
     -e '\|^lxc.cgroup2.devices.allow: c 226:\* rwm$|d' \
     -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
     "$config_file"
@@ -781,7 +772,7 @@ get_ct_owner_node() {
 reconcile_source_bridge_after_migration() {
   local attempt lock=""
   for ((attempt = 1; attempt <= 30; attempt++)); do
-    lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+    lock=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
     if [[ -z "$lock" ]] \
       && bridge_policy_reconcile_guest "$SOURCE_NODE" CT "$CTID" "$SOURCE_BRIDGE"; then
       return 0
@@ -895,7 +886,7 @@ rollback() {
   restore_original_gpu_config || true
   if [[ "$ORIGINAL_STATUS" == "running" ]]; then
     if [[ "$(get_ct_status "$CTID")" != running ]]; then
-      pct start "$CTID" || {
+      run_on_node "$SOURCE_NODE" pct start "$CTID" || {
         echo "[✗] CT ${CTID} source configuration was restored, but its original running state could not be restored." >&2
         move_status_cleanup
         exit "$recovery_failure_code"
@@ -973,11 +964,13 @@ safe_remove_source_data() {
       "/mnt/docker-data/${CT_HOSTNAME}") expected="$path" ;;
       *) echo "ERROR: Refusing unsafe source cleanup path '${path}'." >&2; return 1 ;;
     esac
-    [[ ! -L "$path" ]] || { echo "ERROR: Refusing symlink cleanup '${path}'." >&2; return 1; }
-    canonical=$(realpath -e "$path")
+    ! node_path_is_symlink "$SOURCE_NODE" "$path" \
+      || { echo "ERROR: Refusing symlink cleanup '${path}'." >&2; return 1; }
+    canonical=$(node_realpath "$SOURCE_NODE" "$path") \
+      || { echo "ERROR: Cannot resolve source cleanup path '${path}' on ${SOURCE_NODE}." >&2; return 1; }
     [[ "$canonical" == "$expected" ]] || { echo "ERROR: Cleanup path changed: '${canonical}'." >&2; return 1; }
   done
-  rm -rf --one-file-system -- "$DIR_DOCKER" "$DIR_DOCKER_DATA"
+  run_on_node "$SOURCE_NODE" rm -rf --one-file-system -- "$DIR_DOCKER" "$DIR_DOCKER_DATA"
 }
 
 report_move_status() {
@@ -993,7 +986,7 @@ report_move_status() {
     fi
   fi
   if [[ "$owner" == "$SOURCE_NODE" ]]; then
-    lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+    lock=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   elif [[ "$owner" == "$TARGET_NODE" ]]; then
     lock=$(remote "pct config '$CTID'" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   fi
@@ -1102,11 +1095,12 @@ run_move_transaction() {
   fi
 
   if phase_before stopped_sync_complete; then
-    ct_lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+    ct_lock=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
     [[ -z "$ct_lock" ]] || abort_move "CT ${CTID} became locked during pre-copy (${ct_lock})."
     move_status_progress 5 "Stopping CT for final synchronization..."
     if [[ "$ORIGINAL_STATUS" == "running" ]]; then
-      pct shutdown "$CTID" --timeout 60 || pct stop "$CTID"
+      run_on_node "$SOURCE_NODE" pct shutdown "$CTID" --timeout 60 \
+        || run_on_node "$SOURCE_NODE" pct stop "$CTID"
       ensure_ct_stopped "$CTID"
     fi
     move_status_progress 6 "Applying final stopped workload delta..."
@@ -1205,7 +1199,7 @@ main() {
     lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
   fi
 
-  [[ $EUID -eq 0 ]] || { echo "ERROR: Run moveCT.sh as root on the source node." >&2; exit 1; }
+  [[ $EUID -eq 0 ]] || { echo "ERROR: Run moveCT.sh as root on the administrative node." >&2; exit 1; }
   if [[ "$MOVE_ACTION" != move ]]; then
     resolve_move_state_input "$ct_arg" || true
     if [[ -n "$MOVE_STATE_FILE" && -f "$MOVE_STATE_FILE" ]]; then
@@ -1213,8 +1207,6 @@ main() {
       load_move_state
       report_move_status
       [[ "$MOVE_ACTION" != status ]] || exit 0
-      [[ "$(hostname -s)" == "$SOURCE_NODE" ]] \
-        || { echo "ERROR: Resume or abort this transaction on authoritative node ${SOURCE_NODE}." >&2; exit 1; }
       if [[ "$MOVE_ACTION" == abort ]]; then
         [[ "$FORCE" == true ]] || {
           read -rp "Abort and recover CT ${CTID} to ${SOURCE_NODE} when safe? [y/N]: " answer
@@ -1238,6 +1230,8 @@ main() {
   else
     select_ct_interactive_single "move" || exit 1
   fi
+  SOURCE_NODE="${CT_NODE[$CTID]:-}"
+  [[ -n "$SOURCE_NODE" ]] || { echo "ERROR: Cannot determine owner node for CT ${CTID}." >&2; exit 1; }
   if [[ "$MOVE_ACTION" == status ]]; then
     MOVE_STATE_FILE=$(move_state_path "$CTID")
     get_ct_dirs "$CT_HOSTNAME"
@@ -1263,7 +1257,7 @@ main() {
   get_ct_dirs "$CT_HOSTNAME"
   ORIGINAL_STATUS=$(get_ct_status "$CTID")
   [[ "$ORIGINAL_STATUS" == "running" || "$ORIGINAL_STATUS" == "stopped" ]] || { echo "ERROR: Unsupported CT status '${ORIGINAL_STATUS}'." >&2; exit 1; }
-  ct_lock=$(pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
+  ct_lock=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   [[ -z "$ct_lock" ]] || { echo "ERROR: CT ${CTID} is locked (${ct_lock})." >&2; exit 1; }
   validate_ct_storage_scope || exit 1
   capture_original_mounts
@@ -1277,7 +1271,9 @@ main() {
   validate_target_devices || exit 1
   inspect_migration_bandwidth "$rootfs_size_gib"
 
-  [[ -d "$DIR_DOCKER" && -d "$DIR_DOCKER_DATA" ]] || { echo "ERROR: Source bind trees are incomplete." >&2; exit 1; }
+  node_path_is_dir "$SOURCE_NODE" "$DIR_DOCKER" \
+    && node_path_is_dir "$SOURCE_NODE" "$DIR_DOCKER_DATA" \
+    || { echo "ERROR: Source bind trees are incomplete on ${SOURCE_NODE}." >&2; exit 1; }
   if remote "test -e '$DIR_DOCKER' -o -e '$DIR_DOCKER_DATA'"; then
     echo "ERROR: Target bind paths already exist; refusing ambiguous merge." >&2
     exit 1

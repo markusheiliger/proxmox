@@ -2442,9 +2442,10 @@ detect_node_gpu_capability() {
 ct_gpu_config_matches_capability() {
   local ctid="$1"
   local config_file="/etc/pve/lxc/${ctid}.conf"
-  local has_allow=false has_mount=false
-  grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null && has_allow=true
-  grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null && has_mount=true
+  local node has_allow=false has_mount=false
+  node=$(get_ct_owner_node "$ctid") || return 1
+  run_on_node "$node" grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null && has_allow=true
+  run_on_node "$node" grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null && has_mount=true
 
   if [[ "$NODE_GPU_STATE" == "available" ]]; then
     [[ "$has_allow" == "true" && "$has_mount" == "true" ]]
@@ -2456,21 +2457,23 @@ ct_gpu_config_matches_capability() {
 reconcile_stopped_ct_gpu_config() {
   local ctid="$1"
   local config_file="/etc/pve/lxc/${ctid}.conf"
+  local node
+  node=$(get_ct_owner_node "$ctid") || return 1
 
   if [[ "$(get_ct_status "$ctid")" != "stopped" ]]; then
     echo "ERROR: CT ${ctid} must be stopped before GPU config reconciliation." >&2
     return 1
   fi
 
-  sed -i \
+  run_on_node "$node" sed -i \
     -e '\|^lxc.cgroup2.devices.allow: c 226:\* rwm$|d' \
     -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
     "$config_file"
 
   if [[ "$NODE_GPU_STATE" == "available" ]]; then
-    printf '%s\n' \
+    run_node_shell "$node" "printf '%s\\n' \
       'lxc.cgroup2.devices.allow: c 226:* rwm' \
-      'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' >> "$config_file"
+      'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' >> '$config_file'"
     echo "  [✓] CT ${ctid}: exposing ${#NODE_GPU_RENDER_DEVICES[@]} DRM render device(s)"
   else
     echo "  [✓] CT ${ctid}: removed managed DRM passthrough (no GPU on node)"
@@ -2521,6 +2524,42 @@ finalize_ct_gpu_capability() {
     fi
   done
   echo "  [✓] CT ${ctid}: all DRM render devices are accessible"
+}
+
+# Run Docker Compose inside a CT through the optional hardware-profile wrapper.
+# CTs without the delivered wrapper retain the legacy direct Compose behavior.
+# Usage: ct_compose [--timeout SECONDS] [--all-profiles] [CTID] ARGS...
+ct_compose() {
+  local timeout=300 all_profiles=false ctid="${CTID}" argument quoted command
+  if [[ "${1:-}" == --timeout ]]; then
+    timeout="${2:-}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: Invalid ct_compose timeout." >&2; return 2; }
+    shift 2
+  fi
+  if [[ "${1:-}" == --all-profiles ]]; then
+    all_profiles=true
+    shift
+  fi
+  if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+    ctid="$1"
+    shift
+  fi
+  [[ $# -gt 0 ]] || { echo "ERROR: ct_compose requires Compose arguments." >&2; return 2; }
+
+  command='cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then exec ./_config/shared/compose-profile.sh'
+  [[ "$all_profiles" == true ]] && command+=' --all-profiles'
+  command+=' --'
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+=" ${quoted}"
+  done
+  command+='; else exec docker compose'
+  for argument in "$@"; do
+    printf -v quoted '%q' "$argument"
+    command+=" ${quoted}"
+  done
+  command+='; fi'
+  ct_exec --timeout "$timeout" "$ctid" "$command"
 }
 
 # Configure container registry authentication for Docker
@@ -2592,19 +2631,22 @@ is_transient_registry_error() {
 compose_pull() {
   local ctid="${1:-${CTID}}"
 
-  # Get all profiles defined in the compose file and build --profile flags
-  local profile_flags
-  profile_flags=$(ct_exec --timeout 30 "${ctid}" 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
-    while read -r profile; do echo -n "--profile $profile "; done)
+  # Pull every profile without selecting current hardware; pull creates no containers.
+  local -a profiles=() pull_args=()
+  local profile
+  mapfile -t profiles < <(ct_compose --timeout 30 --all-profiles "${ctid}" config --profiles 2>/dev/null)
+  for profile in "${profiles[@]}"; do
+    [[ -n "$profile" ]] && pull_args+=(--profile "$profile")
+  done
+  pull_args+=(pull)
 
   local max_attempts=5
   local attempt output backoff
-  local pull_cmd="cd /mnt/docker && docker compose ${profile_flags}pull"
 
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
     echo "  Pulling images (attempt ${attempt}/${max_attempts})..."
 
-    if output=$(ct_exec --timeout 600 "${ctid}" "${pull_cmd}" 2>&1); then
+    if output=$(ct_compose --timeout 600 --all-profiles "${ctid}" "${pull_args[@]}" 2>&1); then
       [[ -n "$output" ]] && echo "$output"
       return 0
     fi
@@ -2716,9 +2758,9 @@ compose_up() {
   fi
   
   # Build compose command with optional published profile
-  local profile_flag=""
+  local -a profile_args=()
   if [[ -n "$newt_id" && -n "$newt_secret" && -n "$newt_endpoint" ]]; then
-    profile_flag="--profile published"
+    profile_args=(--profile published)
     echo "  Newt tunnel enabled (published profile)"
   fi
 
@@ -2726,12 +2768,12 @@ compose_up() {
   # --pull missing here: start from cached images and avoid a redundant network hit.
   local max_attempts=3
   local attempt output
-  local compose_cmd="cd /mnt/docker && docker compose ${profile_flag} up -d --pull missing --remove-orphans"
+  local -a compose_args=("${profile_args[@]}" up -d --pull missing --remove-orphans)
 
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
     echo "  Starting services (attempt ${attempt}/${max_attempts})..."
 
-    if output=$(ct_exec --timeout 300 "${ctid}" "${compose_cmd}" 2>&1); then
+    if output=$(ct_compose --timeout 300 "${ctid}" "${compose_args[@]}" 2>&1); then
       [[ -n "$output" ]] && echo "$output"
       return 0
     fi
@@ -2777,13 +2819,15 @@ compose_up() {
 # Returns: exit code from docker compose
 compose_down() {
   local ctid="${1:-${CTID}}"
-  
-  # Get all profiles defined in the compose file and build --profile flags
-  local profile_flags
-  profile_flags=$(ct_exec --timeout 30 "${ctid}" 'cd /mnt/docker && docker compose config --profiles 2>/dev/null' | \
-    while read -r profile; do echo -n "--profile $profile "; done)
-  
-  ct_exec --timeout 300 "${ctid}" "cd /mnt/docker && docker compose ${profile_flags} down"
+
+  local -a profiles=() down_args=()
+  local profile
+  mapfile -t profiles < <(ct_compose --timeout 30 --all-profiles "${ctid}" config --profiles 2>/dev/null)
+  for profile in "${profiles[@]}"; do
+    [[ -n "$profile" ]] && down_args+=(--profile "$profile")
+  done
+  down_args+=(down)
+  ct_compose --timeout 300 --all-profiles "${ctid}" "${down_args[@]}"
 }
 
 # Reboot a container
@@ -4327,6 +4371,39 @@ sync_config_shared() {
 
   node_sync_tree "$node" "$src" "$dest"
   echo "  [✓] Synced shared configure library -> _config/shared"
+
+  configure_compose_profile_boot "$CTID"
+}
+
+# Reconcile profile-aware Compose stacks after Docker starts on Alpine boot.
+# CTs without a selector are explicitly kept free of this optional service.
+configure_compose_profile_boot() {
+  local ctid="${1:-${CTID}}"
+  if ! ct_exec --timeout 10 "$ctid" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+    ct_exec --timeout 15 "$ctid" \
+      'if [ -e /etc/init.d/compose-profile ]; then rc-update del compose-profile default >/dev/null 2>&1 || true; rm -f /etc/init.d/compose-profile; fi'
+    return 0
+  fi
+
+  ct_exec --timeout 30 "$ctid" 'cat > /etc/init.d/compose-profile <<'"'"'OPENRC'"'"'
+#!/sbin/openrc-run
+description="Select hardware profile and reconcile Docker Compose"
+
+depend() {
+  need docker
+  after networking
+}
+
+start() {
+  ebegin "Reconciling Docker Compose hardware profile"
+  cd /mnt/docker || return 1
+  ./_config/shared/compose-profile.sh up -d --pull missing --remove-orphans
+  eend $?
+}
+OPENRC
+chmod 0755 /etc/init.d/compose-profile
+rc-update add compose-profile default >/dev/null 2>&1'
+  echo "  [✓] Compose hardware-profile boot reconciliation configured"
 }
 
 # Run per-CT configure.sh script (if present)
@@ -4359,7 +4436,7 @@ run_configure_script() {
   # Wait for Docker containers to be healthy (up to 120s)
   echo "  Waiting for containers to be healthy..."
   local retries=24
-  while ! ct_exec --timeout 10 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | head -1 | grep -q .' 2>/dev/null; do
+  while ! ct_compose --timeout 10 ps --status running --quiet 2>/dev/null | head -1 | grep -q .; do
     retries=$((retries - 1))
     if [[ $retries -le 0 ]]; then
       echo "  [!] Containers not healthy after 120s, running configure.sh anyway"
@@ -4394,6 +4471,8 @@ run_configure_script() {
 #
 update_env_file() {
   local env_file="$1"
+  local ct_config_dir="${2:-$(dirname "$env_file")/_config}"
+  local config_node="${3:-}"
   local target_hostname="${CT_HOSTNAME:-${HOSTNAME:-}}"
   if [[ -z "$target_hostname" ]]; then
     echo "ERROR: No hostname available for update_env_file"
@@ -4463,10 +4542,17 @@ update_env_file() {
     remove_env_key "AUTH_HOSTNAME"
   fi
 
-  local ct_config_dir auth_token auth_authorization_flow auth_invalidation_flow
-  ct_config_dir="$(dirname "$env_file")/_config"
-  if [[ -n "$auth_host" && -f "${ct_config_dir}/configure.sh" ]] \
-     && grep -q 'lib-authentik' "${ct_config_dir}/configure.sh" 2>/dev/null; then
+  local auth_token auth_authorization_flow auth_invalidation_flow has_auth_config=false
+  if [[ -n "$config_node" ]]; then
+    if node_path_is_file "$config_node" "${ct_config_dir}/configure.sh" \
+       && run_on_node "$config_node" grep -q 'lib-authentik' "${ct_config_dir}/configure.sh" 2>/dev/null; then
+      has_auth_config=true
+    fi
+  elif [[ -f "${ct_config_dir}/configure.sh" ]] \
+       && grep -q 'lib-authentik' "${ct_config_dir}/configure.sh" 2>/dev/null; then
+    has_auth_config=true
+  fi
+  if [[ -n "$auth_host" && "$has_auth_config" == true ]]; then
     auth_token=$(config_get_authentik_token)
     auth_authorization_flow=$(config_get_authentik_authorization_flow)
     auth_invalidation_flow=$(config_get_authentik_invalidation_flow)
@@ -4602,7 +4688,7 @@ setup_mountpoints() {
   else
     : > "$stage_env"
   fi
-  update_env_file "$stage_env"
+  update_env_file "$stage_env" "${DIR_DOCKER}/_config" "$node"
   node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600
   rm -rf "$stage_dir"
 
@@ -4669,6 +4755,16 @@ compose_permission_shell_quote() {
 compose_permission_ct_exec() {
   local executor="${COMPOSE_PERMISSION_EXECUTOR:-ct_exec}"
   "$executor" "$@"
+}
+
+compose_permission_render() {
+  local ctid="$1"
+  if [[ "${COMPOSE_PERMISSION_EXECUTOR:-ct_exec}" == ct_exec ]]; then
+    ct_compose --timeout 30 "$ctid" config --format json
+  else
+    compose_permission_ct_exec --timeout 30 "$ctid" \
+      'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --format json; else docker compose config --format json; fi'
+  fi
 }
 
 # Resolve a managed CT-local bind source through the CT's actual mp configuration.
@@ -4820,8 +4916,7 @@ reconcile_compose_permissions() {
     return 1
   }
 
-  compose_json=$(compose_permission_ct_exec --timeout 30 "$ctid" \
-    'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
+  compose_json=$(compose_permission_render "$ctid" 2>/dev/null) || {
     echo "  [!] Could not render Compose permission plan" >&2
     return 1
   }

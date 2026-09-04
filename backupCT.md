@@ -43,6 +43,12 @@ The job is not enabled until its audit passes. Backup policy, NFS storage,
 source datasets, TEMP sizing, retention, and job schedule come from
 `commonCT.json`.
 
+`--audit`, `--verify`, and `--run` verify that the installed workload hook,
+policy, and backup-health library match the repository sources. If any node has
+drifted, run `--install-hook` before starting another backup. This prevents an
+older hook with unbounded rsync progress output from re-entering the task-log
+backpressure failure mode.
+
 The installed 15-minute reconciler timer uses leader election to refresh exact
 CT and QEMU VMID lists. This enrolls resources created directly through
 Proxmox. It updates existing jobs only; create the separate VM job with
@@ -124,6 +130,16 @@ reconciles validated stale hook state, pending snapshots, and exact-pattern
 temporary artifacts older than 24 hours. Unknown and recent artifacts are
 retained for inspection. `--provision-temp` grows undersized staging storage but
 never shrinks it. Use `--verify` after every manual run and after recovery.
+
+A Proxmox `lock: backup` is separate from hook state and temporary artifacts.
+Audit, verification, and the periodic job reconciler report an idle backup lock
+as stale only after the newest complete pair exceeds 26 hours. Detection is
+read-only and never unlocks a CT. Before recovery, inspect active Proxmox tasks
+and host processes on the CT's owner node. Only after proving that no backup
+owns the lock, clear it with `pct unlock <CTID>`, rerun `--audit`, back up that
+CT immediately, and finish with `--verify`. Do not edit the CT configuration or
+use `--cleanup-stale` as a substitute for clearing a confirmed stale Proxmox
+lock.
 
 ## Related
 

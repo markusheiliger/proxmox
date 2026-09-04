@@ -897,6 +897,13 @@ rollback() {
       move_status_cleanup
       exit "$recovery_failure_code"
     }
+    if ct_exec --timeout 10 "$CTID" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+      compose_up "$CTID" || {
+        echo "[✗] CT ${CTID} restarted on ${SOURCE_NODE}, but its selected hardware profile could not be reconciled." >&2
+        move_status_cleanup
+        exit "$recovery_failure_code"
+      }
+    fi
   elif [[ "$(get_ct_status "$CTID")" != stopped ]]; then
     echo "[✗] CT ${CTID} did not retain its original stopped state; target data and transaction state were retained." >&2
     move_status_cleanup
@@ -916,9 +923,9 @@ rollback() {
 
 verify_target_services() {
   local service state health attempt
-  remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && docker compose config --quiet'"
+  remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --quiet; else docker compose config --quiet; fi'"
   COMPOSE_PERMISSION_EXECUTOR=target_ct_exec reconcile_compose_permissions "$CTID"
-  remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && docker compose up -d'"
+  remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh up -d --remove-orphans; else docker compose up -d --remove-orphans; fi'"
 
   while IFS= read -r service; do
     [[ -n "$service" ]] || continue
@@ -1099,6 +1106,9 @@ run_move_transaction() {
     [[ -z "$ct_lock" ]] || abort_move "CT ${CTID} became locked during pre-copy (${ct_lock})."
     move_status_progress 5 "Stopping CT for final synchronization..."
     if [[ "$ORIGINAL_STATUS" == "running" ]]; then
+      if ct_exec --timeout 10 "$CTID" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+        compose_down "$CTID"
+      fi
       run_on_node "$SOURCE_NODE" pct shutdown "$CTID" --timeout 60 \
         || run_on_node "$SOURCE_NODE" pct stop "$CTID"
       ensure_ct_stopped "$CTID"

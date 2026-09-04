@@ -16,6 +16,9 @@ HOOK_CONFIG="/etc/pve-workload-backup.conf"
 RECONCILER_SOURCE="${SCRIPT_DIR}/backup/reconcile-backup-jobs"
 RECONCILER_SERVICE="${SCRIPT_DIR}/backup/reconcile-backup-jobs.service"
 RECONCILER_TIMER="${SCRIPT_DIR}/backup/reconcile-backup-jobs.timer"
+BACKUP_HEALTH_SOURCE="${SCRIPT_DIR}/backup/lib-backup-health.sh"
+# shellcheck source=backup/lib-backup-health.sh
+source "$BACKUP_HEALTH_SOURCE"
 
 usage() {
   cat <<'EOF'
@@ -90,6 +93,7 @@ hook_policy_content() {
 
 audit_cluster() {
   local node failed=false
+  verify_hook_cluster || failed=true
   export_hook_policy
   while IFS= read -r node; do
     echo "Auditing ${node}..."
@@ -101,6 +105,13 @@ audit_cluster() {
     fi
   done < <(online_nodes)
   [[ "$failed" == false ]]
+}
+
+check_cluster_backup_locks() {
+  local resources mount_path
+  resources=$(pvesh get /cluster/resources --type vm --output-format json)
+  mount_path="/mnt/pve/$(config_get_backup_storage)"
+  check_stale_backup_locks "$resources" "$mount_path"
 }
 
 prepare_backup_tmpdir_cluster() {
@@ -166,12 +177,15 @@ install_prerequisites_cluster() {
 
 install_hook_cluster() {
   local node hook_path checksum installed_checksum temporary policy policy_checksum installed_policy_checksum policy_temporary
+  local health_path health_checksum installed_health_checksum health_temporary
   install_prerequisites_cluster
   prepare_backup_tmpdir_cluster
   hook_path=$(config_get_backup_hook_path)
   checksum=$(sha256sum "$HOOK_SOURCE" | awk '{print $1}')
   policy=$(hook_policy_content)
   policy_checksum=$(printf '%s\n' "$policy" | sha256sum | awk '{print $1}')
+  health_path=/usr/local/lib/pve-backup/lib-backup-health.sh
+  health_checksum=$(sha256sum "$BACKUP_HEALTH_SOURCE" | awk '{print $1}')
   while IFS= read -r node; do
     if [[ "$DRY_RUN" == true ]]; then
       echo "Would install the workload hook, backup policy, and job reconciler on ${node}."
@@ -180,6 +194,7 @@ install_hook_cluster() {
     if [[ "$node" == "$(hostname -s)" ]]; then
       install -D -o root -g root -m 0755 "$HOOK_SOURCE" "$hook_path"
       install -D -o root -g root -m 0755 "$RECONCILER_SOURCE" /usr/local/sbin/reconcile-backup-jobs
+      install -D -o root -g root -m 0644 "$BACKUP_HEALTH_SOURCE" "$health_path"
       install -D -o root -g root -m 0644 "$RECONCILER_SERVICE" /etc/systemd/system/reconcile-backup-jobs.service
       install -D -o root -g root -m 0644 "$RECONCILER_TIMER" /etc/systemd/system/reconcile-backup-jobs.timer
       policy_temporary=$(mktemp)
@@ -188,45 +203,57 @@ install_hook_cluster() {
       rm -f "$policy_temporary"
       installed_checksum=$(sha256sum "$hook_path" | awk '{print $1}')
       installed_policy_checksum=$(sha256sum "$HOOK_CONFIG" | awk '{print $1}')
+      installed_health_checksum=$(sha256sum "$health_path" | awk '{print $1}')
       systemctl daemon-reload
       systemctl enable --now reconcile-backup-jobs.timer
     else
       temporary="${hook_path}.tmp.$$"
       policy_temporary="${HOOK_CONFIG}.tmp.$$"
+      health_temporary="${health_path}.tmp.$$"
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "umask 077; cat >'$temporary'; install -D -o root -g root -m 0755 '$temporary' '$hook_path'; rm -f '$temporary'" <"$HOOK_SOURCE"
       printf '%s\n' "$policy" | ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "umask 077; cat >'$policy_temporary'; install -D -o root -g root -m 0600 '$policy_temporary' '$HOOK_CONFIG'; rm -f '$policy_temporary'"
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "install -D -o root -g root -m 0755 /dev/stdin /usr/local/sbin/reconcile-backup-jobs" <"$RECONCILER_SOURCE"
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "install -d -o root -g root -m 0755 '${health_path%/*}'; umask 077; cat >'$health_temporary'; install -D -o root -g root -m 0644 '$health_temporary' '$health_path'; rm -f '$health_temporary'" <"$BACKUP_HEALTH_SOURCE"
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "install -D -o root -g root -m 0644 /dev/stdin /etc/systemd/system/reconcile-backup-jobs.service" <"$RECONCILER_SERVICE"
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "install -D -o root -g root -m 0644 /dev/stdin /etc/systemd/system/reconcile-backup-jobs.timer" <"$RECONCILER_TIMER"
       installed_checksum=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "sha256sum '$hook_path' | cut -d ' ' -f 1")
       installed_policy_checksum=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "sha256sum '$HOOK_CONFIG' | cut -d ' ' -f 1")
+      installed_health_checksum=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "sha256sum '$health_path' | cut -d ' ' -f 1")
       ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "systemctl daemon-reload && systemctl enable --now reconcile-backup-jobs.timer"
     fi
     [[ "$installed_checksum" == "$checksum" ]] || { echo "ERROR: Hook checksum mismatch on ${node}." >&2; return 1; }
     [[ "$installed_policy_checksum" == "$policy_checksum" ]] || { echo "ERROR: Hook policy checksum mismatch on ${node}." >&2; return 1; }
+    [[ "$installed_health_checksum" == "$health_checksum" ]] || { echo "ERROR: Backup health library checksum mismatch on ${node}." >&2; return 1; }
     echo "Installed and verified hook on ${node}."
   done < <(online_nodes)
 }
 
 verify_hook_cluster() {
   local node hook_path expected actual policy expected_policy actual_policy
+  local health_path expected_health actual_health
   hook_path=$(config_get_backup_hook_path)
   expected=$(sha256sum "$HOOK_SOURCE" | awk '{print $1}')
   policy=$(hook_policy_content)
   expected_policy=$(printf '%s\n' "$policy" | sha256sum | awk '{print $1}')
+  health_path=/usr/local/lib/pve-backup/lib-backup-health.sh
+  expected_health=$(sha256sum "$BACKUP_HEALTH_SOURCE" | awk '{print $1}')
   while IFS= read -r node; do
     if [[ "$node" == "$(hostname -s)" ]]; then
       actual=$(sha256sum "$hook_path" 2>/dev/null | awk '{print $1}' || true)
       actual_policy=$(sha256sum "$HOOK_CONFIG" 2>/dev/null | awk '{print $1}' || true)
+      actual_health=$(sha256sum "$health_path" 2>/dev/null | awk '{print $1}' || true)
       [[ -x "$hook_path" ]] || actual=""
     else
       actual=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
         "test -x '$hook_path' && sha256sum '$hook_path' | cut -d ' ' -f 1" 2>/dev/null || true)
       actual_policy=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
         "test -r '$HOOK_CONFIG' && sha256sum '$HOOK_CONFIG' | cut -d ' ' -f 1" 2>/dev/null || true)
+      actual_health=$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" \
+        "test -r '$health_path' && sha256sum '$health_path' | cut -d ' ' -f 1" 2>/dev/null || true)
     fi
-    [[ "$actual" == "$expected" ]] || { echo "ERROR: Hook is missing or differs on ${node}." >&2; return 1; }
-    [[ "$actual_policy" == "$expected_policy" ]] || { echo "ERROR: Hook policy is missing or differs on ${node}." >&2; return 1; }
+    [[ "$actual" == "$expected" ]] || { echo "ERROR: Hook is missing or differs on ${node}; run backupCT.sh --install-hook." >&2; return 1; }
+    [[ "$actual_policy" == "$expected_policy" ]] || { echo "ERROR: Hook policy is missing or differs on ${node}; run backupCT.sh --install-hook." >&2; return 1; }
+    [[ "$actual_health" == "$expected_health" ]] || { echo "ERROR: Backup health library is missing or differs on ${node}; run backupCT.sh --install-hook." >&2; return 1; }
   done < <(online_nodes)
 }
 
@@ -483,6 +510,7 @@ run_backup() {
   ionice=$(config_get_backup_ionice)
   local ctids=()
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
+  verify_hook_cluster
   if [[ "$target" == all ]]; then
     vmids=$(jq -r '.[] | select(.type == "lxc" and (((.tags // "") | split(";")) | index("backup-restore-test") | not)) | .vmid' <<<"$resources" | sort -n)
     mapfile -t ctids <<<"$vmids"
@@ -528,14 +556,15 @@ main() {
   validate_backup_config
   [[ -f "$HOOK_SOURCE" ]] || { echo "ERROR: Hook source is missing: ${HOOK_SOURCE}" >&2; return 1; }
   [[ -f "$TEMP_PROVISIONER" ]] || { echo "ERROR: TEMP provisioner is missing: ${TEMP_PROVISIONER}" >&2; return 1; }
+  [[ -f "$BACKUP_HEALTH_SOURCE" ]] || { echo "ERROR: Backup health source is missing: ${BACKUP_HEALTH_SOURCE}" >&2; return 1; }
   case "$ACTION" in
-    --audit) audit_cluster ;;
+    --audit) audit_cluster && check_cluster_backup_locks ;;
     --install-prerequisites) install_prerequisites_cluster ;;
     --provision-temp) provision_temp_cluster ;;
     --install-hook) install_hook_cluster ;;
     --run) run_backup "$RUN_TARGET" ;;
     --configure-job) configure_job ;;
-    --verify) verify_pairs ;;
+    --verify) verify_hook_cluster && check_cluster_backup_locks && verify_pairs ;;
     --restore-test) restore_test "$RUN_TARGET" ;;
     *) usage; return 1 ;;
   esac

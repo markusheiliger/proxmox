@@ -68,6 +68,11 @@ The script creates the CT rootfs on `local-lvm`, creates `/mnt/docker/<hostname>
 template when no per-CT Compose file exists. An existing CT is refreshed instead
 of duplicated.
 
+Stacks with an executable `_config/select-compose-profile.sh` select one generic
+hardware profile before Compose validation and startup. Selection is local to
+the CT and is reevaluated on boot; node-specific render-device names are never
+persisted in `.env`.
+
 ## Recovery
 
 Creation validates major boundaries but is not a transaction with automatic

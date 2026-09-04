@@ -1,244 +1,93 @@
-# Copilot Instructions for Proxmox Scripts
+# Copilot Instructions for Proxmox CT Infrastructure
 
-## Project Overview
+## Scope
 
-Bash scripts for managing Proxmox LXC containers with Docker. Scripts use `set -euo pipefail` for strict error handling.
+This repository manages Proxmox LXC containers and the Docker Compose workloads stored under
+`/mnt/docker`. Apply the domain that matches the file being changed:
 
-## Critical: Strict Mode (`set -euo pipefail`)
+- `/root/scripts/**` — Proxmox lifecycle and shared Bash tooling.
+- `/mnt/docker/<hostname>/**` — one CT's Compose stack and service configuration.
+- `/mnt/docker/<hostname>/_config/configure.sh` — POSIX `sh` executed inside that CT.
 
-All generated bash code MUST handle the strict mode requirements:
+Focused authoring rules live in `.github/instructions/`:
 
-### `set -e` - Exit on Error
+- `bash-lifecycle-scripts.instructions.md`
+- `docker-compose.instructions.md`
+- `compose-hardware-profiles.instructions.md`
+- `configure-sh.instructions.md`
+- `grafana-dashboards.instructions.md`
 
-Commands that may fail must be handled explicitly:
+Relevant skills must load these modules explicitly when cross-workspace `applyTo` discovery is not available.
 
-```bash
-# BAD - exits script if grep finds nothing
-result=$(grep "pattern" file.txt)
+## Infrastructure topology
 
-# GOOD - handle failure explicitly
-result=$(grep "pattern" file.txt || true)
+Each `/mnt/docker/<hostname>/docker-compose.yaml` defines a self-hosted service stack inside one Proxmox LXC CT. The CT receives two host bind mounts:
 
-# GOOD - check return code
-if grep -q "pattern" file.txt; then
-  # found
-fi
-```
+| Purpose | Proxmox-host path | Path inside CT |
+| --- | --- | --- |
+| Compose/config/low-volume state | `/mnt/docker/<hostname>` | `/mnt/docker` |
+| Large application data | `/mnt/docker-data/<hostname>` | `/mnt/docker-data` |
 
-### `set -u` - Unset Variables are Errors
+The hostname segment exists only on the host. Compose and commands executed in the CT use the fixed CT-local paths without a hostname segment.
 
-All variables must be defined or have defaults:
+## Running commands in CTs
 
-```bash
-# BAD - exits if $1 not provided
-local value="$1"
+The user has shell access to the Proxmox host; Docker runs inside CTs, not on that host.
 
-# GOOD - provide default
-local value="${1:-}"
-local value="${1:-default}"
-```
+- Wrap CT commands with `pct exec <CTID> -- <command>`.
+- For directory changes or shell composition, use `pct exec <CTID> -- sh -c '<commands>'`.
+- The Compose file inside a CT is `/mnt/docker/docker-compose.yaml`; Compose operations use `cd /mnt/docker && docker compose ...`.
+- Never put `/mnt/docker/<hostname>` or `/mnt/docker-data/<hostname>` inside a `pct exec` command.
+- The agent terminal sandbox cannot execute `pct` operations. Do not run them from the sandbox; present them for the user when direct host execution is required.
 
-### `set -o pipefail` - Pipeline Failures
+Known CT identity: `seafile.thesaints.de` is CT `2100`.
 
-Any command in a pipeline can cause exit:
+## Proxmox lifecycle scripts
 
-```bash
-# BAD - exits if getent returns non-zero (not found)
-local ip=$(getent hosts example.com | awk '{print $1}')
+Lifecycle scripts are strict-mode Bash and source shared behavior from `commonCT.sh`:
 
-# GOOD - suppress failure
-local ip=$(getent hosts example.com 2>/dev/null | awk '{print $1}' || true)
-```
+- `createCT.sh` — create and provision CTs.
+- `refreshCT.sh` — idempotently refresh existing CTs.
+- `deleteCT.sh` — remove CTs and optionally their data.
+- `moveCT.sh` — migrate CTs and bind data between nodes.
+- `renameCT.sh` — rename CTs and derived identity state.
+- `upgradeCT.sh` — upgrade Alpine with rollback points.
+- `backupCT.sh` — workload-aware cluster backups and restore tests.
+- `monitorCT.sh` — stream container logs.
+- `forwardAuthCT.sh` — reconcile Caddy forward auth with Authentik.
+- `forwardDNSCT.sh` — reconcile secondary-domain split DNS.
 
-### Functions Returning Non-Zero
+Each user-facing lifecycle script has a matching operator guide. Cross-cutting architecture lives under `documentation/`. Follow `bash-lifecycle-scripts.instructions.md` for strict mode, selection, progress, and idempotency.
 
-Functions that fail will exit the entire script:
+## Configuration sources
 
-```bash
-# BAD - if bootstrap fails, script exits
-pct exec "${CTID}" -- step ca bootstrap --install --force
+- `/root/scripts/commonCT.json` is the lifecycle configuration source and contains secrets; it is gitignored.
+- The per-CT `/mnt/docker/<hostname>/.env` is the source consumed by Compose and CT `configure.sh` scripts.
+- Shared POSIX configure helpers live in `/root/scripts/configure/` and are mirrored into CTs at `/mnt/docker/_config/shared/` during refresh. Never edit the mirrored copy.
 
-# GOOD - catch failure, warn, continue
-if ! pct exec "${CTID}" -- step ca bootstrap --install --force 2>&1; then
-  echo "Warning: bootstrap failed"
-  return 0  # Non-fatal, continue
-fi
-```
+## Docker service conventions
 
-### Arithmetic with `set -e`
+- Each CT uses Caddy for reverse proxying and automatic TLS through the appropriate project image.
+- Internal service-to-service communication uses Docker container names.
+- Every Compose service has a deterministic `container_name`; telemetry identity is `<hostname>/<container_name>`.
+- Compose bind paths use CT-local `/mnt/docker/<service>` or `/mnt/docker-data/<service>` paths, never host-side hostname-qualified paths.
+- One-shot initializers use the repository's explicit `restart: "no"` contract; post-reboot API configuration uses `_config/configure.sh`.
+- Service secrets that require literal handling use raw files below `_secrets/`, not Compose `.env` interpolation.
 
-`((expr))` returns exit code 1 if result is 0, causing script termination:
+Follow `docker-compose.instructions.md` for the complete Compose contract.
 
-```bash
-# BAD - exits script when count=0 because ((0)) returns exit code 1
-local count=0
-((count++))  # Script exits here!
+## Authentication
 
-# GOOD - always succeeds
-local count=0
-count=$((count + 1))
-```
+Authentik is the central OIDC provider. When a service supports OIDC/OAuth2/SSO, recommend native OpenID Connect against Authentik; do not silently add authentication. Implement only after user confirmation.
 
-## Script Structure
+- Use product-neutral `AUTH_*` configuration names.
+- Keep client credentials in service environment variables delivered through raw secret env files.
+- Redirect URIs use `https://<service-hostname>/<callback>`.
+- Forward auth is managed exclusively by `forwardAuthCT.sh`; do not duplicate its provider, application, or Caddy-label logic in lifecycle scripts.
+- Authentik registration from `_config/configure.sh` must use the shared configure library and its self-healing helpers.
 
-- `commonCT.sh` - Shared idempotent functions, sourced by other scripts
-- `createCT.sh` - Create new LXC containers
-- `refreshCT.sh` - Update existing containers with latest config
-- `deleteCT.sh` - Remove containers
-- `moveCT.sh` - Move containers and bind data between Proxmox nodes
-- `renameCT.sh` - Rename containers and all derived identity state
-- `upgradeCT.sh` - Upgrade Alpine releases with rollback points
-- `backupCT.sh` - Manage workload-aware cluster backups
-- `monitorCT.sh` - Stream container logs
-- `forwardAuthCT.sh` - Reconcile Caddy forward auth with Authentik
-- `forwardDNSCT.sh` - Reconcile secondary-domain split DNS
+Follow `configure-sh.instructions.md` for the complete configure/OIDC contract.
 
-Each user-facing lifecycle script has an adjacent `[scriptname].md` operator
-guide. Cross-cutting architecture and decisions live in `documentation/`.
+## Hardware-aware stacks
 
-## Configuration
-
-- `commonCT.json` - Contains secrets (gitignored)
-- Required sections: `step_ca`, `registries`, `sizes`, `newt`
-
-## Docker Volume Mounts
-
-**IMPORTANT**: Each CT instance has bind mounts that point to hostname-specific folders:
-- `/mnt/docker` in CT → `/mnt/docker/[hostname]` on host
-- `/mnt/docker-data` in CT → `/mnt/docker-data/[hostname]` on host
-
-**This means docker-compose volume paths should NOT include the hostname:**
-
-```yaml
-# WRONG - hostname is redundant, creates nested folder
-volumes:
-  - /mnt/docker-data/oidc.thesaints.home/postgresql:/var/lib/postgresql/data
-
-# CORRECT - CT already resolves to hostname folder
-volumes:
-  - /mnt/docker-data/postgresql:/var/lib/postgresql/data
-```
-
-### Storage Characteristics
-
-Choose the appropriate mount based on service requirements:
-
-| Mount | Storage | Best For |
-|-------|---------|----------|
-| `/mnt/docker` | **SSD** | Low volume, fast IO (configs, small DBs, app state) |
-| `/mnt/docker-data` | **HDD** | Large volume, slow IO (media, recordings, backups, large DBs) |
-
-**Always add a comment explaining the mount choice:**
-
-```yaml
-volumes:
-  # SSD: fast IO for database operations
-  - /mnt/docker/postgresql:/var/lib/postgresql/data
-  # HDD: large media storage
-  - /mnt/docker-data/media:/media
-  # HDD: video recordings (large files)
-  - /mnt/docker-data/recordings:/recordings
-```
-
-### Hard Rules
-
-- **Caddy**: Always uses `/mnt/docker/caddy` - certificates and config require fast IO
-
-## Whiptail UI
-
-Use `--separate-output` for checklists to get one item per line:
-
-```bash
-# Multi-select with --separate-output for easy parsing
-selections=$(whiptail --title "Title" \
-  --separate-output \
-  --checklist "Select items:" \
-  "$height" "$width" "$list_height" \
-  "${checklist_args[@]}" \
-  3>&1 1>&2 2>&3)
-
-# Parse line by line
-while IFS= read -r line; do
-  [[ -n "$line" ]] && SELECTED_ITEMS+=("$line")
-done <<< "$selections"
-```
-
-## Interactive Selection Patterns
-
-Scripts support two selection modes for containers:
-
-- `select_ct_interactive_single` - whiptail `--menu` for single selection
-- `select_ct_interactive_multi` - whiptail `--checklist` for multi-selection
-
-**When to use which:**
-- **Multi-select**: Only when NO arguments/options provided (batch operations)
-- **Single-select**: When options like `--gpu`, `--size`, `--monitor` are given
-
-```bash
-# Pattern: track if options were provided
-local has_options=false
-
-case "$1" in
-  --gpu)
-    GPU_PASSTHROUGH=true
-    has_options=true
-    ;;
-esac
-
-# Select based on context
-if [[ -z "$ct_arg" ]]; then
-  if [[ "$has_options" == "true" ]]; then
-    select_ct_interactive_single "action" || exit 1
-  else
-    select_ct_interactive_multi "action" || exit 1
-  fi
-fi
-```
-
-**Rationale**: Options like `--monitor` only make sense for single CTs. Multi-select is for bulk operations with default settings.
-
-## Status Bar Progress
-
-Scripts use ANSI escape codes to display a persistent status bar at the bottom of the terminal while output scrolls above.
-
-**Functions (in commonCT.sh):**
-- `status_bar_init()` - Initialize status bar, reserve bottom line
-- `status_update "message"` - Update status text
-- `status_progress current total "message"` - Show `[N/total] X% - message`
-- `status_bar_cleanup()` - Restore normal terminal (also in EXIT trap)
-
-**Usage pattern:**
-```bash
-status_bar_init
-
-status_progress 1 5 "Step one..."
-do_step_one
-
-status_progress 2 5 "Step two..."
-do_step_two
-
-status_bar_cleanup
-```
-
-**IMPORTANT: When adding new steps to a script, always:**
-1. Update `total_steps` count in scripts using numbered progress
-2. Add corresponding `status_progress` call before the new operation
-3. Verify step numbers are sequential and total is correct
-
-This ensures the progress percentage remains accurate.
-
-## Idempotent Functions
-
-All configuration functions must be idempotent:
-- Check if already configured before making changes
-- Use `--force` flags where available
-- Return success even if no changes needed
-
-## Global Variables
-
-Scripts share these globals:
-- `CTID` - Current container ID
-- `CT_HOSTNAME` - Current container hostname
-- `CT_LIST` - Array of all container IDs
-- `CT_MAP` - Associative array: CTID -> hostname
-- `SELECTED_CTS` - Array from multi-select (refreshCT.sh)
+Portable accelerator stacks select a generic Compose profile at runtime. Do not persist node or device identity in `.env`. Lifecycle operations use `ct_compose()` so profile-aware and ordinary stacks remain compatible. Follow `compose-hardware-profiles.instructions.md` for the full contract.

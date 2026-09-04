@@ -156,16 +156,16 @@ ct_exec() {
     *"docker compose config --format json"*)
       printf '%s\n' '{"services":{"setup-a":{"restart":"no"},"setup-b":{"restart":"no"}}}'
       ;;
-    *"docker compose ps -a -q 'setup-a'"*)
+    *"ps -a -q setup-a"*|*"ps -a -q 'setup-a'"*)
       echo aaa111
       ;;
-    *"docker compose ps -a -q 'setup-b'"*)
+    *"ps -a -q setup-b"*|*"ps -a -q 'setup-b'"*)
       echo bbb222
       ;;
-    *"'aaa111'"*"{{.Name}}"*)
+    *"aaa111"*"{{.Name}}"*)
       echo /setup-a
       ;;
-    *"'bbb222'"*"{{.Name}}"*)
+    *"bbb222"*"{{.Name}}"*)
       echo /setup-b
       ;;
     *"{{.State.Status}}"*)
@@ -187,6 +187,43 @@ else
 fi
 assert_contains "first initializer completes" "$multiple_output" "Initialization service setup-a completed"
 assert_contains "second initializer completes" "$multiple_output" "Initialization service setup-b completed"
+
+gpu_commands="${TEST_ROOT}/gpu-commands"
+get_ct_owner_node() { echo pve02; }
+get_ct_status() { echo stopped; }
+run_on_node() { printf 'run_on_node' >> "$gpu_commands"; printf ' %q' "$@" >> "$gpu_commands"; printf '\n' >> "$gpu_commands"; }
+run_node_shell() { printf 'run_node_shell' >> "$gpu_commands"; printf ' %q' "$@" >> "$gpu_commands"; printf '\n' >> "$gpu_commands"; }
+NODE_GPU_STATE=available
+NODE_GPU_RENDER_DEVICES=(/dev/dri/renderD128)
+if reconcile_stopped_ct_gpu_config 3500 > /dev/null; then
+  assert_contains "GPU config removal runs on owner node" "$gpu_commands" "run_on_node pve02 sed -i"
+  assert_contains "GPU config append runs on owner node" "$gpu_commands" "run_node_shell pve02"
+  assert_contains "GPU config targets owner-local LXC path" "$gpu_commands" "/etc/pve/lxc/3500.conf"
+else
+  fail "GPU config mutation is owner-routed"
+fi
+
+remote_env="${TEST_ROOT}/remote.env"
+: > "$remote_env"
+CT_HOSTNAME=ai.thesaints.home
+config_get_ssl_type() { echo none; }
+config_get_dns_provider() { :; }
+config_get_dns_api_token() { :; }
+config_get_dns_account_id() { :; }
+config_get_email() { echo admin@example.test; }
+config_get_authentik_host() { echo auth.example.test; }
+config_get_authentik_token() { echo test-api-token; }
+config_get_authentik_authorization_flow() { echo authorization-flow; }
+config_get_authentik_invalidation_flow() { echo invalidation-flow; }
+config_get_telemetry_hostname() { :; }
+config_get_telemetry_otlp_http_port() { :; }
+config_get_telemetry_otlp_grpc_port() { :; }
+node_path_is_file() { [[ "$2" == /mnt/docker/ai.thesaints.home/_config/configure.sh ]]; }
+run_on_node() { [[ "$1" == pve02 && "$2" == grep && "$*" == *lib-authentik* ]]; }
+update_env_file "$remote_env" /mnt/docker/ai.thesaints.home/_config pve02
+assert_contains "remote configure script retains Authentik API token" "$remote_env" "AUTH_API_TOKEN=test-api-token"
+assert_contains "remote configure script retains authorization flow" "$remote_env" "AUTH_AUTHORIZATION_FLOW=authorization-flow"
+assert_contains "remote configure script retains invalidation flow" "$remote_env" "AUTH_INVALIDATION_FLOW=invalidation-flow"
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

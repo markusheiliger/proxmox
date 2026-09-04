@@ -100,6 +100,11 @@ to the source node's selected bridge before the CT can start. This avoids asking
 the current node to validate a source-only bridge and does not rely on
 version-specific migration remapping options.
 
+Selector-enabled Compose stacks are stopped with every hardware profile before
+the final sync. After migration, startup selects hardware visible inside the CT
+on the destination; rollback reselects on the source. This permits automatic
+Vulkan-to-CPU fallback without persisting a node-specific render-device index.
+
 Preflight reads the effective datacenter migration bandwidth policy. For a
 finite limit it prints a lower-bound rootfs transfer estimate. An estimate over
 six hours requires separate confirmation; `--force` acknowledges the warning

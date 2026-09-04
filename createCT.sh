@@ -383,7 +383,7 @@ start_compose() {
     
     # Validate compose file first
     echo "  Validating docker-compose.yaml..."
-    if ! ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>/dev/null; then
+    if ! ct_compose --timeout 30 config --quiet 2>/dev/null; then
       echo "  [!] Warning: docker-compose.yaml validation failed, skipping start"
       echo "      Fix the compose file and run: pct exec ${CTID} -- sh -c 'cd /mnt/docker && docker compose up -d'"
       return
@@ -578,6 +578,7 @@ main() {
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
   setup_mountpoints
+  sync_config_shared
   reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Verifying setup..."

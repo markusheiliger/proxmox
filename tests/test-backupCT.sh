@@ -276,5 +276,61 @@ else
   test_fail "restore tests receive the exclusion tag"
 fi
 
+health_resources='[{"type":"lxc","vmid":2100,"name":"app.thesaints.home","node":"pve01"}]'
+health_archive="${BACKUP_MOUNT}/dump/vzdump-lxc-2100-2026_08_28-02_00_00.tar.zst"
+health_generation="${WORKLOAD_ROOT}/app.thesaints.home/vzdump-lxc-2100-2026_08_28-02_00_00"
+mkdir -p "${health_generation}/docker" "${health_generation}/docker-data"
+touch -d '2 hours ago' "$health_archive"
+HEALTH_LOCK=backup
+HEALTH_TASKS='[]'
+pvesh() {
+  case "$*" in
+    "get /nodes/pve01/lxc/2100/config --output-format json") jq -nc --arg lock "$HEALTH_LOCK" '{lock:$lock}' ;;
+    "get /nodes/pve01/tasks --source active --typefilter vzdump --output-format json") printf '%s\n' "$HEALTH_TASKS" ;;
+    *) return 1 ;;
+  esac
+}
+BACKUP_MAX_AGE_SECONDS=3600
+assert_failure_contains "idle old backup lock is reported stale" "STALE LOCK CT 2100" check_stale_backup_locks "$health_resources" "$BACKUP_MOUNT"
+HEALTH_TASKS='[{"type":"vzdump"}]'
+if check_stale_backup_locks "$health_resources" "$BACKUP_MOUNT" >"${TEST_ROOT}/active-lock" 2>&1 && grep -Fq "ACTIVE LOCK CT 2100" "${TEST_ROOT}/active-lock"; then
+  pass "active backup lock is not classified stale"
+else
+  test_fail "active backup lock is not classified stale"
+fi
+HEALTH_TASKS='[]'
+touch "$health_archive"
+if check_stale_backup_locks "$health_resources" "$BACKUP_MOUNT" >"${TEST_ROOT}/recent-lock" 2>&1 && grep -Fq "RECENT LOCK CT 2100" "${TEST_ROOT}/recent-lock"; then
+  pass "recent idle backup lock receives a grace period"
+else
+  test_fail "recent idle backup lock receives a grace period"
+fi
+HEALTH_LOCK=migrate
+if check_stale_backup_locks "$health_resources" "$BACKUP_MOUNT" >"${TEST_ROOT}/other-lock" 2>&1 && [[ ! -s "${TEST_ROOT}/other-lock" ]]; then
+  pass "non-backup CT locks are ignored"
+else
+  test_fail "non-backup CT locks are ignored"
+fi
+if grep -Eq '^[[:space:]]*pct[[:space:]]+unlock|pvesh[[:space:]]+(set|create|delete)' "${SCRIPT_DIR}/backup/lib-backup-health.sh"; then
+  test_fail "backup lock health check is read-only"
+else
+  pass "backup lock health check is read-only"
+fi
+if declare -f audit_cluster | grep -Fq 'verify_hook_cluster'; then
+  pass "CT audit checks deployed hook drift"
+else
+  test_fail "CT audit checks deployed hook drift"
+fi
+if declare -f run_backup | grep -Fq 'verify_hook_cluster'; then
+  pass "manual CT backup checks deployed hook drift"
+else
+  test_fail "manual CT backup checks deployed hook drift"
+fi
+if grep -Fq -- '--verify) verify_hook_cluster && check_cluster_backup_locks && verify_pairs' "${SCRIPT_DIR}/backupCT.sh"; then
+  pass "CT pair verification checks hook drift and locks"
+else
+  test_fail "CT pair verification checks hook drift and locks"
+fi
+
 echo "${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

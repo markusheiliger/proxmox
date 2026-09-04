@@ -11,7 +11,10 @@ implement workload-aware Proxmox backups.
 - `provision-temp-storage`: idempotently creates or extends the node-local thin
   LV and ext4 filesystem used for suspend-mode rootfs staging.
 - `reconcile-backup-jobs`: leader-elected reconciliation of exact LXC and QEMU
-  job membership from cluster resources and exclusion tags.
+  job membership from cluster resources and exclusion tags, followed by
+  read-only stale backup-lock health reporting.
+- `lib-backup-health.sh`: shared classification of active, recent, and stale
+  Proxmox CT backup locks. It reports recovery guidance but never unlocks CTs.
 - `reconcile-backup-jobs.service` and `.timer`: run reconciliation every 15
   minutes on each node; non-leaders exit without mutation.
 

@@ -137,6 +137,25 @@ blocked the task writer and made an already-completed backup appear frozen.
 Bounded summary output preserves diagnostics without allowing terminal output to
 become part of the backup's liveness path.
 
+The repository source and the installed hook are separate artifacts. Audit,
+verification, and manual CT backup preflights compare the installed hook,
+policy, and health library with their repository sources. Drift is fatal and
+must be repaired explicitly by reinstalling the hook on every online node.
+
+## Backup-lock health
+
+Proxmox owns the CT configuration `lock: backup`; the workload hook does not.
+Health checks are therefore read-only. A backup lock is reported as stale only
+when its owner node has no active `vzdump` task and the newest complete
+archive/workload pair is older than 26 hours (or no complete pair exists). An
+active task suppresses stale classification, and recent pairs receive a grace
+period. Non-backup locks are outside this check.
+
+The elected job reconciler performs this check after membership and retention
+reconciliation. A stale lock makes the unit fail visibly without rolling back
+job reconciliation and without calling `pct unlock`. Unlocking remains an
+operator decision after task and process ownership have been inspected.
+
 ## Related documentation
 
 - [Backup operator guide](../backupCT.md)

@@ -64,6 +64,12 @@ folders. Caddy data requires its own confirmation because deletion triggers
 certificate reissuance. Initialization services use `restart: "no"`; every one
 must exit successfully before post-deployment configuration runs.
 
+For stacks that provide `_config/select-compose-profile.sh`, refresh synchronizes
+the shared profile wrapper before Compose operations and selects current CT
+hardware for validation, permission planning, startup, status, and initializer
+discovery. Pull and down intentionally cover all profiles. Other CTs retain the
+legacy direct Compose behavior.
+
 ## Recovery
 
 A VLAN failure attempts to restore the old tag and fixed address. For routine
@@ -77,3 +83,4 @@ rerunning is preferred to manual partial configuration.
 - [Monitor](monitorCT.md)
 - [Storage and permissions](documentation/storage-and-permissions.md)
 - [Networking and authentication](documentation/networking-and-authentication.md)
+- [Hardware-aware Compose profiles](documentation/hardware-compose-profiles.md)

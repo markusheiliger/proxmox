@@ -222,7 +222,7 @@ reset_docker() {
   # Validate compose file
   echo "  Validating docker-compose.yaml..."
   local compose_validation_output
-  if ! compose_validation_output=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose config --quiet' 2>&1); then
+  if ! compose_validation_output=$(ct_compose --timeout 30 config --quiet 2>&1); then
     echo "  [✗] docker-compose.yaml validation failed"
     if [[ -n "$compose_validation_output" ]]; then
       echo "$compose_validation_output" | sed 's/^/      /'
@@ -281,11 +281,11 @@ reset_docker() {
   # following the earlier 'compose down'), retry the deploy once and report if it
   # is still down.
   local running_count
-  running_count=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r')
+  running_count=$(ct_compose --timeout 30 ps --status running --quiet 2>/dev/null | wc -l | tr -d ' \r')
   if [[ -z "$running_count" || "$running_count" -eq 0 ]]; then
     echo "  [!] No running services after deploy — retrying 'docker compose up -d'..."
-    ct_exec --timeout 120 'cd /mnt/docker && docker compose up -d' 2>/dev/null || true
-    running_count=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose ps --status running --quiet 2>/dev/null | wc -l' 2>/dev/null | tr -d ' \r')
+    ct_compose --timeout 120 up -d --remove-orphans 2>/dev/null || true
+    running_count=$(ct_compose --timeout 30 ps --status running --quiet 2>/dev/null | wc -l | tr -d ' \r')
   fi
   if [[ -z "$running_count" || "$running_count" -eq 0 ]]; then
     echo "  [✗] Stack is DOWN after deploy attempts — manual intervention needed"
@@ -302,7 +302,7 @@ wait_for_initialization_services() {
   local compose_json services service container_ids container_id container_name
   local state exit_code elapsed latest_log
 
-  compose_json=$(ct_exec --timeout 30 'cd /mnt/docker && docker compose config --format json' 2>/dev/null) || {
+  compose_json=$(ct_compose --timeout 30 config --format json 2>/dev/null) || {
     echo "  [!] Could not inspect Compose initialization services"
     return 1
   }
@@ -315,7 +315,7 @@ wait_for_initialization_services() {
   fi
 
   for service in $services; do
-    container_ids=$(ct_exec --timeout 30 "cd /mnt/docker && docker compose ps -a -q '$service'" 2>/dev/null) || {
+    container_ids=$(ct_compose --timeout 30 ps -a -q "$service" 2>/dev/null) || {
       echo "  [!] Could not find initialization service '$service'"
       return 1
     }
@@ -618,6 +618,7 @@ main() {
       overall_step=$((base_step + steps_per_ct))
       continue
     fi
+    sync_config_shared
     
     overall_step=$((base_step + 5)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Restarting Docker..."
     if ! reset_docker; then

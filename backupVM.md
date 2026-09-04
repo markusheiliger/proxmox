@@ -41,6 +41,23 @@ Job configuration requires the configured backup storage to report active on
 every online cluster node. Immediate backups repeat that check for the VM's
 current node before invoking `vzdump`.
 
+## Secure Boot certificate warning
+
+An otherwise successful Windows backup can finish with `WARNINGS: 1` when its
+OVMF EFI disk lacks Microsoft's 2023 Secure Boot certificates. The 2011
+certificates expired in June 2026, so this is guest firmware maintenance rather
+than a backup transport failure.
+
+Before enrollment, record the BitLocker recovery key and run
+`manage-bde -protectors -disable <drive>` in an elevated Windows PowerShell for
+every protected drive. Shut the VM down cleanly, then run
+`qm enroll-efi-keys <VMID>` on its Proxmox owner node. Boot the guest, verify
+Secure Boot and TPM health, and re-enable each protector with
+`manage-bde -protectors -enable <drive>`. Finally, run `--run <VMID>` and
+`--verify`; the backup task should complete without the EFI certificate
+warning. Do not enroll keys while BitLocker protectors remain active unless the
+recovery-key boot path has been explicitly accepted.
+
 ## Selection
 
 Both jobs use exact VMID lists. Eligible QEMU guests are cluster resources of

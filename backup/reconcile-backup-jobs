@@ -12,6 +12,17 @@ BACKUP_VM_JOB_ID="${BACKUP_VM_JOB_ID:-}"
 BACKUP_VM_ENABLED="${BACKUP_VM_ENABLED:-true}"
 BACKUP_EXCLUDE_TAGS="${BACKUP_EXCLUDE_TAGS:-no-backup,backup-restore-test}"
 BACKUP_PRUNE_POLICY="${BACKUP_PRUNE_POLICY:-}"
+BACKUP_STORAGE="${BACKUP_STORAGE:-SYNOLOGY}"
+BACKUP_MOUNT="${BACKUP_MOUNT:-/mnt/pve/${BACKUP_STORAGE}}"
+BACKUP_HEALTH_LIB="${BACKUP_HEALTH_LIB:-/usr/local/lib/pve-backup/lib-backup-health.sh}"
+
+if [[ -r "$BACKUP_HEALTH_LIB" ]]; then
+  # shellcheck source=lib-backup-health.sh
+  source "$BACKUP_HEALTH_LIB"
+else
+  echo "ERROR: Backup health library is unavailable: ${BACKUP_HEALTH_LIB}" >&2
+  return 1 2>/dev/null || exit 1
+fi
 
 fail() { echo "ERROR: $*" >&2; return 1; }
 
@@ -75,15 +86,17 @@ reconcile_job() {
 }
 
 main() {
-  local resources
+  local resources failed=false
   validate_policy
   if ! is_elected_node; then
     echo "This node is not the elected backup reconciler; skipping."
     return 0
   fi
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
-  reconcile_job lxc "$BACKUP_CT_JOB_ID" true "$resources"
-  reconcile_job qemu "$BACKUP_VM_JOB_ID" "$BACKUP_VM_ENABLED" "$resources"
+  reconcile_job lxc "$BACKUP_CT_JOB_ID" true "$resources" || failed=true
+  reconcile_job qemu "$BACKUP_VM_JOB_ID" "$BACKUP_VM_ENABLED" "$resources" || failed=true
+  check_stale_backup_locks "$resources" "$BACKUP_MOUNT" || failed=true
+  [[ "$failed" == false ]]
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

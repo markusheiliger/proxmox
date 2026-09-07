@@ -22,6 +22,8 @@ results and exits non-zero on failure.
   CT hooks, QEMU lifecycle, automatic enrollment, and TEMP provisioning.
 - `test-dry-run.sh`: mutation-free lifecycle previews.
 - `test-moveCT.sh`: migration and rollback.
+- `test-optimization-contract.sh`: fail-closed image, advisory, artifact, and guest
+  OS upgrade verification contracts for Recon and `ct-optimize`.
 - `test-permissions.sh`: bind ownership policy.
 - `test-refresh.sh`: refresh and initialization behavior.
 - `test-upgradeCT.sh`: release upgrades and rollback.

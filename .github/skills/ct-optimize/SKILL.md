@@ -142,13 +142,15 @@ Request Recon's standard read-only inspection plus:
 
 - Current owner, status, CPU/RAM/rootfs allocation, guest Alpine release, mounts, network, and passthrough.
 - Compose services, roles, images/tags/digests, application versions, configuration relationships, health, drift, telemetry, and bounded runtime evidence.
+- A complete container image evidence ledger with one row for every primary and supporting image, including verified deployed versions, authoritative release retrieval status, proposed targets, exact registry artifacts, required platforms/variants/build dependencies, and fail-closed dispositions.
+- A guest OS upgrade evidence ledger with the verified installed release, authoritative supported target, exact ordered intermediate chain, per-release branch/repository availability, workload compatibility, lifecycle-parser compatibility, and a fail-closed disposition.
 - Practical CPU and memory floors for applications, databases, caches, proxies, workers, and the guest OS.
 - Storage use/pressure and whether rootfs growth may be necessary.
 - Supported image/application upgrades, breaking changes, EOL/security posture, image variant switches, and prerequisite configuration work.
 - Workload functions that could benefit from GPU, video acceleration, Coral/Edge TPU, or another node capability.
 - Existing profile variants, selector behavior, stable service aliases, CPU/generic fallback, expected degradation, and any hard-coded node/device identity that would prevent movement.
 
-Recon must remain CT/workload-only: never ask it to inventory, probe, compare, or select candidate cluster nodes. Never request raw environment, secret, certificate, credential, or token values. A failed or incomplete Recon result becomes a per-CT caveat; do not infer missing facts.
+Recon must remain CT/workload-only: never ask it to inventory, probe, compare, or select candidate cluster nodes. Never request raw environment, secret, certificate, credential, or token values. A failed or incomplete Recon result becomes a per-CT caveat; do not infer missing facts. Missing ledger rows or required fields are incomplete acquisition, not permission for the parent to reconstruct or synthesize them.
 
 ### 3. Normalize utilization evidence
 
@@ -179,7 +181,11 @@ The parent skill—not either subagent—correlates each Recon workload profile 
 
 - Separate `configured`, `running`, `observed`, `historical`, `documented`, and `inferred` facts.
 - Resolve contradictory evidence conservatively and state the conflict.
-- Verify current product/hardware compatibility, releases, support policy, and security claims with official sources. A mutable or old tag alone does not prove a vulnerability.
+- Independently attest every actionable image and guest OS upgrade against current official release/support sources and exact deployable artifacts before publication. Record the authoritative URL, UTC retrieval timestamp, and result as exactly `verified`, `not found`, `inaccessible`, `contradictory`, or `incomplete`; tool-call completion alone is not verification.
+- For an image upgrade, attest the deployed version, published stable target, exact registry manifest, required architecture/platform and variant, and every derived-build dependency. A mutable or old tag alone is neither deployed-version evidence nor proof that an upgrade exists.
+- For a guest OS upgrade, attest the installed release, supported stable target, every intermediate branch/release and package repository, workload compatibility, and compatibility with the current `upgradeCT.sh` parser/path logic. Never generate a chain by numeric sequencing alone.
+- For a security finding, attest that the authoritative advisory exists and is published, its affected range matches the verified deployed version, and any named fixed version has an available exact artifact. A successful lookup with a missing, empty, unrelated, or contradictory result is not advisory evidence.
+- Preserve Recon's fail-closed disposition. If any required evidence is absent, stale, nonmatching, inaccessible, contradictory, or incomplete, classify the item `unverified — no recommendation`; describe the gap, omit the target and upgrade action, and do not create a prompt or command that presents the upgrade as available. Never synthesize a version, tag, digest, fixed release, advisory identifier, or OS chain from prior reports, likely numbering, or neighboring releases.
 - Distinguish hardware that is present, driver-bound, exposed to the CT, selected by the Compose profile, and actually used.
 - Compare Recon's fallback/profile contract with Scout's capability matrix and assign one portability classification before proposing an action.
 - Never expose values from `commonCT.json`; query only required non-secret settings such as `.sizes`.
@@ -258,7 +264,8 @@ Do not emit a remediation prompt that applies an optimization classified **Block
 
 ### 8. Separate OS, workload, and configuration changes
 
-- Recommend `upgradeCT.sh` only for an eligible outdated Alpine guest OS. Verify the current release, supported target, intermediate upgrade path, rollback behavior, and workload compatibility.
+- Recommend `upgradeCT.sh` only when both Recon's guest OS evidence disposition and the parent's independent attestation are `upgrade verified`. Verify the installed release, supported target, every intermediate release branch and package repository, rollback behavior, workload compatibility, and current lifecycle-parser support. Otherwise report `unverified — no recommendation` and emit no OS target or command.
+- Recommend a container image/application update only when both Recon's matching image evidence row and the parent's independent attestation establish `upgrade verified` for the exact target artifact and platform/variant/dependencies. Otherwise report the evidence gap without an upgrade target, prompt, or dependent refresh command.
 - Container image/application updates, alternate image variants, Compose edits, and hardware-profile/configuration changes are not guest OS upgrades. Describe them as separately reviewed prerequisites, followed by `refreshCT.sh` to reconcile the managed workload.
 - Do not imply that `refreshCT.sh` authors prerequisite file changes. Name the files/settings that require operator review without editing them.
 - Rootfs growth, unsupported passthrough, firmware/driver work, or any change not expressible through the approved lifecycle interfaces is a prerequisite/blocker, not a fabricated command.
@@ -372,6 +379,20 @@ Emit the following complete section for **every selected CT**, even when unchang
 - Evidence source, `WINDOW`, coverage, quality, and confidence.
 - Missing or conflicting evidence.
 
+**Container image evidence**
+
+| Image | Verified deployed version | Authoritative source / retrieval result | Verified stable target | Artifact, platform, variant, and dependency attestation | Disposition |
+| --- | --- | --- | --- | --- | --- |
+
+Include one row for every primary and supporting image. The parent disposition must be no more permissive than Recon's disposition.
+
+**Guest OS upgrade evidence**
+
+| Verified installed release | Authoritative source / retrieval result | Verified supported target | Intermediate release/repository attestation | Workload/parser compatibility | Disposition |
+| --- | --- | --- | --- | --- | --- |
+
+Use exactly one row. An incomplete chain must be `unverified — no recommendation` and must not name an inferred target.
+
 **Current → recommended**
 
 | Area | Current | Recommended |
@@ -446,6 +467,7 @@ Before returning the report, confirm:
 - The remediation-owner catalog was rebuilt from current workspace skills for this run; every non-generic owner in coverage and prompt text exists in that eligible catalog, and no excluded advisory, read-only, diagnostic, or verification-only skill owns remediation.
 - Ambiguous ownership was split only when domains were cleanly separable; otherwise it fell back to `generic` without nearest-description guessing or duplicate competing prompts.
 - Both mandatory agent types were available; Scout ran exactly once and supplied cluster-wide managed-CT discovery when the target was omitted; Recon ran exactly once per selected CT, and individual Recon failures are disclosed.
+- Every complete Recon result contains one image evidence row per primary/supporting image and one guest OS evidence row; missing rows or fields remain disclosed incomplete evidence and were not reconstructed by the parent.
 - An unavailable agent, failed Scout, unresolved explicit target, or incomplete authoritative discovery stopped before publication and preserved the prior valid report.
 - Seven-day evidence is used by default and quality/coverage is reported.
 - Sizing respects approximately 20% memory headroom, sustained CPU demand, and workload floors.
@@ -454,6 +476,10 @@ Before returning the report, confirm:
 - Every proposed optimization is classified for portability; blocked/unknown ideas have no command or apply-ready prompt, and any fallback-architecture prompt belongs to a distinct uncovered issue.
 - No node name, `COMPOSE_PROFILES`, PCI identity, or `renderD<N>` is persisted in workload configuration; hardware variants retain automatic functional fallback.
 - `upgradeCT.sh` is used only for Alpine guest OS upgrades.
+- Every image upgrade target has matching `upgrade verified` Recon evidence and independent parent attestation for the deployed version, published stable target, exact manifest, platform/variant, and derived-build dependencies. No mutable tag, inferred version, or unavailable artifact produced a recommendation.
+- Every guest OS target and each intermediate chain release/repository has matching `upgrade verified` Recon evidence and independent parent attestation, including workload and lifecycle-parser compatibility. No numerically synthesized chain produced a recommendation.
+- Every actionable security upgrade is backed by an existing published authoritative advisory whose affected range matches the verified deployment and whose named fixed version has an attested exact artifact; retrieval/tool success alone was never treated as source evidence.
+- Every failed, inaccessible, contradictory, nonmatching, or incomplete version/advisory/artifact/chain check is reported as `unverified — no recommendation` with no synthesized target, apply-ready prompt, lifecycle command, or blocked refresh that implies an upgrade exists.
 - Every actionable issue has exactly one remediation-coverage class and one workflow owner. Every uncovered actionable issue has exactly one focused prompt whose first token is `/plan` and which explicitly invokes the same owner, cross-owner findings are split, rejected portability ideas remain non-actionable, and dependent lifecycle commands use exact `# BLOCKED UNTIL:` prompt titles for completed and verified prerequisite edits.
 - Every CT-level and unique cluster-level prompt requests affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification, then remains in planning for refinement or the **Start Implementation** handoff.
 - No rootfs shrink or unsupported flag is proposed.

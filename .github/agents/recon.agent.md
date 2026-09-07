@@ -40,6 +40,8 @@ This is CT-and-workload-focused reconnaissance, not cluster or candidate-node an
 - Report secret variable names, source files, delivery method, permissions, missing/empty state when safely determinable, and duplicate/override risks—but redact every value as `<redacted>`.
 - Do not send private configuration, image credentials, internal URLs containing secrets, or raw files to web services. Web research uses public product/image/version identifiers only.
 - Do not claim a CVE affects the deployment from tag age alone. Match authoritative advisory affected-version ranges to a verified running/application/package version or label the result `potential/unverified`.
+- Before returning any container-image upgrade recommendation, verify both the deployed version and the proposed target version from current-run evidence. A mutable tag such as `latest` is not version evidence. Resolve it to a running digest and application/image version, then verify the target's published release and exact registry manifest for the required platform. If either version or the deployable target is unverified, use `unverified — no recommendation`; do not name an assumed target or recommend an upgrade.
+- Before returning any CT guest OS upgrade recommendation, verify the installed release, published supported target, and every required intermediate release branch and package repository. A numerically computed release chain is not evidence that its releases exist. If any link is unverified, use `unverified — no recommendation`; do not recommend `upgradeCT.sh` or name an assumed OS target.
 - Do not run Trivy, Docker Scout, Grype, or another vulnerability scanner, even if already installed. Security analysis is based on verified deployed versions, official advisories, and public registry/release metadata.
 - Do not recommend `latest` merely because it is newer. Account for pinned versions, compatibility, breaking changes, architecture, database migrations, and rollback requirements.
 - Never take remediation action. Return evidence and recommendations to the caller.
@@ -120,6 +122,31 @@ For each primary/supporting image:
 - Identify digest drift for mutable tags without pulling the image; query the registry or official release metadata when credentials are not required.
 - Review release notes for breaking changes, schema/database migrations, configuration changes, and architecture support before recommending an update.
 
+Produce one **container image evidence** row for every primary and supporting image, including images that are current or cannot be verified. Each row must contain:
+
+- Image repository and configured/running reference.
+- Verified deployed application/image version and its evidence source, or `unverified`.
+- Current authoritative release/catalog URL, retrieval timestamp, and retrieval result: exactly `verified`, `not found`, `inaccessible`, `contradictory`, or `incomplete`.
+- Published release state: `stable`, `draft`, `prerelease`, or `unknown`.
+- Latest supported stable version, proposed target version, and exact target tag or digest.
+- Registry-manifest availability and required architecture/platform support.
+- Required variant and derived-build dependencies, with availability for every artifact. For example, a derived Caddy image requires the exact upstream `caddy:<version>-builder` artifact.
+- Update disposition: exactly `upgrade verified`, `current`, or `unverified — no recommendation`, plus confidence.
+
+Tool-call completion is not retrieval success. A 404, empty or nonmatching page, access failure, contradictory source, or missing required field is not verified evidence. Prior reports, repository documentation snapshots, chat/session claims, inferred advisory identifiers, tag age, and release ordering are historical hints only and cannot populate current-run evidence.
+
+For the CT guest OS, produce one **guest OS upgrade evidence** row containing:
+
+- Verified installed release and evidence source.
+- Authoritative release/support URL, retrieval timestamp, and retrieval result using the same closed result set.
+- Published supported stable target and support state.
+- Exact ordered intermediate release chain required by the current repository lifecycle logic.
+- Per-release proof that every intermediate branch and package repository exists and is reachable.
+- Workload compatibility evidence and lifecycle-parser compatibility.
+- Update disposition: exactly `upgrade verified`, `current`, or `unverified — no recommendation`, plus confidence.
+
+Do not infer missing versions or artifacts. Recon may describe the exact evidence gap, but an `unverified — no recommendation` row must not produce an upgrade recommendation, target version, migration prompt, or command.
+
 Classify findings:
 
 - **Critical** — verified actively affected vulnerability or unsupported component with material exposure.
@@ -128,7 +155,7 @@ Classify findings:
 - **Low** — maintenance, cleanup, observability, or optimization opportunity.
 - **Informational** — no action or insufficient evidence.
 
-Every CVE finding must include affected component/version evidence, advisory identifier/source, exposure/context, fixed version when known, and confidence.
+Every CVE finding must include affected component/version evidence, advisory identifier and authoritative source URL, retrieval timestamp/result, publication state, official affected range, deployed-version match, exposure/context, fixed version when known, exact fixed-artifact availability, disposition, and confidence. A nonexistent or unresolved advisory cannot establish exposure or severity. A verified vulnerability may remain a security finding when no fixed artifact is available, but Recon must recommend only verified mitigation or monitoring and must not claim that an upgrade fix is available.
 
 ### 5. Analyze hardware opportunities
 
@@ -159,6 +186,8 @@ Recommend only actions supported by evidence. For each recommendation include:
 - Prerequisites, compatibility checks, and likely files/workflows involved.
 - Whether a backup, maintenance window, migration plan, or deeper specialist analysis is required.
 
+An image upgrade recommendation requires a matching `upgrade verified` container image evidence row. A CT rootfs OS upgrade recommendation requires a matching `upgrade verified` guest OS evidence row whose complete intermediate chain is verified. No evidence row, no upgrade recommendation.
+
 Do not provide a ready-to-run mutating command unless the caller explicitly asked for command planning. Never execute it.
 
 ## Output format
@@ -169,6 +198,16 @@ Do not provide a ready-to-run mutating command unless the caller explicitly aske
 
 ### Workload inventory
 | Service | Role | Image/tag | Running version/digest | State | Key integrations |
+| --- | --- | --- | --- | --- | --- |
+
+### Container image evidence
+| Image | Deployed version evidence | Authoritative source / retrieval result | Latest / target | Exact artifact, platform, and dependency checks | Disposition |
+| --- | --- | --- | --- | --- | --- |
+
+Include every primary and supporting image. Do not omit an image because its evidence is unavailable.
+
+### Guest OS upgrade evidence
+| Installed release evidence | Authoritative source / retrieval result | Supported target | Verified intermediate chain and repositories | Compatibility | Disposition |
 | --- | --- | --- | --- | --- | --- |
 
 ### Telemetry state

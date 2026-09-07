@@ -1,6 +1,6 @@
 ---
 name: ct-compose
-description: Multi-step workflow to plan, confirm, and implement a Docker Compose application stack for a Proxmox CT identified by hostname or CTID. Use for new or updated CT workloads, image selection, Caddy/TLS exposure, Authentik authentication, initialization services, secrets, permissions, and storage mapping.
+description: Multi-step workflow to plan, confirm, and implement or remediate a Docker Compose application stack for a Proxmox CT identified by hostname or CTID. Use for new or updated CT workloads, image selection, health/readiness, Caddy/TLS exposure, Authentik authentication, initialization services, secrets, permissions, storage mapping, and portable GPU/Vulkan hardware profiles with automatic fallback.
 ---
 
 # Configure CT Compose
@@ -18,6 +18,15 @@ Before planning, read:
 - `CT`: CT hostname or CTID.
 - `IMAGE`: optional explicit application image.
 - `WORKLOAD`: optional workload name when no image is supplied.
+- `OUTCOME`, `EVIDENCE`, and `ACCEPTANCE_CRITERIA`: optional remediation context supplied by an optimization prompt.
+
+When optimization context is supplied, verify it against the current workload and preserve its outcome rather than treating proposed implementation details as established fact.
+
+## Ownership boundaries
+
+This skill owns Compose application structure and readiness, including portable profile variants and selectors. Full application telemetry reconciliation belongs to `ct-telemetry`; keep ordinary `container_name` and Compose compatibility work here, but split native OTLP, scrape-sidecar, telemetry migration, duplicate-shipping, and telemetry garbage-collection work into that skill.
+
+Host or LXC device exposure, lifecycle-script changes, central Telegraf/Proxmox resource telemetry, and node preparation are outside this skill. Report them as separate prerequisites under their applicable repository instructions rather than editing them as part of a Compose remediation.
 
 ## 0. Mandatory plan and confirmation
 

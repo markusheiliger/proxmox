@@ -90,10 +90,14 @@ Read Compose and all repository-local files it references, including:
 	presence, duplicate/override relationships, and whether a required value is empty when this can be
 	established without printing or retaining the value. Report only boolean/state results.
 - Caddy, telemetry, health-check, initializer, permissions, network, and profile declarations.
+- Application telemetry per service: native OTLP, Caddy tracing, Prometheus endpoint and scrape job, or none. Report native-plus-scrape duplication, canonical identity drift, every collector job, and whether a telemetry sidecar has no jobs.
+- Central CT resource telemetry availability as a separate fact from application telemetry. Do not infer that missing Telegraf, Proxmox RRD, or CT resource series can be repaired through application OTLP or a scrape sidecar.
 
 Render Compose read-only when the CT is available, but ensure command output cannot reveal interpolated secrets. Prefer targeted extraction/redaction over dumping the full rendered model.
 
 For each service record image/tag, role, dependencies, mounts, runtime user, ports/routes, health check, restart policy, profiles/devices, and telemetry method.
+
+For each hardware opportunity, distinguish a fallback that is present and verified, present but unverified, or absent. Record whether profile variants preserve a stable service endpoint and whether device selection is rediscovered dynamically.
 
 ### 3. Inspect runtime safely
 
@@ -150,6 +154,7 @@ Recommend only actions supported by evidence. For each recommendation include:
 - Priority and confidence.
 - Current state and evidence.
 - Proposed target state.
+- Measurable acceptance criteria that prove the target state without exposing secrets.
 - Benefit and risk.
 - Prerequisites, compatibility checks, and likely files/workflows involved.
 - Whether a backup, maintenance window, migration plan, or deeper specialist analysis is required.
@@ -165,6 +170,11 @@ Do not provide a ready-to-run mutating command unless the caller explicitly aske
 ### Workload inventory
 | Service | Role | Image/tag | Running version/digest | State | Key integrations |
 | --- | --- | --- | --- | --- | --- |
+
+### Telemetry state
+- Application telemetry method and canonical identity per service.
+- Collector sidecar jobs, duplicate native/scrape paths, stale wiring, and idle-sidecar status.
+- Central CT resource telemetry availability, source, and coverage, reported separately from application telemetry.
 
 ### Findings
 | Priority | Area | Finding | Evidence | Confidence |

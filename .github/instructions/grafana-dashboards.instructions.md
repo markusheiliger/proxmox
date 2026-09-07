@@ -39,4 +39,4 @@ Pin Tempo to a real release tag; do not use `latest`. Its data directory must be
 
 ## Verification
 
-Verify dashboards in the real browser. `POST /api/ds/query` may return zero frames for valid Infinity queries. To prove a metric, series, or label exists, query Prometheus, Loki, or Tempo directly using the `internal-api-debug` skill. Verify telemetry sidecar output by `__name__`, not a raw `job` value.
+Verify dashboards in the real browser. `POST /api/ds/query` may return zero frames for valid Infinity queries. To prove a metric, series, or label exists, query Prometheus, Loki, or Tempo directly using the `ct-probe` skill. Verify telemetry sidecar output by `__name__`, not a raw `job` value.

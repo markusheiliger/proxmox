@@ -1,9 +1,9 @@
 ---
-name: internal-api-debug
-description: Query or test an UNPUBLISHED / internal container HTTP API endpoint from the Proxmox host when the service is not host-published and has no exposed port. Use when you need to hit a container's localhost-only API (e.g. Prometheus /api/v1/series, Loki /loki/api/v1/labels, an app's /health or admin API) to verify a metric/series/label exists, debug a datasource, or reproduce a request — without guessing a host port. Attaches a throwaway curl container to the target container's network namespace.
+name: ct-probe
+description: Query or test an UNPUBLISHED internal container HTTP API from the Proxmox host when the service has no published port. Use to probe localhost-only health or admin endpoints, verify Prometheus metrics, Loki labels, Tempo data, debug a datasource, or reproduce a request without guessing a host port. Attaches a throwaway curl container to the target container's network namespace.
 ---
 
-# Debug an internal (unpublished) container API
+# Probe an internal container API
 
 Most services in this project are not host-published. They listen only on the CT's internal Docker network. Do not guess a host port. Run a throwaway curl container inside the target container's network namespace, where `localhost` resolves to the target's own ports.
 

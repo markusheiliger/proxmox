@@ -11,6 +11,16 @@ Before planning, read `.github/instructions/docker-compose.instructions.md`. Rea
 
 This skill edits only after confirmation and never deploys. The user applies changes with `refreshCT.sh <hostname>`.
 
+## Inputs and ownership
+
+- `CT`: CT hostname or CTID.
+- `SERVICES`: optional services highlighted by the request; always inspect and reconcile the complete stack telemetry state.
+- `EVIDENCE` and `ACCEPTANCE_CRITERIA`: optional context supplied by an optimization prompt; verify it against current state before planning.
+
+This skill owns application metrics and traces, native OTLP, Caddy tracing, Prometheus scrape sidecars, telemetry identity, duplicate-shipping prevention, migration, and stale-wiring garbage collection. It does not own image pinning, general health checks, authentication, permissions, storage, LXC/device hardening, or other non-telemetry Compose remediation; route those concerns to `ct-compose` as separate work.
+
+Central Telegraf, Docker fluentd logging, syslog, Proxmox RRD, and CT resource-series availability are infrastructure telemetry and remain outside this skill. If a request combines either infrastructure telemetry or unrelated Compose hardening with application telemetry, split the work before planning instead of broadening this reconciliation.
+
 ## Fleet telemetry model
 
 The central collector host comes from `commonCT.json .telemetry.hostname` and receives:
@@ -128,7 +138,7 @@ Confirm YAML is valid, identities match `container_name`, no service is both nat
 cd /root/scripts && ./refreshCT.sh <hostname>
 ```
 
-Suggest post-deploy checks in Tempo and Prometheus. Use the `internal-api-debug` skill when querying unpublished source APIs.
+Suggest post-deploy checks in Tempo and Prometheus. Use the `ct-probe` skill when querying unpublished source APIs.
 
 ## Guardrails
 

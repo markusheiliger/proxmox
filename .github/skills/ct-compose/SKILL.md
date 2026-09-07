@@ -93,10 +93,10 @@ Use `restart: "no"` only for finite, mandatory, idempotent initialization. Use l
 
 Expose web workloads through Caddy. Determine domain mode from hostname and `/root/scripts/commonCT.json`:
 
-- Primary/internal domain: `ghcr.io/markusheiliger/caddy-stepca:latest`.
-- Public domain: `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
+- Primary/internal domain: use exactly `ghcr.io/markusheiliger/caddy-stepca:latest`.
+- Public domain: use exactly `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
 
-Preserve an existing Caddy image unless the user asks to replace it.
+These project images and their mutable `:latest` references are mandatory. Never propose or implement official Caddy, another Caddy implementation, a fork, a version tag, or a digest deployment reference, even when the user requests general image pinning. For a Caddy security or version update, update and review the applicable project image build, publish it as `:latest`, verify the fixed runtime version, and leave the Compose image reference unchanged.
 
 If the workload has no suitable web UI, propose `nicolargo/glances` as a fallback UI, expose it through Caddy, and recommend forward auth. Do not add it silently.
 
@@ -143,6 +143,7 @@ After confirmed edits:
 
 - Never edit before explicit confirmation.
 - Never silently enable authentication.
+- Never replace either mandatory project Caddy image or its exact `:latest` deployment reference.
 - Never place secrets in interpolated `.env` values.
 - Never remove unrelated services.
 - Prefer minimal diffs and preserve existing style.

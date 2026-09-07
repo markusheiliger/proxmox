@@ -62,6 +62,13 @@ An explicit `restart: "no"` marks a mandatory finite initializer consumed by `re
 
 Expose services through the CT Caddy proxy and its labels. Internal service communication uses Docker container names. Do not publish internal-only service ports merely for diagnostics.
 
+The Caddy image is mandatory by domain mode:
+
+- Primary/internal domains: `ghcr.io/markusheiliger/caddy-stepca:latest`.
+- Public domains: `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
+
+Use these exact `:latest` references. Never substitute official Caddy, another Caddy implementation, a fork, a version tag, or a digest reference. Remediate Caddy vulnerabilities by rebuilding and reviewing the applicable project image, then keep the Compose reference unchanged.
+
 ## Secrets containing special characters
 
 Do not interpolate secrets containing `$`, quotes, `#`, or whitespace through Compose `.env`.

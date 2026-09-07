@@ -4515,6 +4515,19 @@ update_env_file() {
     local key="$1"
     sed -i "/^${key}=/d" "$env_file"
   }
+
+  compose_references_env_key() {
+    local key="$1"
+    local compose_file="${ct_config_dir%/_config}/docker-compose.yaml"
+    local reference="\${${key}}"
+
+    if [[ -n "$config_node" ]]; then
+      node_path_is_file "$config_node" "$compose_file" \
+        && run_on_node "$config_node" grep -Fq "$reference" "$compose_file"
+    else
+      [[ -f "$compose_file" ]] && grep -Fq "$reference" "$compose_file"
+    fi
+  }
   
   # Update required configuration values.
   # HOSTFQDN carries the CT's FQDN for compose interpolation. We deliberately do NOT
@@ -4589,7 +4602,9 @@ update_env_file() {
   telemetry_host=$(config_get_telemetry_hostname)
   otlp_http_port=$(config_get_telemetry_otlp_http_port)
   otlp_grpc_port=$(config_get_telemetry_otlp_grpc_port)
-  if [[ -n "$telemetry_host" && -n "$otlp_http_port" ]]; then
+  if [[ -n "$telemetry_host" && -n "$otlp_http_port" ]] \
+     && { compose_references_env_key "OTEL_EXPORTER_OTLP_ENDPOINT" \
+       || compose_references_env_key "OTEL_EXPORTER_OTLP_PROTOCOL"; }; then
     set_env_value "OTEL_EXPORTER_OTLP_ENDPOINT" "http://${telemetry_host}:${otlp_http_port}" "OTLP/HTTP telemetry endpoint (from commonCT.json)"
     # The endpoint above is the OTLP/HTTP port; OTEL SDKs default to gRPC, so the
     # protocol must be declared explicitly or exporters silently fail (gRPC frames
@@ -4604,7 +4619,9 @@ update_env_file() {
   # export OTLP over gRPC rather than HTTP - notably Caddy's native `tracing` module
   # (gRPC-only) and the per-CT `telemetry` sidecar collector. Kept separate from the
   # SDK HTTP endpoint above because they target different receiver ports (4317 vs 4318).
-  if [[ -n "$telemetry_host" && -n "$otlp_grpc_port" ]]; then
+  if [[ -n "$telemetry_host" && -n "$otlp_grpc_port" ]] \
+     && { compose_references_env_key "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT" \
+       || compose_references_env_key "OTEL_EXPORTER_OTLP_INSECURE"; }; then
     set_env_value "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT" "http://${telemetry_host}:${otlp_grpc_port}" "OTLP/gRPC telemetry endpoint (from commonCT.json)"
     # The collector's gRPC receiver is plaintext (no TLS); declare insecure so gRPC
     # exporters do not attempt a TLS handshake against a cleartext endpoint.

@@ -1,2 +1,4 @@
 commonCT.json
 /logs/
+/todos/*
+!/todos/.gitkeep

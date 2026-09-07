@@ -74,6 +74,18 @@ identity is `<hostname>/<container_name>` across logs, metrics, and traces. Cadd
 uses Compose labels to expose selected services and obtains certificates from
 the domain's configured issuer.
 
+All CT reverse proxies use the repository's mandatory custom Caddy images:
+
+- Primary and internal domains use exactly `ghcr.io/markusheiliger/caddy-stepca:latest`.
+- Public domains use exactly `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
+
+Official Caddy, alternative implementations, forks, version tags, and digest
+deployment references are prohibited. This preserves the repository's required
+plugins and domain-specific certificate behavior. Caddy security and version
+updates are made in the applicable image under `containers/`, published after
+review as `:latest`, and verified from the running binary; workload Compose
+references remain unchanged.
+
 ## Authentik
 
 Authentik is the central authentication provider. Forward authentication is

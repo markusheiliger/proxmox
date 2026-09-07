@@ -67,7 +67,8 @@ Each user-facing lifecycle script has a matching operator guide. Cross-cutting a
 
 ## Docker service conventions
 
-- Each CT uses Caddy for reverse proxying and automatic TLS through the appropriate project image.
+- Each CT uses Caddy for reverse proxying and automatic TLS through exactly one mandatory project image: primary/internal domains use `ghcr.io/markusheiliger/caddy-stepca:latest`, and public domains use `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
+- Do not replace these images with official Caddy, another Caddy implementation, a fork, or a digest/version deployment reference. Security and version updates must rebuild the applicable project image and continue deploying its mandatory `:latest` reference.
 - Internal service-to-service communication uses Docker container names.
 - Every Compose service has a deterministic `container_name`; telemetry identity is `<hostname>/<container_name>`.
 - Compose bind paths use CT-local `/mnt/docker/<service>` or `/mnt/docker-data/<service>` paths, never host-side hostname-qualified paths.

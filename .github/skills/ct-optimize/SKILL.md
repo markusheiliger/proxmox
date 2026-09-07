@@ -1,13 +1,13 @@
 ---
 name: ct-optimize
-description: "Analyze and optimize one Proxmox CT by CTID/hostname or all repository-managed CTs when no target is supplied. Use for portable workload-aware right-sizing, movable CPU/GPU profiles, cluster hardware/capability placement, node resource pressure, Alpine guest upgrades, container/image/configuration posture, optimization reviews, or generating documentation/optimization.md. Requires scout once per run and recon once per selected CT. Advisory only: persists a ranked report with manual lifecycle proposals and remediation prompts, but never applies recommendations."
+description: "Analyze and optimize one Proxmox CT by CTID/hostname or all repository-managed CTs when no target is supplied. Use for portable workload-aware right-sizing, movable CPU/GPU profiles, cluster hardware/capability placement, node resource pressure, Alpine guest upgrades, container/image/configuration posture, optimization reviews, or generating todos/optimization.md. Requires scout once per run and recon once per selected CT. Advisory only: persists a ranked report with manual lifecycle proposals and remediation prompts, but never applies recommendations."
 ---
 
 # Optimize Proxmox CT workloads
 
 Analyze one managed CT or all managed CTs in the cluster. Combine historical utilization, deep workload inspection, and cluster-node capabilities to produce evidence-backed recommendations grouped by cluster and CT.
 
-This skill is **strictly advisory**. Its only permitted mutation is creating or replacing `/root/scripts/documentation/optimization.md` with the validated report from the current run. It must never apply a recommendation or modify any other file, container, CT, node, or cluster state. Commands in the report are proposals for the operator to review and run manually.
+This skill is **strictly advisory**. Its only permitted mutation is creating or replacing `/root/scripts/todos/optimization.md` with the validated report from the current run. It must never apply a recommendation or modify any other file, container, CT, node, or cluster state. Commands in the report are proposals for the operator to review and run manually.
 
 CT movability is a hard invariant. An optimization must keep the workload functional after moving to another compatible cluster node; improved performance on one node must never become an undocumented hard dependency.
 
@@ -25,7 +25,7 @@ Resolve scope non-interactively:
 
 ## Absolute safety contract
 
-Only read, search, public web research, safe read-only probes, read-only `recon`/`scout` delegation, and publication of the validated report to `/root/scripts/documentation/optimization.md` are permitted.
+Only read, search, public web research, safe read-only probes, read-only `recon`/`scout` delegation, and publication of the validated report to `/root/scripts/todos/optimization.md` are permitted.
 
 The report is a generated output artifact, not workload configuration. Render and validate the complete document before writing it. Replace the whole file in one file-edit operation; never append, merge with, or partially update an older report. If required acquisition, reconciliation, validation, or publication fails, preserve the previous valid report and return the failure. Do not create a placeholder or incomplete file.
 
@@ -241,13 +241,16 @@ An issue and its prompt must stay within one owner's contract. Split independent
 
 For each uncovered issue, emit exactly one focused copy/paste prompt. The prompt must:
 
+- Begin with `/plan` as the first token so copying the complete block into VS Code Chat invokes the built-in Plan agent.
 - Identify the CT by hostname and CTID.
 - State the desired outcome, relevant evidence, and measurable acceptance criteria.
 - Require preservation of CT movability and automatic fallback where hardware is involved.
-- Request a plan and explicit confirmation before edits, preserve secrets, and exclude unrelated changes.
+- Require the Plan agent to inspect applicable files and project instructions, resolve material ambiguities, and present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification.
+- Keep the response in planning for user refinement or the **Start Implementation** handoff. Treat Start Implementation as explicit approval to leave planning; do not ask the planning response to edit files.
+- Preserve secrets and exclude unrelated changes.
 - Be outcome-oriented rather than prescribing unverified implementation details.
 - Contain one cohesive issue owned by exactly one workflow.
-- Start with `Use the <skill-name> skill`, substituting the selected owner's exact discovered frontmatter name. For generic work, state that no discovered repository skill owns the complete remediation and request a reviewed implementation plan.
+- Immediately after `/plan`, start skill-owned work with `Use the <skill-name> skill`, substituting the selected owner's exact discovered frontmatter name. For generic work, start with `/plan No discovered repository skill owns this complete remediation;` and request a reviewed implementation plan without inventing an owner.
 
 Record explicit ownership in coverage as `uncovered — <skill-name> — <prompt intent>` or `uncovered — generic — <prompt intent>`. Every non-generic `<skill-name>` must exist in the current run's eligible remediation-owner catalog.
 
@@ -280,7 +283,7 @@ Order commands by actual dependencies and explain the order. A common sequence i
 
 ## Generated report contract
 
-After all acquisition, reconciliation, sorting, and guardrail checks succeed, render one complete Markdown document and replace `/root/scripts/documentation/optimization.md`. Return only a concise chat summary with the report link, scope, issue/action counts, and incomplete CTs; the file is the authoritative full result.
+After all acquisition, reconciliation, sorting, and guardrail checks succeed, render one complete Markdown document and replace `/root/scripts/todos/optimization.md`. Return only a concise chat summary with the report link, scope, issue/action counts, and incomplete CTs; the file is the authoritative full result.
 
 Every run fully replaces the prior report:
 
@@ -353,7 +356,7 @@ Do not copy every CT issue into this section. For a repeated pattern, summarize 
 - **Downtime:** Expected interruption, or `none`/`unknown` with justification.
 - **Confidence:** `high`, `medium`, or `low`, tied to evidence quality.
 
-For each actionable uncovered issue unique to this section, emit exactly one immediately following `text` block labeled with the matching issue title and owner. It must explicitly invoke its discovered skill owner, or state that no discovered repository skill owns generic work. It must name the cluster or node and affected CTs, request a plan and explicit confirmation before edits, preserve secrets and movability, and exclude unrelated changes. Do not emit cluster-level shell commands. Do not add a second cluster prompt for a repeated issue already covered by per-CT prompts.
+For each actionable uncovered issue unique to this section, emit exactly one immediately following `text` block labeled with the matching issue title and owner. The block must begin with `/plan` and then explicitly invoke its discovered skill owner, or state that no discovered repository skill owns generic work. It must name the cluster or node and affected CTs and require the same implementation-ready, refinable Plan-agent output and **Start Implementation** handoff as CT prompts. Preserve secrets and movability, and exclude unrelated changes. Do not emit cluster-level shell commands. Do not add a second cluster prompt for a repeated issue already covered by per-CT prompts.
 
 If no cluster improvement is justified, include one informational record saying so. If Scout evidence is missing, the run must already have stopped before publication.
 
@@ -405,13 +408,13 @@ If there are no shortcomings, include one informational record stating that no o
 
 **Uncovered optimization prompts**
 
-For every uncovered issue, emit exactly one separate `text` code block immediately labeled with the matching issue title and owner. Prompts must be ready to copy into Copilot, explicitly invoke the owner recorded in coverage, and request planning and confirmation before edits. Example shape:
+For every uncovered issue, emit exactly one separate `text` code block immediately labeled with the matching issue title and owner. Prompts must be ready to copy into VS Code Chat, begin with `/plan`, explicitly invoke the owner recorded in coverage, and produce a plan that the operator can refine or hand off with **Start Implementation**. Example shape:
 
 ```text
-Use the <skill-name> skill for CT <CTID> (<hostname>) to plan a focused update that <desired outcome>. Evidence: <concise evidence>. Preserve CT movability by <fallback/profile constraint>. Acceptance criteria: <verifiable result>. First inspect the current files and applicable project instructions, then present a plan and wait for explicit confirmation before editing. Preserve secrets and unrelated configuration.
+/plan Use the <skill-name> skill for CT <CTID> (<hostname>) to plan a focused update that <desired outcome>. Evidence: <concise evidence>. Preserve CT movability by <fallback/profile constraint>. Acceptance criteria: <verifiable result>. Inspect the current files and applicable project instructions, resolve material ambiguities, then present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification. Remain in planning so I can refine the plan or use Start Implementation as explicit approval to begin edits. Preserve secrets and unrelated configuration.
 ```
 
-For `generic`, replace the opening sentence with: `No discovered repository skill owns this complete remediation; plan a focused implementation for ...`.
+For `generic`, replace the opening with: `/plan No discovered repository skill owns this complete remediation; plan a focused implementation for ...` and retain the same implementation-ready plan and handoff requirements.
 
 Do not emit this subsection's prompt blocks when no uncovered issue exists. Do not wrap prompts in shell fences or make them commands.
 
@@ -431,9 +434,9 @@ End the complete report with a truthful write-status disclaimer:
 
 ### Publication
 
-Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, prompt/action cardinality, lifecycle syntax, secret redaction, and the final disclaimer. Then create or replace only `/root/scripts/documentation/optimization.md` in one file-edit operation. Never publish incrementally.
+Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, prompt/action cardinality, lifecycle syntax, secret redaction, and the final disclaimer. Then create or replace only `/root/scripts/todos/optimization.md` in one file-edit operation. Never publish incrementally.
 
-After successful publication, return a concise summary and link to `[documentation/optimization.md](documentation/optimization.md)`. If publication fails, report the error and provide the complete Markdown in chat without claiming the file was updated.
+After successful publication, return a concise summary and link to `[todos/optimization.md](todos/optimization.md)`. If publication fails, report the error and provide the complete Markdown in chat without claiming the file was updated.
 
 ## Guardrails checklist
 
@@ -451,7 +454,8 @@ Before returning the report, confirm:
 - Every proposed optimization is classified for portability; blocked/unknown ideas have no command or apply-ready prompt, and any fallback-architecture prompt belongs to a distinct uncovered issue.
 - No node name, `COMPOSE_PROFILES`, PCI identity, or `renderD<N>` is persisted in workload configuration; hardware variants retain automatic functional fallback.
 - `upgradeCT.sh` is used only for Alpine guest OS upgrades.
-- Every actionable issue has exactly one remediation-coverage class and one workflow owner. Every uncovered actionable issue has exactly one focused prompt that explicitly invokes the same owner, cross-owner findings are split, rejected portability ideas remain non-actionable, and dependent lifecycle commands use exact `# BLOCKED UNTIL:` prompt titles for completed and verified prerequisite edits.
+- Every actionable issue has exactly one remediation-coverage class and one workflow owner. Every uncovered actionable issue has exactly one focused prompt whose first token is `/plan` and which explicitly invokes the same owner, cross-owner findings are split, rejected portability ideas remain non-actionable, and dependent lifecycle commands use exact `# BLOCKED UNTIL:` prompt titles for completed and verified prerequisite edits.
+- Every CT-level and unique cluster-level prompt requests affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification, then remains in planning for refinement or the **Start Implementation** handoff.
 - No rootfs shrink or unsupported flag is proposed.
 - Every issue states severity, evidence, why it matters, how to fix it, coverage, portability, prerequisites, risk/rollback, downtime, and confidence.
 - Every CT has exactly one minimal lifecycle-command block; prompt blocks are one per uncovered issue and counts reconcile by owner.
@@ -462,4 +466,4 @@ Before returning the report, confirm:
 - Summary counts match the sorted issue records, owner-specific prompts, command blocks, incomplete CTs, and unchanged CTs.
 - Application telemetry and central Telegraf/Proxmox resource telemetry are reported separately; missing central CT series never route to `ct-telemetry`.
 - The complete document passed validation before one create/replace operation; no partial report was published.
-- `/root/scripts/documentation/optimization.md` was the only file written; no command was executed, no confirmation was bypassed, no recommendation was applied, and no secret value was exposed.
+- `/root/scripts/todos/optimization.md` was the only file written; no command was executed, no confirmation was bypassed, no recommendation was applied, and no secret value was exposed.

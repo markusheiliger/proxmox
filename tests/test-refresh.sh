@@ -14,6 +14,11 @@ assert_contains() {
   if grep -Fq "$expected" "$file"; then pass "$name"; else cat "$file" >&2; fail "$name"; fi
 }
 
+assert_not_contains() {
+  local name="$1" file="$2" unexpected="$3"
+  if grep -Fq "$unexpected" "$file"; then cat "$file" >&2; fail "$name"; else pass "$name"; fi
+}
+
 source "${SCRIPT_DIR}/refreshCT.sh"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -224,6 +229,43 @@ update_env_file "$remote_env" /mnt/docker/ai.thesaints.home/_config pve02
 assert_contains "remote configure script retains Authentik API token" "$remote_env" "AUTH_API_TOKEN=test-api-token"
 assert_contains "remote configure script retains authorization flow" "$remote_env" "AUTH_AUTHORIZATION_FLOW=authorization-flow"
 assert_contains "remote configure script retains invalidation flow" "$remote_env" "AUTH_INVALIDATION_FLOW=invalidation-flow"
+
+config_get_telemetry_hostname() { echo telemetry.example.test; }
+config_get_telemetry_otlp_http_port() { echo 4318; }
+config_get_telemetry_otlp_grpc_port() { echo 4317; }
+
+run_otlp_env_case() {
+  local case_name="$1" compose_content="$2"
+  local case_dir="${TEST_ROOT}/${case_name}"
+  mkdir -p "${case_dir}/_config"
+  printf '%s\n' "$compose_content" > "${case_dir}/docker-compose.yaml"
+  cat > "${case_dir}/.env" <<'EOF'
+OTEL_EXPORTER_OTLP_ENDPOINT=stale-http
+OTEL_EXPORTER_OTLP_PROTOCOL=stale-protocol
+OTEL_EXPORTER_OTLP_GRPC_ENDPOINT=stale-grpc
+OTEL_EXPORTER_OTLP_INSECURE=stale-insecure
+EOF
+  update_env_file "${case_dir}/.env" "${case_dir}/_config"
+  printf '%s\n' "${case_dir}/.env"
+}
+
+http_env=$(run_otlp_env_case http 'environment: ["OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}", "OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL}"]')
+assert_contains "HTTP OTLP endpoint is retained when referenced" "$http_env" "OTEL_EXPORTER_OTLP_ENDPOINT=http://telemetry.example.test:4318"
+assert_contains "HTTP OTLP protocol is retained when referenced" "$http_env" "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"
+assert_not_contains "unused gRPC OTLP endpoint is removed" "$http_env" "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT="
+assert_not_contains "unused gRPC insecure flag is removed" "$http_env" "OTEL_EXPORTER_OTLP_INSECURE="
+
+grpc_env=$(run_otlp_env_case grpc 'environment: ["OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_GRPC_ENDPOINT}", "OTEL_EXPORTER_OTLP_INSECURE=${OTEL_EXPORTER_OTLP_INSECURE}"]')
+assert_contains "gRPC OTLP endpoint is retained when referenced" "$grpc_env" "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT=http://telemetry.example.test:4317"
+assert_contains "gRPC OTLP insecure flag is retained when referenced" "$grpc_env" "OTEL_EXPORTER_OTLP_INSECURE=true"
+assert_not_contains "unused HTTP OTLP endpoint is removed" "$grpc_env" "OTEL_EXPORTER_OTLP_ENDPOINT="
+assert_not_contains "unused HTTP OTLP protocol is removed" "$grpc_env" "OTEL_EXPORTER_OTLP_PROTOCOL="
+
+none_env=$(run_otlp_env_case none 'services: {}')
+assert_not_contains "unreferenced HTTP OTLP endpoint is removed" "$none_env" "OTEL_EXPORTER_OTLP_ENDPOINT="
+assert_not_contains "unreferenced HTTP OTLP protocol is removed" "$none_env" "OTEL_EXPORTER_OTLP_PROTOCOL="
+assert_not_contains "unreferenced gRPC OTLP endpoint is removed" "$none_env" "OTEL_EXPORTER_OTLP_GRPC_ENDPOINT="
+assert_not_contains "unreferenced gRPC insecure flag is removed" "$none_env" "OTEL_EXPORTER_OTLP_INSECURE="
 
 echo "${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

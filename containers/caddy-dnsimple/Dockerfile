@@ -1,10 +1,21 @@
-FROM caddy:builder AS builder
+ARG CADDY_RELEASE
+FROM caddy:${CADDY_RELEASE}-builder AS builder
+
+ARG CADDY_RELEASE
 
 RUN xcaddy build \
 	--with github.com/caddy-dns/dnsimple \
-	--with github.com/lucaslorentz/caddy-docker-proxy/v2
+	--with github.com/lucaslorentz/caddy-docker-proxy/v2 \
+	&& test "$(caddy version | cut -d' ' -f1)" = "v${CADDY_RELEASE}" \
+	&& caddy list-modules --packages | grep -Fq 'github.com/caddy-dns/dnsimple' \
+	&& caddy list-modules --packages | grep -Fq 'github.com/lucaslorentz/caddy-docker-proxy/v2' \
+	&& caddy docker-proxy --help >/dev/null
 
 FROM alpine:latest
+
+ARG CADDY_RELEASE
+
+LABEL org.opencontainers.image.version="${CADDY_RELEASE}"
 
 RUN apk add --no-cache bash ca-certificates
 

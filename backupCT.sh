@@ -32,7 +32,7 @@ Usage: backupCT.sh ACTION [options]
   --run <CTID|hostname|all>  Run an immediate suspend backup
   --verify                Report archive/workload pair completeness
   --restore-test <CT>     Restore the newest complete pair into an isolated CT
-  --restore-id <unused>   Required unused CTID for --restore-test
+  --restore-id <unused>   Optional unused CTID override for --restore-test
   --node <node>           Restore-test node (defaults to source CT node)
   --force                 Skip restore-test confirmation
   --dry-run               Print mutations without performing them
@@ -428,15 +428,30 @@ run_node_shell() {
   if [[ "$node" == "$(hostname -s)" ]]; then sh -c "$command"; else ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "$command"; fi
 }
 
-restore_test() {
-  local source="$1" storage mount_path archive stem generation node docker_temp data_temp resources command reply restore_bridge restore_reason
-  [[ "$RESTORE_ID" =~ ^[1-9][0-9]+$ ]] || { echo "ERROR: --restore-id with an unused numeric CTID is required." >&2; return 1; }
-  resolve_cluster_ct "$source"
-  resources=$(pvesh get /cluster/resources --type vm --output-format json)
+resolve_restore_id() {
+  local resources="$1"
+  if [[ -z "$RESTORE_ID" ]]; then
+    RESTORE_ID=$(pvesh get /cluster/nextid 2>/dev/null) || {
+      echo "ERROR: Could not allocate an unused restore CTID." >&2
+      return 1
+    }
+    echo "Automatically selected restore CTID ${RESTORE_ID}."
+  fi
+  [[ "$RESTORE_ID" =~ ^[1-9][0-9]+$ ]] || {
+    echo "ERROR: Restore CTID must be a positive numeric value." >&2
+    return 1
+  }
   [[ "$(jq --argjson id "$RESTORE_ID" '[.[] | select(.vmid == $id)] | length' <<<"$resources")" == 0 ]] || {
     echo "ERROR: Restore CTID ${RESTORE_ID} already exists." >&2
     return 1
   }
+}
+
+restore_test() {
+  local source="$1" storage mount_path archive stem generation node docker_temp data_temp resources command reply restore_bridge restore_reason
+  resolve_cluster_ct "$source"
+  resources=$(pvesh get /cluster/resources --type vm --output-format json)
+  resolve_restore_id "$resources" || return 1
   storage=$(config_get_backup_storage)
   mount_path="/mnt/pve/${storage}"
   archive=$(find "${mount_path}/dump" -maxdepth 1 -type f -name "vzdump-lxc-${CTID}-*.tar.zst" -print | sort -r | head -n 1 || true)
@@ -484,7 +499,7 @@ restore_test() {
     run_node_shell "$node" "rm -rf --one-file-system '$docker_temp' '$data_temp'" || true
     return 1
   fi
-  run_on_node "$node" pct set "$RESTORE_ID" -tags backup-restore-test
+  run_on_node "$node" pct set "$RESTORE_ID" -tags backup-restore-test -onboot 0
   command="for mp in \$(pct config '$RESTORE_ID' | awk -F: '/^mp[0-9]+:/ {print \$1}'); do pct set '$RESTORE_ID' -delete \"\$mp\"; done"
   run_node_shell "$node" "$command"
   run_on_node "$node" pct set "$RESTORE_ID" -mp0 "${docker_temp},mp=/mnt/docker" -mp1 "${data_temp},mp=/mnt/docker-data"

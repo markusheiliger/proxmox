@@ -88,6 +88,7 @@
 #   CONFIG_FILE            Path to commonCT.json
 #   CT_MAP                 Associative array: CTID -> hostname
 #   CT_STATUS              Associative array: CTID -> status (running/stopped)
+#   CT_TAGS                Associative array: CTID -> semicolon-separated tags
 #   CT_LIST                Array of CTIDs
 #   CTID                   Selected container ID
 #   CT_HOSTNAME            Selected container hostname
@@ -115,6 +116,7 @@ CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/commonCT.json}"
 declare -A CT_MAP
 declare -A CT_STATUS
 declare -A CT_NODE
+declare -A CT_TAGS
 declare -a CT_LIST
 CTID=""
 CT_HOSTNAME=""
@@ -248,6 +250,35 @@ node_upload_file() {
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "$command" < "$local_path"
 }
 
+ct_upload_file() {
+  local ctid="${1:-}" local_path="${2:-}" ct_path="${3:-}" mode="${4:-0600}"
+  local node source_on_node ct_temporary host_temporary
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && -f "$local_path" && "$ct_path" == /* && "$mode" =~ ^0?[0-7]{3,4}$ ]] || {
+    echo "ERROR: ct_upload_file received invalid arguments." >&2
+    return 1
+  }
+  node=$(get_ct_owner_node "$ctid") || return 1
+  source_on_node="$local_path"
+  host_temporary=""
+  if [[ "$node" != "$(hostname -s)" ]]; then
+    host_temporary="/tmp/ct-upload-${ctid}-$$"
+    node_upload_file "$node" "$local_path" "$host_temporary" 0600 || return 1
+    source_on_node="$host_temporary"
+  fi
+  ct_temporary="${ct_path}.tmp.$$"
+  if ! run_on_node "$node" pct push "$ctid" "$source_on_node" "$ct_temporary" \
+    -perms "$mode" -user 0 -group 0; then
+    [[ -z "$host_temporary" ]] || run_on_node "$node" rm -f -- "$host_temporary" || true
+    return 1
+  fi
+  if ! run_on_node "$node" pct exec "$ctid" -- mv -f -- "$ct_temporary" "$ct_path"; then
+    run_on_node "$node" pct exec "$ctid" -- rm -f -- "$ct_temporary" || true
+    [[ -z "$host_temporary" ]] || run_on_node "$node" rm -f -- "$host_temporary" || true
+    return 1
+  fi
+  [[ -z "$host_temporary" ]] || run_on_node "$node" rm -f -- "$host_temporary"
+}
+
 node_sync_tree() {
   local node="${1:-}" local_dir="${2:-}" remote_dir="${3:-}" quoted_dir
   [[ -n "$node" && -d "$local_dir" && -n "$remote_dir" ]] || {
@@ -341,12 +372,14 @@ lifecycle_log_init() {
   [[ -n "$script_path" ]] || { echo "ERROR: Lifecycle logger requires a script path." >&2; return 1; }
   script_name=$(basename "$script_path" .sh)
   log_dir="${LIFECYCLE_LOG_DIR:-${SCRIPT_DIR}/logs}"
-  umask 077
-  mkdir -p "$log_dir" || { echo "ERROR: Cannot create lifecycle log directory: ${log_dir}" >&2; return 1; }
-  chmod 0700 "$log_dir" || { echo "ERROR: Cannot secure lifecycle log directory: ${log_dir}" >&2; return 1; }
   RUN_LOG_FILE="${log_dir}/${script_name}.log"
-  : > "$RUN_LOG_FILE" || { echo "ERROR: Cannot create lifecycle log: ${RUN_LOG_FILE}" >&2; return 1; }
-  chmod 0600 "$RUN_LOG_FILE" || { echo "ERROR: Cannot secure lifecycle log: ${RUN_LOG_FILE}" >&2; return 1; }
+  (
+    umask 077
+    mkdir -p "$log_dir" || { echo "ERROR: Cannot create lifecycle log directory: ${log_dir}" >&2; exit 1; }
+    chmod 0700 "$log_dir" || { echo "ERROR: Cannot secure lifecycle log directory: ${log_dir}" >&2; exit 1; }
+    : > "$RUN_LOG_FILE" || { echo "ERROR: Cannot create lifecycle log: ${RUN_LOG_FILE}" >&2; exit 1; }
+    chmod 0600 "$RUN_LOG_FILE" || { echo "ERROR: Cannot secure lifecycle log: ${RUN_LOG_FILE}" >&2; exit 1; }
+  ) || return 1
   exec 8>&1 9>&2
   exec > >(tee -a "$RUN_LOG_FILE" >&8) 2>&1
   RUN_LOG_TEE_PID=$!
@@ -2439,6 +2472,30 @@ detect_node_gpu_capability() {
   esac
 }
 
+ct_managed_gpu_disabled() {
+  local ctid="$1"
+  local target_hostname="${2:-${CT_HOSTNAME:-}}"
+  local node marker
+  [[ -n "$target_hostname" ]] || target_hostname="${CT_MAP[$ctid]:-}"
+  [[ "$target_hostname" == ca.* ]] && return 0
+  [[ -n "$target_hostname" ]] || return 1
+  node=$(get_ct_owner_node "$ctid") || return 1
+  marker="/mnt/docker/${target_hostname}/_config/disable-managed-gpu"
+  node_path_is_file "$node" "$marker"
+}
+
+resolve_ct_gpu_capability() {
+  local ctid="$1"
+  local node="$2"
+  if ct_managed_gpu_disabled "$ctid"; then
+    NODE_GPU_STATE="absent"
+    NODE_GPU_RENDER_DEVICES=()
+    NODE_GPU_RENDER_GIDS=()
+  else
+    detect_node_gpu_capability "$node"
+  fi
+}
+
 ct_gpu_config_matches_capability() {
   local ctid="$1"
   local config_file="/etc/pve/lxc/${ctid}.conf"
@@ -2447,7 +2504,7 @@ ct_gpu_config_matches_capability() {
   run_on_node "$node" grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null && has_allow=true
   run_on_node "$node" grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null && has_mount=true
 
-  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+  if [[ "$NODE_GPU_STATE" == "available" ]] && ! ct_managed_gpu_disabled "$ctid"; then
     [[ "$has_allow" == "true" && "$has_mount" == "true" ]]
   else
     [[ "$has_allow" == "false" && "$has_mount" == "false" ]]
@@ -2470,13 +2527,13 @@ reconcile_stopped_ct_gpu_config() {
     -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
     "$config_file"
 
-  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+  if [[ "$NODE_GPU_STATE" == "available" ]] && ! ct_managed_gpu_disabled "$ctid"; then
     run_node_shell "$node" "printf '%s\\n' \
       'lxc.cgroup2.devices.allow: c 226:* rwm' \
       'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' >> '$config_file'"
     echo "  [✓] CT ${ctid}: exposing ${#NODE_GPU_RENDER_DEVICES[@]} DRM render device(s)"
   else
-    echo "  [✓] CT ${ctid}: removed managed DRM passthrough (no GPU on node)"
+    echo "  [✓] CT ${ctid}: removed managed DRM passthrough"
   fi
 }
 
@@ -2486,7 +2543,7 @@ reconcile_ct_gpu_config() {
   local original_status
   original_status=$(get_ct_status "$ctid")
 
-  detect_node_gpu_capability "$node" || return 1
+  resolve_ct_gpu_capability "$ctid" "$node" || return 1
   if ct_gpu_config_matches_capability "$ctid"; then
     echo "  [✓] CT ${ctid}: GPU config matches node '${node}' (${NODE_GPU_STATE})"
     return 0
@@ -2507,6 +2564,11 @@ finalize_ct_gpu_capability() {
   local ctid="${1:-${CTID}}"
   local node="${2:-}"
   local index device gid group
+
+  if ct_managed_gpu_disabled "$ctid"; then
+    echo "  [✓] CT ${ctid}: managed GPU passthrough is disabled"
+    return 0
+  fi
 
   [[ -n "$node" ]] || node=$(get_ct_owner_node "$ctid") || return 1
   detect_node_gpu_capability "$node" || return 1
@@ -2705,15 +2767,7 @@ compose_up() {
   newt_secret=$(config_get_newt_secret "$hostname")
   newt_endpoint=$(config_get_newt_endpoint "$hostname")
 
-  # Determine TLS provider env requirements for this CT domain
-  local domain ssl_type dns_provider dns_api_token dns_account_id
-  domain=$(extract_domain_from_hostname "$hostname")
-  ssl_type=$(config_get_ssl_type "$domain")
-  dns_provider=$(config_get_dns_provider "$domain")
-  dns_api_token=$(config_get_dns_api_token "$domain")
-  dns_account_id=$(config_get_dns_account_id "$domain")
-  
-  # Update .env file with newt values
+  # Reconcile .env through the same consumption-aware path used during mount setup.
   local hostname_lower
   hostname_lower=$(echo "$hostname" | tr '[:upper:]' '[:lower:]')
   local env_file="/mnt/docker/${hostname_lower}/.env"
@@ -2723,37 +2777,8 @@ compose_up() {
     stage_dir=$(mktemp -d)
     stage_env="${stage_dir}/.env"
     node_download_file "$node" "$env_file" "$stage_env"
-    set_or_add_env() {
-      local key="$1"
-      local value="$2"
-      if grep -q "^${key}=" "$stage_env"; then
-        sed -i "s|^${key}=.*|${key}=${value}|" "$stage_env"
-      else
-        echo "${key}=${value}" >> "$stage_env"
-      fi
-    }
-
-    remove_env() {
-      local key="$1"
-      sed -i "/^${key}=/d" "$stage_env"
-    }
-
-    # Update or add NEWT values
-    set_or_add_env "NEWT_ID" "${newt_id}"
-    set_or_add_env "NEWT_SECRET" "${newt_secret}"
-    set_or_add_env "NEWT_ENDPOINT" "${newt_endpoint}"
-
-    # Keep DNS provider credentials aligned with the CT domain SSL config.
-    if [[ "$ssl_type" == "letsencrypt" && "$dns_provider" == "dnsimple" && -n "$dns_api_token" ]]; then
-      set_or_add_env "DNSIMPLE_API_ACCESS_TOKEN" "${dns_api_token}"
-      # Optional account id; an empty value lets the provider fall back to a whoami lookup.
-      set_or_add_env "DNSIMPLE_ACCOUNT_ID" "${dns_account_id}"
-    else
-      # Avoid leaking DNSimple vars into non-dnsimple or internal domains.
-      remove_env "DNSIMPLE_API_ACCESS_TOKEN"
-      remove_env "DNSIMPLE_ACCOUNT_ID"
-    fi
-    node_upload_file "$node" "$stage_env" "$env_file" 0600
+    update_env_file "$stage_env" "/mnt/docker/${hostname_lower}/_config" "$node"
+    ct_upload_file "$ctid" "$stage_env" /mnt/docker/.env 0600
     rm -rf "$stage_dir"
   fi
   
@@ -3645,26 +3670,36 @@ reconcile_vlan_change() {
 }
 
 # Build list of all containers
-# Populates CT_MAP (CTID -> hostname), CT_STATUS (CTID -> status), and CT_LIST (array of CTIDs)
+# Populates CT_MAP, CT_STATUS, CT_NODE, CT_TAGS, and CT_LIST.
 build_ct_list() {
   CT_MAP=()
   CT_LIST=()
   CT_STATUS=()
   CT_NODE=()
+  CT_TAGS=()
 
-  local resources id status name node
+  local resources id status name node tags
   resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || {
     echo "ERROR: Cannot query cluster containers." >&2
     return 1
   }
-  while IFS=$'\t' read -r id status name node; do
+  while IFS=$'\t' read -r id status name node tags; do
     [[ "$id" =~ ^[1-9][0-9]*$ && -n "$name" && -n "$node" ]] || continue
     CT_MAP["$id"]="$name"
     CT_STATUS["$id"]="${status:-unknown}"
     CT_NODE["$id"]="$node"
+    CT_TAGS["$id"]="$tags"
     CT_LIST+=("$id")
-  done < <(jq -r '.[] | select(.type == "lxc") | [.vmid, (.status // "unknown"), (.name // ""), (.node // "")] | @tsv' \
+  done < <(jq -r '.[] | select(.type == "lxc") | [.vmid, (.status // "unknown"), (.name // ""), (.node // ""), (.tags // "")] | @tsv' \
     <<< "$resources" | sort -n)
+}
+
+ct_has_tag() {
+  local ctid="$1" expected_tag="$2" tag
+  while IFS= read -r tag; do
+    [[ "$tag" == "$expected_tag" ]] && return 0
+  done < <(tr ';' '\n' <<<"${CT_TAGS[$ctid]:-}")
+  return 1
 }
 
 # Display interactive single-select container menu using whiptail
@@ -3818,7 +3853,8 @@ select_ct_interactive_multi() {
 # Sets: CTID, CT_HOSTNAME
 # Returns: 0 on success, 1 on failure
 resolve_ct_from_input() {
-  local input="$1"
+  local input="$1" id
+  local matches=()
   
   if [[ -z "$input" ]]; then
     echo "ERROR: No CTID or hostname provided."
@@ -3836,18 +3872,21 @@ resolve_ct_from_input() {
   else
     # Input is a hostname
     CT_HOSTNAME="$input"
-    CTID=""
     for id in "${CT_LIST[@]}"; do
       if [[ "${CT_MAP[$id]}" == "$CT_HOSTNAME" ]]; then
-        CTID="$id"
-        break
+        matches+=("$id")
       fi
     done
-    
-    if [[ -z "$CTID" ]]; then
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
       echo "ERROR: No CT found with hostname '${CT_HOSTNAME}'."
       return 1
     fi
+    if [[ ${#matches[@]} -ne 1 ]]; then
+      echo "ERROR: Hostname '${CT_HOSTNAME}' matches multiple CTs: ${matches[*]}. Use a numeric CTID."
+      return 1
+    fi
+    CTID="${matches[0]}"
   fi
   
   return 0
@@ -4488,6 +4527,10 @@ update_env_file() {
   dns_account_id=$(config_get_dns_account_id "${domain}")
   local email
   email=$(config_get_email "${domain}")
+  local newt_id newt_secret newt_endpoint
+  newt_id=$(config_get_newt_id "$target_hostname")
+  newt_secret=$(config_get_newt_secret "$target_hostname")
+  newt_endpoint=$(config_get_newt_endpoint "$target_hostname")
   
   # Create file if it doesn't exist
   touch "$env_file"
@@ -4516,6 +4559,11 @@ update_env_file() {
     sed -i "/^${key}=/d" "$env_file"
   }
 
+  ensure_env_key() {
+    local key="$1"
+    grep -q "^${key}=" "$env_file" || echo "${key}=" >> "$env_file"
+  }
+
   compose_references_env_key() {
     local key="$1"
     local compose_file="${ct_config_dir%/_config}/docker-compose.yaml"
@@ -4537,7 +4585,11 @@ update_env_file() {
   # no such collision. remove_env_key cleans up the legacy HOSTNAME line on refresh.
   set_env_value "HOSTFQDN" "${target_hostname}" "Site FQDN (from CT container)"
   remove_env_key "HOSTNAME"
-  set_env_value "CADDY_EMAIL" "${email}" "Caddy email for ACME (from commonCT.json)"
+  if compose_references_env_key "CADDY_EMAIL"; then
+    set_env_value "CADDY_EMAIL" "${email}" "Caddy email for ACME (from commonCT.json)"
+  else
+    remove_env_key "CADDY_EMAIL"
+  fi
 
   # Authentik / OIDC provider values (product-agnostic AUTH_* names; the CT .env is
   # the single source of truth, consumed by both compose interpolation and the per-CT
@@ -4631,12 +4683,26 @@ update_env_file() {
     remove_env_key "OTEL_EXPORTER_OTLP_INSECURE"
   fi
 
-  # Add Newt/Pangolin placeholders if not already present
-  if ! grep -q "^NEWT_ID=" "$env_file"; then
-    echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
-    echo "NEWT_ID=" >> "$env_file"
-    echo "NEWT_SECRET=" >> "$env_file"
-    echo "NEWT_ENDPOINT=" >> "$env_file"
+  if compose_references_env_key "NEWT_ID" \
+     || compose_references_env_key "NEWT_SECRET" \
+     || compose_references_env_key "NEWT_ENDPOINT"; then
+    if [[ -n "$newt_id" && -n "$newt_secret" && -n "$newt_endpoint" ]]; then
+      set_env_value "NEWT_ID" "$newt_id" "Newt/Pangolin tunnel configuration (from commonCT.json)"
+      set_env_value "NEWT_SECRET" "$newt_secret" ""
+      set_env_value "NEWT_ENDPOINT" "$newt_endpoint" ""
+    else
+      if ! grep -q '^NEWT_\(ID\|SECRET\|ENDPOINT\)=' "$env_file"; then
+        echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
+      fi
+      ensure_env_key "NEWT_ID"
+      ensure_env_key "NEWT_SECRET"
+      ensure_env_key "NEWT_ENDPOINT"
+    fi
+  else
+    remove_env_key "NEWT_ID"
+    remove_env_key "NEWT_SECRET"
+    remove_env_key "NEWT_ENDPOINT"
+    sed -i "/^# Newt\/Pangolin tunnel configuration/d" "$env_file"
   fi
   
   # Clean up multiple blank lines
@@ -4706,7 +4772,7 @@ setup_mountpoints() {
     : > "$stage_env"
   fi
   update_env_file "$stage_env" "${DIR_DOCKER}/_config" "$node"
-  node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600
+  ct_upload_file "$CTID" "$stage_env" /mnt/docker/.env 0600
   rm -rf "$stage_dir"
 
   # Idempotent mount setup: only reconfigure if mounts are missing or incorrect
@@ -4781,6 +4847,16 @@ compose_permission_render() {
   else
     compose_permission_ct_exec --timeout 30 "$ctid" \
       'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --format json; else docker compose config --format json; fi'
+  fi
+}
+
+compose_permission_render_env_files() {
+  local ctid="$1"
+  if [[ "${COMPOSE_PERMISSION_EXECUTOR:-ct_exec}" == ct_exec ]]; then
+    ct_compose --timeout 30 "$ctid" config --format json --no-env-resolution
+  else
+    compose_permission_ct_exec --timeout 30 "$ctid" \
+      'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --format json --no-env-resolution; else docker compose config --format json --no-env-resolution; fi'
   fi
 }
 
@@ -4923,10 +4999,11 @@ resolve_compose_service_user() {
 # Validate and reconcile all repository-managed Compose bind permissions. Every
 # mutation runs inside the CT, so LXC applies the active node's idmap.
 reconcile_compose_permissions() {
-  local ctid="${1:-$CTID}" mode="${2:-apply}" compose_json service owner source create_host_path skip recursive quoted_source
-  local existing_owner services_for_source secret_path quoted_secret quoted_parent planned_source uid gid
+  local ctid="${1:-$CTID}" mode="${2:-apply}" compose_json compose_env_json service owner source create_host_path skip recursive quoted_source
+  local existing_owner services_for_source secret_path raw_env_path quoted_secret quoted_parent planned_source uid gid
   local -A source_owners=() source_services=() source_recursive=() source_create=() source_missing=()
-  local -a sources=() secrets=()
+  local -A raw_env_seen=() secret_seen=()
+  local -a sources=() secrets=() raw_env_files=()
 
   [[ "$mode" == "apply" || "$mode" == "--check" ]] || {
     echo "  [!] Invalid permission reconciliation mode '${mode}'" >&2
@@ -4935,6 +5012,10 @@ reconcile_compose_permissions() {
 
   compose_json=$(compose_permission_render "$ctid" 2>/dev/null) || {
     echo "  [!] Could not render Compose permission plan" >&2
+    return 1
+  }
+  compose_env_json=$(compose_permission_render_env_files "$ctid" 2>/dev/null) || {
+    echo "  [!] Could not render Compose env_file permission plan" >&2
     return 1
   }
 
@@ -5003,13 +5084,44 @@ reconcile_compose_permissions() {
   while IFS= read -r secret_path; do
     [[ -n "$secret_path" ]] || continue
     case "$secret_path" in
-      /mnt/docker/_secrets/?*) secrets+=("$secret_path") ;;
+      /mnt/docker/_secrets/?*)
+        if [[ -z "${secret_seen[$secret_path]:-}" ]]; then
+          secrets+=("$secret_path")
+          secret_seen[$secret_path]=true
+        fi
+        ;;
       *)
         echo "  [!] Refusing Compose secret outside /mnt/docker/_secrets: ${secret_path}" >&2
         return 1
         ;;
     esac
   done < <(jq -r '.secrets // {} | to_entries[] | .value.file // empty' <<< "$compose_json")
+
+  while IFS= read -r raw_env_path; do
+    [[ -n "$raw_env_path" ]] || continue
+    case "$raw_env_path" in
+      /mnt/docker/_secrets/?*) ;;
+      *)
+        echo "  [!] Refusing Compose env_file outside /mnt/docker/_secrets: ${raw_env_path}" >&2
+        return 1
+        ;;
+    esac
+    if [[ -n "${secret_seen[$raw_env_path]:-}" ]]; then
+      echo "  [!] Secret file uses conflicting env_file and mounted-secret modes: ${raw_env_path}" >&2
+      return 1
+    fi
+    if [[ -z "${raw_env_seen[$raw_env_path]:-}" ]]; then
+      raw_env_files+=("$raw_env_path")
+      raw_env_seen[$raw_env_path]=true
+    fi
+  done < <(jq -r '
+    .services // {} | to_entries[] | .value.env_file[]?
+    | if type == "string" then . elif type == "object" then .path // empty else empty end
+    | if startswith("./") then "/mnt/docker/" + .[2:]
+      elif startswith("/") then .
+      else "/mnt/docker/" + .
+      end
+  ' <<< "$compose_env_json")
 
   # Validate every source before the first mutation.
   for source in "${sources[@]}"; do
@@ -5041,6 +5153,16 @@ reconcile_compose_permissions() {
       return 1
     fi
   done
+  for raw_env_path in "${raw_env_files[@]}"; do
+    quoted_secret=$(compose_permission_shell_quote "$raw_env_path")
+    if ! compose_permission_ct_exec --timeout 15 "$ctid" \
+      "test -f ${quoted_secret} && test ! -L ${quoted_secret} &&
+       canonical=\$(readlink -f ${quoted_secret}) &&
+       case \"\$canonical\" in /mnt/docker/_secrets/?*) exit 0 ;; *) exit 1 ;; esac" >/dev/null 2>&1; then
+      echo "  [!] Missing or unsafe Compose env_file: ${raw_env_path}" >&2
+      return 1
+    fi
+  done
 
   if [[ "$mode" == "--check" ]]; then
     for source in "${sources[@]}"; do
@@ -5048,6 +5170,9 @@ reconcile_compose_permissions() {
     done
     for secret_path in "${secrets[@]}"; do
       echo "  [check] Compose secret: ${secret_path}"
+    done
+    for raw_env_path in "${raw_env_files[@]}"; do
+      echo "  [check] Compose raw env_file: ${raw_env_path}"
     done
     return 0
   fi
@@ -5082,5 +5207,12 @@ reconcile_compose_permissions() {
     compose_permission_ct_exec --timeout 30 "$ctid" \
       "chown 0:0 ${quoted_parent} ${quoted_secret} && chmod 700 ${quoted_parent} && chmod 444 ${quoted_secret}" || return 1
     echo "  [✓] Compose secret permissions: ${secret_path}"
+  done
+  for raw_env_path in "${raw_env_files[@]}"; do
+    quoted_secret=$(compose_permission_shell_quote "$raw_env_path")
+    quoted_parent=$(compose_permission_shell_quote "$(dirname "$raw_env_path")")
+    compose_permission_ct_exec --timeout 30 "$ctid" \
+      "chown 0:0 ${quoted_parent} ${quoted_secret} && chmod 700 ${quoted_parent} && chmod 400 ${quoted_secret}" || return 1
+    echo "  [✓] Compose raw env_file permissions: ${raw_env_path}"
   done
 }

@@ -12,6 +12,8 @@ recovery live beside each top-level script in `[scriptname].md`.
   sizing.
 - [Storage and permissions](storage-and-permissions.md): mount layout, ownership,
   secrets, and backup staging.
+- [Container image versioning](container-image-versioning.md): readable release
+  tags, registry evidence, rollback, and the controlled Caddy exception.
 - [Networking and authentication](networking-and-authentication.md): VLANs, DNS,
   Caddy, Authentik, and telemetry identity.
 - [Testing](testing.md): suite ownership, commands, and test design.

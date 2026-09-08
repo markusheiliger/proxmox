@@ -26,6 +26,18 @@ Profile variants use workload-specific service and container names, but may shar
 
 Lifecycle scripts synchronize the wrapper before Compose use. Selector-enabled Alpine CTs also receive an OpenRC service that reselects hardware and reconciles Compose after Docker starts. CTs without a selector retain direct Compose behavior.
 
+## CPU-only stacks
+
+A stack that never uses an accelerator may include an empty marker at
+`/mnt/docker/_config/disable-managed-gpu`. Lifecycle operations check the
+authoritative workload tree on the CT owner node and remove the managed DRM
+cgroup allow and `/dev/dri` bind entries when the marker exists.
+
+The marker moves with the stack's mp0 storage and must remain empty. It must not
+contain a node name, PCI identity, or render-device path. Without the marker,
+the existing node-capability behavior remains unchanged. Certificate authority
+CTs retain their existing implicit GPU-disable rule.
+
 ## Moves and fallback
 
 Before moving a running selector-enabled CT, all profile variants are brought down before the final data sync. The destination selects its local profile only after migration and mount restoration. Rollback reselects on the source. A CT moved from an NVIDIA node to a node without a supported discrete GPU therefore starts the `no-discrete-gpu` variant automatically.

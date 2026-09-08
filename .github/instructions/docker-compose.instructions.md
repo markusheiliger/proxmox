@@ -7,6 +7,15 @@ description: "Use when creating or editing CT Docker Compose stacks under /mnt/d
 
 Each `/mnt/docker/<hostname>/docker-compose.yaml` defines a stack running inside one Proxmox LXC CT.
 
+## Image versioning
+
+- Use an explicit, readable stable version tag for third-party images, such as `postgres:16.10-alpine` or `smallstep/step-ca:0.30.2`.
+- Review release notes, compatibility, migrations, registry availability, and required platforms before selecting a tag. A newer tag is not automatically safe.
+- Do not use floating tags such as `latest`, `stable`, an unversioned variant such as `alpine`, or an unbounded major tag for third-party deployments.
+- Do not append `@sha256:` digests to Compose image references by default. Record resolved digests for verification, drift detection, provenance, and rollback identification.
+- Services that intentionally share one artifact must use the same exact version tag.
+- The repository-controlled `ghcr.io/markusheiliger/caddy-stepca:latest` and `ghcr.io/markusheiliger/caddy-dnsimple:latest` images are the sole floating-tag exception, as described under Networking.
+
 ## CT-local volume paths
 
 The host mounts `/mnt/docker/<hostname>` at `/mnt/docker` in the CT and `/mnt/docker-data/<hostname>` at `/mnt/docker-data`. Compose executes inside the CT, so bind sources must never repeat the hostname.
@@ -34,7 +43,9 @@ Lifecycle scripts run `reconcile_compose_permissions` before startup.
 - Use `permissions.thesaints.recursive: "false"` only when the service owns the mount root but existing descendants must not be rewritten.
 - Use `permissions.thesaints.skip` only for a verified application-managed exception.
 - Shared writable sources are valid only when all writers resolve to the same UID/GID.
-- File-backed secrets must live below `/mnt/docker/_secrets`; reconciliation keeps the parent CT-root-only and mounted secret sources read-only.
+- File-backed secrets must live below `/mnt/docker/_secrets`; reconciliation keeps the parent CT-root-only.
+- Raw `env_file` sources are read by CT-root Compose before container launch. Reconciliation makes these files CT-root-owned and mode `0400`.
+- Top-level Compose secret sources mounted into containers remain mode `0444` unless the runtime user contract proves a stricter mode is compatible.
 
 ## Container and telemetry identity
 
@@ -82,3 +93,4 @@ env_file:
 ```
 
 Write bare `KEY=VALUE` lines. Remove the same key from `environment:` because `environment` overrides `env_file`. When a command reads the container environment at runtime, escape `$` as `$$` to prevent Compose interpolation. The `_secrets` prefix also protects the directory from `refreshCT.sh --reset`.
+Lifecycle permission reconciliation requires the `_secrets` parent to be mode `0700` and each raw env file to be CT-root-owned mode `0400`.

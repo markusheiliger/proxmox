@@ -176,6 +176,55 @@ else
 fi
 
 source "${SCRIPT_DIR}/backupCT.sh"
+CT_LIST=(100 2700)
+CT_MAP[100]=ca.thesaints.home
+CT_MAP[2700]=ca.thesaints.home
+if resolve_ct_from_input ca.thesaints.home >"${TEST_ROOT}/duplicate-hostname" 2>&1; then
+  test_fail "duplicate CT hostnames require a numeric CTID"
+elif grep -Fq 'matches multiple CTs: 100 2700. Use a numeric CTID.' "${TEST_ROOT}/duplicate-hostname"; then
+  pass "duplicate CT hostnames require a numeric CTID"
+else
+  test_fail "duplicate CT hostnames require a numeric CTID"
+fi
+if resolve_ct_from_input 2700 && [[ "$CTID" == 2700 ]]; then
+  pass "numeric CTID remains unambiguous"
+else
+  test_fail "numeric CTID remains unambiguous"
+fi
+CT_TAGS[100]='backup-restore-test;temporary'
+CT_TAGS[2700]='production'
+if ct_has_tag 100 backup-restore-test && ! ct_has_tag 2700 backup-restore-test; then
+  pass "restore-test tags are matched exactly"
+else
+  test_fail "restore-test tags are matched exactly"
+fi
+
+restore_resources='[
+  {"type":"lxc","vmid":2100,"name":"app.thesaints.home"},
+  {"type":"qemu","vmid":2200,"name":"vm.thesaints.home"}
+]'
+pvesh() {
+  [[ "$*" == "get /cluster/nextid" ]] || return 1
+  printf '2300\n'
+}
+RESTORE_ID=""
+if resolve_restore_id "$restore_resources" >"${TEST_ROOT}/restore-id-output" \
+  && [[ "$RESTORE_ID" == 2300 ]] \
+  && grep -Fq 'Automatically selected restore CTID 2300.' "${TEST_ROOT}/restore-id-output"; then
+  pass "restore test automatically selects the next cluster ID"
+else
+  test_fail "restore test automatically selects the next cluster ID"
+fi
+pvesh() { return 1; }
+RESTORE_ID=2400
+if resolve_restore_id "$restore_resources" && [[ "$RESTORE_ID" == 2400 ]]; then
+  pass "explicit restore ID bypasses automatic allocation"
+else
+  test_fail "explicit restore ID bypasses automatic allocation"
+fi
+RESTORE_ID=2100
+assert_failure_contains "occupied restore ID is rejected" "already exists" resolve_restore_id "$restore_resources"
+
 temp_resources='[
   {"type":"lxc","vmid":2000,"maxdisk":17179869184},
   {"type":"lxc","vmid":3500,"maxdisk":34359738368},
@@ -250,6 +299,65 @@ if grep -Fq -- '--tmpdir "$tmpdir"' "${SCRIPT_DIR}/backupCT.sh"; then
 else
   test_fail "manual and scheduled backups use node-local vzdump staging"
 fi
+
+remote_backup_log="${TEST_ROOT}/remote-backup.log"
+remote_resources='[{"type":"lxc","vmid":2100,"name":"app.thesaints.home","node":"pve02"}]'
+config_get_backup_storage() { echo backup-nfs; }
+config_get_backup_hook_path() { echo /usr/local/lib/pve-backup/pve-workload-backup-hook; }
+config_get_backup_tmpdir() { echo /TEMP/vzdump-tmp; }
+config_get_backup_mode() { echo suspend; }
+config_get_backup_compress() { echo zstd; }
+config_get_backup_bwlimit_kib() { echo 0; }
+config_get_backup_ionice() { echo 7; }
+verify_hook_cluster() { :; }
+pvesh() {
+  [[ "$*" == "get /cluster/resources --type vm --output-format json" ]] || return 1
+  printf '%s\n' "$remote_resources"
+}
+run_on_node() {
+  local node="$1"
+  shift
+  printf '%s|%s\n' "$node" "$*" >>"$remote_backup_log"
+}
+DRY_RUN=false
+if run_backup app.thesaints.home \
+  && grep -Fq 'pve02|install -d -o root -g root -m 1777 /TEMP/vzdump-tmp' "$remote_backup_log" \
+  && grep -Fq 'pve02|vzdump 2100 --storage backup-nfs --tmpdir /TEMP/vzdump-tmp --mode suspend --compress zstd --script /usr/local/lib/pve-backup/pve-workload-backup-hook --ionice 7' "$remote_backup_log" \
+  && ! grep -Fq 'pve01|' "$remote_backup_log"; then
+  pass "manual backup dispatches node-local staging and vzdump to the CT owner"
+else
+  cat "$remote_backup_log" >&2
+  test_fail "manual backup dispatches node-local staging and vzdump to the CT owner"
+fi
+
+remote_restore_log="${TEST_ROOT}/remote-restore.log"
+restore_archive="${BACKUP_MOUNT}/dump/vzdump-lxc-2100-2026_08_28-02_00_00.tar.zst"
+restore_generation="${WORKLOAD_ROOT}/app.thesaints.home/vzdump-lxc-2100-2026_08_28-02_00_00"
+mkdir -p "${restore_generation}/docker" "${restore_generation}/docker-data"
+touch "$restore_archive"
+config_get_backup_storage() { printf '../../%s\n' "${BACKUP_MOUNT#/}"; }
+online_nodes() { printf 'pve01\npve02\n'; }
+bridge_policy_resolve() {
+  BRIDGE_POLICY_SELECTED=vmbr0
+  BRIDGE_POLICY_REASON="test fixture"
+}
+run_node_shell() {
+  printf '%s|%s\n' "$1" "$2" >>"$remote_restore_log"
+}
+RESTORE_ID=92200
+RESTORE_NODE=""
+DRY_RUN=true
+if restore_test app.thesaints.home >"${TEST_ROOT}/remote-restore-output" \
+  && grep -Fq 'pve02|test ! -e ' "$remote_restore_log" \
+  && grep -Fq 'Target: CT 92200 on pve02' "${TEST_ROOT}/remote-restore-output" \
+  && ! grep -Fq 'pve01|' "$remote_restore_log"; then
+  pass "restore test defaults staging and restore planning to the source CT owner"
+else
+  cat "$remote_restore_log" >&2
+  cat "${TEST_ROOT}/remote-restore-output" >&2
+  test_fail "restore test defaults staging and restore planning to the source CT owner"
+fi
+
 pct() {
   case "$2" in
     92200) printf 'hostname: nodered.thesaints.home\ntags: backup-restore-test\n' ;;
@@ -270,10 +378,10 @@ pvesh() {
   ]'
 }
 [[ "$(cluster_lxc_ids)" == 2200 ]] && pass "scheduled VMIDs honor CT exclusion tags" || test_fail "scheduled VMIDs honor CT exclusion tags"
-if grep -Fq 'pct set "$RESTORE_ID" -tags backup-restore-test' "${SCRIPT_DIR}/backupCT.sh"; then
-  pass "restore tests receive the exclusion tag"
+if grep -Fq 'pct set "$RESTORE_ID" -tags backup-restore-test -onboot 0' "${SCRIPT_DIR}/backupCT.sh"; then
+  pass "restore tests receive the exclusion tag and stay disabled at boot"
 else
-  test_fail "restore tests receive the exclusion tag"
+  test_fail "restore tests receive the exclusion tag and stay disabled at boot"
 fi
 
 health_resources='[{"type":"lxc","vmid":2100,"name":"app.thesaints.home","node":"pve01"}]'

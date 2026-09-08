@@ -12,6 +12,7 @@ This repository manages Proxmox LXC containers and the Docker Compose workloads 
 Focused authoring rules live in `.github/instructions/`:
 
 - `bash-lifecycle-scripts.instructions.md`
+- `testing.instructions.md`
 - `docker-compose.instructions.md`
 - `compose-hardware-profiles.instructions.md`
 - `configure-sh.instructions.md`
@@ -59,6 +60,15 @@ Lifecycle scripts are strict-mode Bash and source shared behavior from `commonCT
 
 Each user-facing lifecycle script has a matching operator guide. Cross-cutting architecture lives under `documentation/`. Follow `bash-lifecycle-scripts.instructions.md` for strict mode, selection, progress, and idempotency.
 
+## Testing
+
+- Shared lifecycle and infrastructure tests live under `/root/scripts/tests`.
+- Workload-owned tests live directly beside `/mnt/docker/<hostname>/docker-compose.yaml` as root-level `test-*.sh` files and run through `testCT.sh`.
+- Tests of CT-specific behavior must prove owner-node routing with at least one non-local owner fixture; a local-only mock is insufficient.
+- Node-local hooks may use local `pct` and host paths only when the test establishes that Proxmox invokes the hook on the CT owner node.
+
+Follow `testing.instructions.md` for cluster-aware fixtures, workload-test ownership, discovery, and validation.
+
 ## Configuration sources
 
 - `/root/scripts/commonCT.json` is the lifecycle configuration source and contains secrets; it is gitignored.
@@ -69,6 +79,7 @@ Each user-facing lifecycle script has a matching operator guide. Cross-cutting a
 
 - Each CT uses Caddy for reverse proxying and automatic TLS through exactly one mandatory project image: primary/internal domains use `ghcr.io/markusheiliger/caddy-stepca:latest`, and public domains use `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
 - Do not replace these images with official Caddy, another Caddy implementation, a fork, or a digest/version deployment reference. Security and version updates must rebuild the applicable project image and continue deploying its mandatory `:latest` reference.
+- Third-party images use explicit, readable stable version tags. Do not append registry digests to Compose image references by default; retain resolved digests as verification, drift, provenance, and rollback evidence instead. The two repository-controlled Caddy images above are the sole `:latest` exception because their builds and emergency fixes remain under project control.
 - Internal service-to-service communication uses Docker container names.
 - Every Compose service has a deterministic `container_name`; telemetry identity is `<hostname>/<container_name>`.
 - Compose bind paths use CT-local `/mnt/docker/<service>` or `/mnt/docker-data/<service>` paths, never host-side hostname-qualified paths.
@@ -80,6 +91,8 @@ Follow `docker-compose.instructions.md` for the complete Compose contract.
 ## Authentication
 
 Authentik is the central OIDC provider. When a service supports OIDC/OAuth2/SSO, recommend native OpenID Connect against Authentik; do not silently add authentication. Implement only after user confirmation.
+
+Glances is the explicit exception: it never requires authentication. Do not recommend or configure OIDC, forward auth, or another authentication layer for Glances. Expose its web UI through Caddy/TLS without publishing port 61208 directly unless a separately documented consumer requires that port.
 
 - Use product-neutral `AUTH_*` configuration names.
 - Keep client credentials in service environment variables delivered through raw secret env files.

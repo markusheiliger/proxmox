@@ -42,6 +42,19 @@ else
   fail "lifecycle log records successful completion"
 fi
 
+umask_result="${TEST_ROOT}/umask-result"
+LIFECYCLE_LOG_DIR="${TEST_ROOT}/logs" SCRIPT_DIR="$SCRIPT_DIR" UMASK_RESULT="$umask_result" bash -c '
+  umask 022
+  source "$SCRIPT_DIR/commonCT.sh"
+  lifecycle_log_init "/tmp/umask.sh"
+  umask >"$UMASK_RESULT"
+' >/dev/null 2>&1
+if [[ "$(<"$umask_result")" == 0022 ]]; then
+  pass "lifecycle logging preserves the caller umask"
+else
+  fail "lifecycle logging preserves the caller umask"
+fi
+
 LIFECYCLE_LOG_DIR="${TEST_ROOT}/logs" SCRIPT_DIR="$SCRIPT_DIR" bash -c '
   source "$SCRIPT_DIR/commonCT.sh"
   lifecycle_log_init "/tmp/example.sh" second-run
@@ -93,7 +106,7 @@ fi
 
 lifecycle_scripts=(
   createCT.sh refreshCT.sh deleteCT.sh renameCT.sh upgradeCT.sh moveCT.sh
-  backupCT.sh backupVM.sh forwardAuthCT.sh forwardDNSCT.sh
+  backupCT.sh backupVM.sh forwardAuthCT.sh forwardDNSCT.sh testCT.sh
 )
 missing_logging=()
 for script in "${lifecycle_scripts[@]}"; do

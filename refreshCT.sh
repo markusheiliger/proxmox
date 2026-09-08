@@ -567,6 +567,13 @@ main() {
     echo "Refreshing: CT ${CTID} (${CT_HOSTNAME}) [${current}/${total}]"
     echo "=============================================="
     echo ""
+
+    if ct_has_tag "$CTID" backup-restore-test; then
+      echo "  [✗] FATAL: refusing to refresh isolated backup restore-test CT ${CTID}"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): backup restore-test isolation")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
     
     check_ct_storage_health "${CTID}" warn
 

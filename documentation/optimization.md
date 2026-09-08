@@ -52,7 +52,7 @@
 
 **Prompt — pve01 DATA mirror is degraded**
 ```text
-For the Proxmox cluster, plan a focused remediation of the degraded pve01 DATA mirror affecting managed CT configuration storage. Evidence: Scout found one mirror SSD with 750 checksum errors. Acceptance criteria: current SMART and scrub evidence is reviewed, backups are verified, redundancy and pool health are restored, and all owner-local CT mount contracts remain valid. Present a read-only diagnosis and risk-ranked plan first, then wait for explicit confirmation before any mutation. Preserve secrets, CT movability, and unrelated storage.
+/plan For the Proxmox cluster, plan a focused remediation of the degraded pve01 DATA mirror affecting managed CT configuration storage. Evidence: Scout found one mirror SSD with 750 checksum errors. Acceptance criteria: current SMART and scrub evidence is reviewed, backups are verified, redundancy and pool health are restored, and all owner-local CT mount contracts remain valid. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff. Preserve secrets, CT movability, and unrelated storage.
 ```
 
 #### `[medium]` — `pve01 sustained CPU scheduling pressure needs attribution`
@@ -69,7 +69,7 @@ For the Proxmox cluster, plan a focused remediation of the degraded pve01 DATA m
 
 **Prompt — pve01 sustained CPU scheduling pressure needs attribution**
 ```text
-For pve01 and its managed CTs, plan a read-only investigation of sustained CPU scheduling pressure. Evidence: seven-day CPU PSI some was about 73% p50 and 75% p95 despite modest aggregate CPU use. Acceptance criteria: pressure is attributed to specific host or CT activity, telemetry gaps are identified, and any proposed tuning preserves CT movability and includes measurable before/after thresholds. Present the plan and wait for explicit confirmation before edits or tuning. Preserve secrets and unrelated configuration.
+/plan For pve01 and its managed CTs, plan a read-only investigation of sustained CPU scheduling pressure. Evidence: seven-day CPU PSI some was about 73% p50 and 75% p95 despite modest aggregate CPU use. Acceptance criteria: pressure is attributed to specific host or CT activity, telemetry gaps are identified, and any proposed tuning preserves CT movability and includes measurable before/after thresholds. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff. Preserve secrets and unrelated configuration.
 ```
 
 #### `[medium]` — `pve02 thin-pool headroom limits migration options`
@@ -86,7 +86,7 @@ For pve01 and its managed CTs, plan a read-only investigation of sustained CPU s
 
 **Prompt — pve02 thin-pool headroom limits migration options**
 ```text
-For pve02, plan a focused local-lvm capacity review. Evidence: only about 17 GiB remains below the repository's 80% virtual-allocation ceiling, blocking many CT migrations. Acceptance criteria: every volume is identified, reclaim or expansion options are ranked with rollback paths, the reserve gate remains intact, and future CT moves retain compatible storage and mount contracts. Present a read-only inventory and plan first, then wait for explicit confirmation before changes. Preserve secrets and unrelated storage.
+/plan For pve02, plan a focused local-lvm capacity review. Evidence: only about 17 GiB remains below the repository's 80% virtual-allocation ceiling, blocking many CT migrations. Acceptance criteria: every volume is identified, reclaim or expansion options are ranked with rollback paths, the reserve gate remains intact, and future CT moves retain compatible storage and mount contracts. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff. Preserve secrets and unrelated storage.
 ```
 
 <a id="ct-reports"></a>
@@ -130,7 +130,7 @@ For pve02, plan a focused local-lvm capacity review. Evidence: only about 17 GiB
 
 **Prompt — CA key material is world accessible**
 ```text
-For CT 2700 (ca.thesaints.home), plan a focused repair of CA state and secret permissions. Evidence: CA key/configuration paths are mode 777 and .env is mode 0644. Acceptance criteria: mapped service ownership is verified, private files and directories are least-readable, stale secret-bearing keys are removed safely, step-ca health and certificate issuance pass, and rollback uses a verified CA backup. Preserve CT movability, secrets, and unrelated configuration. Present the plan and wait for explicit confirmation before editing.
+/plan For CT 2700 (ca.thesaints.home), plan a focused repair of CA state and secret permissions. Evidence: CA key/configuration paths are mode 777 and .env is mode 0644. Acceptance criteria: mapped service ownership is verified, private files and directories are least-readable, stale secret-bearing keys are removed safely, step-ca health and certificate issuance pass, and rollback uses a verified CA backup. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `CA deployment has mutable identity and unnecessary device exposure`
@@ -146,7 +146,7 @@ For CT 2700 (ca.thesaints.home), plan a focused repair of CA state and secret pe
 
 **Prompt — CA deployment has mutable identity and unnecessary device exposure**
 ```text
-For CT 2700 (ca.thesaints.home), plan a focused deployment cleanup that pins the verified step-ca 0.30.2 release, removes unused DRM and stale Caddy/Newt/OTEL configuration, and retains the existing health behavior. Acceptance criteria: the CA starts from a reviewed immutable image, no unused device is required, telemetry configuration is intentional, and certificate issuance remains valid. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2700 (ca.thesaints.home), plan a focused deployment cleanup that pins the verified step-ca 0.30.2 release, removes unused DRM and stale Caddy/Newt/OTEL configuration, and retains the existing health behavior. Acceptance criteria: the CA starts from a reviewed immutable image, no unused device is required, telemetry configuration is intentional, and certificate issuance remains valid. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -193,7 +193,7 @@ cd /root/scripts && ./refreshCT.sh ca.thesaints.home
 
 **Prompt — Webtop route and runtime privilege require immediate review**
 ```text
-For CT 2000 (webtop.thesaints.home), plan a focused access-control and runtime-hardening update. Evidence: unauthenticated HTTPS returned Webtop HTTP 200, while the passwordless-root desktop runs in a privileged unconfined CT and Caddy has Docker API access. Acceptance criteria: Authentik enforcement and intentional bypasses are proven, unauthenticated access is rejected, required desktop features still work, and privileges are minimized with rollback tests. Preserve CT movability, /config, secrets, and unrelated settings. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2000 (webtop.thesaints.home), plan a focused access-control and runtime-hardening update. Evidence: unauthenticated HTTPS returned Webtop HTTP 200, while the passwordless-root desktop runs in a privileged unconfined CT and Caddy has Docker API access. Acceptance criteria: Authentik enforcement and intentional bypasses are proven, unauthenticated access is rejected, required desktop features still work, and privileges are minimized with rollback tests. Preserve CT movability, /config, secrets, and unrelated settings. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Swap saturation and a large core dump are unexplained`
@@ -209,7 +209,7 @@ For CT 2000 (webtop.thesaints.home), plan a focused access-control and runtime-h
 
 **Prompt — Swap saturation and a large core dump are unexplained**
 ```text
-For CT 2000 (webtop.thesaints.home), plan a focused crash and memory investigation. Evidence: swap is about 96% occupied and /config contains a 217 MiB core dump while seven-day averages are low. Acceptance criteria: the dump is preserved and identified, relevant logs and an active desktop session are measured, health and memory telemetry cover the failure mode, and cleanup or resizing is justified by evidence. Preserve CT movability, secrets, and unrelated data. Present a plan and wait for explicit confirmation before edits.
+/plan For CT 2000 (webtop.thesaints.home), plan a focused crash and memory investigation. Evidence: swap is about 96% occupied and /config contains a 217 MiB core dump while seven-day averages are low. Acceptance criteria: the dump is preserved and identified, relevant logs and an active desktop session are measured, health and memory telemetry cover the failure mode, and cleanup or resizing is justified by evidence. Preserve CT movability, secrets, and unrelated data. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -256,7 +256,7 @@ cd /root/scripts && ./refreshCT.sh webtop.thesaints.home
 
 **Prompt — Newt is nonfunctional and secret files are broadly readable**
 ```text
-For CT 2100 (seafile.thesaints.de), plan a focused Newt and secret-delivery repair. Evidence: Newt retries every three seconds with incomplete credential structure and four raw secret files are mode 0644. Acceptance criteria: tunnel intent is confirmed, Newt is either healthy with complete protected credentials or removed, raw secret files are CT-root-only, and Seafile access remains valid. Preserve CT movability, secret values, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2100 (seafile.thesaints.de), plan a focused Newt and secret-delivery repair. Evidence: Newt retries every three seconds with incomplete credential structure and four raw secret files are mode 0644. Acceptance criteria: tunnel intent is confirmed, Newt is either healthy with complete protected credentials or removed, raw secret files are CT-root-only, and Seafile access remains valid. Preserve CT movability, secret values, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Allocation is below the documented Seafile baseline`
@@ -283,7 +283,7 @@ For CT 2100 (seafile.thesaints.de), plan a focused Newt and secret-delivery repa
 
 **Prompt — Running drift and weak health coverage obscure service state**
 ```text
-For CT 2100 (seafile.thesaints.de), plan a focused reconciliation of the four drifted Seafile services. Evidence: MariaDB, Redis, Seafile, and SeaDoc running hashes differ from current configuration and only MariaDB has a healthcheck. Acceptance criteria: drift is explained, intended releases are pinned, backups and rollback digests exist, service-specific readiness and telemetry are verified, and data integrity passes after reconciliation. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2100 (seafile.thesaints.de), plan a focused reconciliation of the four drifted Seafile services. Evidence: MariaDB, Redis, Seafile, and SeaDoc running hashes differ from current configuration and only MariaDB has a healthcheck. Acceptance criteria: drift is explained, intended releases are pinned, backups and rollback digests exist, service-specific readiness and telemetry are verified, and data integrity passes after reconciliation. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -330,7 +330,7 @@ cd /root/scripts && ./refreshCT.sh seafile.thesaints.de --size M
 
 **Prompt — Homepage version has a verified SSRF vulnerability**
 ```text
-For CT 2300 (home.thesaints.home), plan a focused Homepage security update from affected 2.1.2 to a reviewed fixed release at least 2.2.0. Acceptance criteria: configuration is backed up, the image is version/digest pinned, widgets and routing work, Authentik access is enforced, and health checks pass with a documented rollback digest. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2300 (home.thesaints.home), plan a focused Homepage security update from affected 2.1.2 to a reviewed fixed release at least 2.2.0. Acceptance criteria: configuration is backed up, the image is version/digest pinned, widgets and routing work, Authentik access is enforced, and health checks pass with a documented rollback digest. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Unused privilege and mutable deployment reduce assurance`
@@ -346,7 +346,7 @@ For CT 2300 (home.thesaints.home), plan a focused Homepage security update from 
 
 **Prompt — Unused privilege and mutable deployment reduce assurance**
 ```text
-For CT 2300 (home.thesaints.home), plan a focused deployment-hardening update that pins reviewed images, adds Caddy readiness, protects configuration files, and removes unused DRM or unconfined privileges where compatible. Acceptance criteria: the dashboard remains healthy and authenticated, image provenance is recorded, no accelerator dependency exists, and rollback restores prior CT and image settings. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2300 (home.thesaints.home), plan a focused deployment-hardening update that pins reviewed images, adds Caddy readiness, protects configuration files, and removes unused DRM or unconfined privileges where compatible. Acceptance criteria: the dashboard remains healthy and authenticated, image provenance is recorded, no accelerator dependency exists, and rollback restores prior CT and image settings. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -393,7 +393,7 @@ cd /root/scripts && ./refreshCT.sh home.thesaints.home
 
 **Prompt — Compose cannot reproduce the live MQTT workload**
 ```text
-For CT 2400 (mqtt.thesaints.home), plan a focused reconstruction of the managed MQTT stack. Evidence: live Mosquitto and Portainer Agent containers are absent from Compose, Mosquitto uses an EOL Alpine 3.18 base, and broker state is in rootfs named volumes. Acceptance criteria: versions and intent are identified, broker data and authentication are backed up, intended services use pinned images and repository-managed bind storage, all five clients reconnect, and rollback preserves the original volumes. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2400 (mqtt.thesaints.home), plan a focused reconstruction of the managed MQTT stack. Evidence: live Mosquitto and Portainer Agent containers are absent from Compose, Mosquitto uses an EOL Alpine 3.18 base, and broker state is in rootfs named volumes. Acceptance criteria: versions and intent are identified, broker data and authentication are backed up, intended services use pinned images and repository-managed bind storage, all five clients reconnect, and rollback preserves the original volumes. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Configured stack lacks reproducibility and service-level assurance`
@@ -409,7 +409,7 @@ For CT 2400 (mqtt.thesaints.home), plan a focused reconstruction of the managed 
 
 **Prompt — Configured stack lacks reproducibility and service-level assurance**
 ```text
-For CT 2400 (mqtt.thesaints.home), after the managed stack is reconstructed, plan focused readiness and telemetry coverage for Mosquitto, Caddy, and the intended management service. Acceptance criteria: reviewed images are pinned, health checks prove protocol readiness, CT-scoped metrics cover seven representative days, unused DRM is removed, and no duplicate telemetry shipping exists. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2400 (mqtt.thesaints.home), after the managed stack is reconstructed, plan focused readiness and telemetry coverage for Mosquitto, Caddy, and the intended management service. Acceptance criteria: reviewed images are pinned, health checks prove protocol readiness, CT-scoped metrics cover seven representative days, unused DRM is removed, and no duplicate telemetry shipping exists. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -456,7 +456,7 @@ cd /root/scripts && ./refreshCT.sh mqtt.thesaints.home
 
 **Prompt — Running Stirling version and security posture are unknowable**
 ```text
-For CT 2500 (pdf.thesaints.home), plan a focused Stirling PDF migration only after resolving the conflicting running status and deployed version. Evidence: Compose uses legacy frooodle/s-pdf:latest while the current official release is 2.14.3 with V2 settings. Acceptance criteria: live version is proven, H2/configuration is backed up, OCR/templates/Auth behavior is tested, the official image is pinned, and rollback restores the prior state. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2500 (pdf.thesaints.home), plan a focused Stirling PDF migration only after resolving the conflicting running status and deployed version. Evidence: Compose uses legacy frooodle/s-pdf:latest while the current official release is 2.14.3 with V2 settings. Acceptance criteria: live version is proven, H2/configuration is backed up, OCR/templates/Auth behavior is tested, the official image is pinned, and rollback restores the prior state. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Health, telemetry, and isolation evidence is incomplete`
@@ -472,7 +472,7 @@ For CT 2500 (pdf.thesaints.home), plan a focused Stirling PDF migration only aft
 
 **Prompt — Health, telemetry, and isolation evidence is incomplete**
 ```text
-For CT 2500 (pdf.thesaints.home), plan focused health, telemetry, and isolation improvements after live access is restored. Acceptance criteria: Stirling and Caddy readiness are measurable, seven representative days of CT-scoped resource data are retained, unused DRM is removed, required LXC privileges are documented, and rollback restores prior settings. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2500 (pdf.thesaints.home), plan focused health, telemetry, and isolation improvements after live access is restored. Acceptance criteria: Stirling and Caddy readiness are measurable, seven representative days of CT-scoped resource data are retained, unused DRM is removed, required LXC privileges are documented, and rollback restores prior settings. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -519,7 +519,7 @@ cd /root/scripts && ./refreshCT.sh pdf.thesaints.home
 
 **Prompt — Frigate is proxied through an unauthenticated admin-equivalent port**
 ```text
-For CT 2600 (nvr.thesaints.home), plan a focused Frigate access-control and secret-delivery repair. Evidence: Caddy proxies port 5000, which is unauthenticated/admin-equivalent, and camera/MQTT credentials are literal in broadly readable configuration. Acceptance criteria: external traffic uses authenticated port 8971, users/proxy headers/integrations pass, credentials use protected supported delivery, and rollback is tested from backup. Preserve CT movability and unrelated recordings/configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2600 (nvr.thesaints.home), plan a focused Frigate access-control and secret-delivery repair. Evidence: Caddy proxies port 5000, which is unauthenticated/admin-equivalent, and camera/MQTT credentials are literal in broadly readable configuration. Acceptance criteria: external traffic uses authenticated port 8971, users/proxy headers/integrations pass, credentials use protected supported delivery, and rollback is tested from backup. Preserve CT movability and unrelated recordings/configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[high]` — `NVR memory allocation has no safe headroom`
@@ -588,7 +588,7 @@ cd /root/scripts && ./refreshCT.sh nvr.thesaints.home --size M
 
 **Prompt — Custom workload images are not auditable or reproducible**
 ```text
-For CT 2800 (svr.thesaints.home), plan a focused provenance and release-control update for the scraper and custom Caddy images. Evidence: both use mutable latest and deployed versions/digests are unavailable; backup verification was stale. Acceptance criteria: backup freshness is restored, current and target digests are recorded, application/Caddy versions and provenance are exposed, reviewed images are pinned, and scraper health/data pass with rollback. Preserve CT movability, secrets, and unrelated data. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2800 (svr.thesaints.home), plan a focused provenance and release-control update for the scraper and custom Caddy images. Evidence: both use mutable latest and deployed versions/digests are unavailable; backup verification was stale. Acceptance criteria: backup freshness is restored, current and target digests are recorded, application/Caddy versions and provenance are exposed, reviewed images are pinned, and scraper health/data pass with rollback. Preserve CT movability, secrets, and unrelated data. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Operational health and secret-file posture need hardening`
@@ -604,7 +604,7 @@ For CT 2800 (svr.thesaints.home), plan a focused provenance and release-control 
 
 **Prompt — Operational health and secret-file posture need hardening**
 ```text
-For CT 2800 (svr.thesaints.home), plan focused operational hardening for scraper and Caddy. Acceptance criteria: service readiness is measurable, credential-bearing configuration is CT-root-only, Docker API access is minimized or justified, and seven representative days of resource telemetry are available before sizing. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2800 (svr.thesaints.home), plan focused operational hardening for scraper and Caddy. Acceptance criteria: service readiness is measurable, credential-bearing configuration is CT-root-only, Docker API access is minimized or justified, and seven representative days of resource telemetry are available before sizing. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -651,7 +651,7 @@ cd /root/scripts && ./refreshCT.sh svr.thesaints.home
 
 **Prompt — Observability secrets are broadly readable**
 ```text
-For CT 2900 (dashboard.thesaints.home), plan a focused secret-permission repair. Evidence: .env, grafana.env, and mcp-grafana.env are mode 0644 and _secrets is 0755. Acceptance criteria: source secrets are CT-root-only, each service still receives required values without disclosure, lifecycle reconciliation preserves modes, and Grafana OIDC/datasources/MCP connectivity pass. Preserve CT movability and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2900 (dashboard.thesaints.home), plan a focused secret-permission repair. Evidence: .env, grafana.env, and mcp-grafana.env are mode 0644 and _secrets is 0755. Acceptance criteria: source secrets are CT-root-only, each service still receives required values without disclosure, lifecycle reconciliation preserves modes, and Grafana OIDC/datasources/MCP connectivity pass. Preserve CT movability and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Observability deployment lacks deterministic releases and complete readiness`
@@ -667,7 +667,7 @@ For CT 2900 (dashboard.thesaints.home), plan a focused secret-permission repair.
 
 **Prompt — Observability deployment lacks deterministic releases and complete readiness**
 ```text
-For CT 2900 (dashboard.thesaints.home), plan a focused release and operability update. Evidence: six services use mutable tags, no Compose healthchecks exist, CT Telegraf resource series are absent, and DRM is unused. Acceptance criteria: compatible releases are pinned, readiness covers every service, telemetry labels use canonical host/container identity without duplicate shipping, Tempo ownership/migration constraints are preserved, and unused DRM is removed. Preserve CT movability, secrets, and data. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2900 (dashboard.thesaints.home), plan a focused release and operability update. Evidence: six services use mutable tags, no Compose healthchecks exist, CT Telegraf resource series are absent, and DRM is unused. Acceptance criteria: compatible releases are pinned, readiness covers every service, telemetry labels use canonical host/container identity without duplicate shipping, Tempo ownership/migration constraints are preserved, and unused DRM is removed. Preserve CT movability, secrets, and data. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[low]` — `Defined size S appears viable only after staged validation`
@@ -725,7 +725,7 @@ cd /root/scripts && ./refreshCT.sh dashboard.thesaints.home --size S
 
 **Prompt — WUNS embeds a runtime missing verified security fixes**
 ```text
-For CT 3100 (worker.thesaints.home), plan a focused WUNS runtime update from embedded .NET/ASP.NET 10.0.3 to a reviewed current 10.0 servicing release. Acceptance criteria: a reproducible pinned image is built, scheduled jobs and upstream calls pass, OTLP identity remains canonical, and rollback uses the prior digest. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3100 (worker.thesaints.home), plan a focused WUNS runtime update from embedded .NET/ASP.NET 10.0.3 to a reviewed current 10.0 servicing release. Acceptance criteria: a reproducible pinned image is built, scheduled jobs and upstream calls pass, OTLP identity remains canonical, and rollback uses the prior digest. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[high]` — `Worker credentials and Glances access are insufficiently protected`
@@ -741,7 +741,7 @@ For CT 3100 (worker.thesaints.home), plan a focused WUNS runtime update from emb
 
 **Prompt — Worker credentials and Glances access are insufficiently protected**
 ```text
-For CT 3100 (worker.thesaints.home), plan a focused credential and Glances access repair. Evidence: credential-bearing .env is mode 0644 and Glances publishes 61208 on all interfaces while also being proxied without explicit authentication. Acceptance criteria: credentials use protected delivery, direct publication is removed unless justified, intended users authenticate through the approved route, and monitoring still works. Preserve CT movability, secrets, and unrelated settings. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3100 (worker.thesaints.home), plan a focused credential and Glances access repair. Evidence: credential-bearing .env is mode 0644 and Glances publishes 61208 on all interfaces while also being proxied without explicit authentication. Acceptance criteria: credentials use protected delivery, direct publication is removed unless justified, intended users authenticate through the approved route, and monitoring still works. Preserve CT movability, secrets, and unrelated settings. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Worker services lack readiness and carry unused device exposure`
@@ -757,7 +757,7 @@ For CT 3100 (worker.thesaints.home), plan a focused credential and Glances acces
 
 **Prompt — Worker services lack readiness and carry unused device exposure**
 ```text
-For CT 3100 (worker.thesaints.home), plan focused readiness and deployment hardening. Acceptance criteria: WUNS exposes a meaningful last-success/progress health signal, Glances and Caddy readiness are checked, the reviewed Caddy digest is pinned, unused DRM is removed, and no healthcheck causes restart loops. Preserve CT movability, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3100 (worker.thesaints.home), plan focused readiness and deployment hardening. Acceptance criteria: WUNS exposes a meaningful last-success/progress health signal, Glances and Caddy readiness are checked, the reviewed Caddy digest is pinned, unused DRM is removed, and no healthcheck causes restart loops. Preserve CT movability, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -804,7 +804,7 @@ cd /root/scripts && ./refreshCT.sh worker.thesaints.home
 
 **Prompt — RustDesk API credential source is broadly readable**
 ```text
-For CT 3200 (desktop.thesaints.home), plan a focused RustDesk secret-permission repair. Evidence: .env containing the API token is mode 0644 and _secrets is 0755, while the JWT file is already 0600. Acceptance criteria: all secret sources are CT-root-only, hbbs/hbbr/API still receive required values, OIDC login works, and lifecycle reconciliation preserves modes. Preserve CT movability and secret values. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3200 (desktop.thesaints.home), plan a focused RustDesk secret-permission repair. Evidence: .env containing the API token is mode 0644 and _secrets is 0755, while the JWT file is already 0600. Acceptance criteria: all secret sources are CT-root-only, hbbs/hbbr/API still receive required values, OIDC login works, and lifecycle reconciliation preserves modes. Preserve CT movability and secret values. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `RustDesk release, readiness, and isolation controls are incomplete`
@@ -820,7 +820,7 @@ For CT 3200 (desktop.thesaints.home), plan a focused RustDesk secret-permission 
 
 **Prompt — RustDesk release, readiness, and isolation controls are incomplete**
 ```text
-For CT 3200 (desktop.thesaints.home), plan a focused RustDesk deployment-hardening update. Acceptance criteria: hbbs, hbbr, and API compatibility is verified, reviewed releases/digests are pinned, protocol and API readiness checks pass, unused DRM is removed, and only required LXC privileges remain. Preserve CT movability, keys, secrets, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3200 (desktop.thesaints.home), plan a focused RustDesk deployment-hardening update. Acceptance criteria: hbbs, hbbr, and API compatibility is verified, reviewed releases/digests are pinned, protocol and API readiness checks pass, unused DRM is removed, and only required LXC privileges remain. Preserve CT movability, keys, secrets, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -867,7 +867,7 @@ cd /root/scripts && ./refreshCT.sh desktop.thesaints.home
 
 **Prompt — Authentik version is within verified affected ranges**
 ```text
-For CT 3400 (auth.thesaints.de), plan a focused Authentik security update from configured 2026.5.3 to reviewed 2026.5.6, updating server and worker together. Acceptance criteria: PostgreSQL and Authentik state are backed up, login/OIDC/worker flows pass, images are pinned, and rollback restores prior database and digests. Do not cross into the backward-incompatible 2026.8 line. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3400 (auth.thesaints.de), plan a focused Authentik security update from configured 2026.5.3 to reviewed 2026.5.6, updating server and worker together. Acceptance criteria: PostgreSQL and Authentik state are backed up, login/OIDC/worker flows pass, images are pinned, and rollback restores prior database and digests. Do not cross into the backward-incompatible 2026.8 line. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[high]` — `Current memory allocation is at its practical ceiling`
@@ -883,7 +883,7 @@ For CT 3400 (auth.thesaints.de), plan a focused Authentik security update from c
 
 **Prompt — Current memory allocation is at its practical ceiling**
 ```text
-For CT 3400 (auth.thesaints.de), plan a read-only-first investigation of memory pressure. Evidence: about 1.87 GiB current, 1.985 GiB peak, and 642 memory.high events at size M with no OOM. Acceptance criteria: pressure is attributed across Authentik, PostgreSQL, Redis, and workers after the security patch; queue/latency impact is measured; and any later size proposal preserves at least 20% headroom and CT movability. Present the plan and wait for explicit confirmation before configuration changes. Preserve secrets.
+/plan For CT 3400 (auth.thesaints.de), plan a read-only-first investigation of memory pressure. Evidence: about 1.87 GiB current, 1.985 GiB peak, and 642 memory.high events at size M with no OOM. Acceptance criteria: pressure is attributed across Authentik, PostgreSQL, Redis, and workers after the security patch; queue/latency impact is measured; and any later size proposal preserves at least 20% headroom and CT movability. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff. Preserve secrets.
 ```
 
 #### `[medium]` — `Secret, tunnel, telemetry, and isolation configuration has drift`
@@ -899,7 +899,7 @@ For CT 3400 (auth.thesaints.de), plan a read-only-first investigation of memory 
 
 **Prompt — Secret, tunnel, telemetry, and isolation configuration has drift**
 ```text
-For CT 3400 (auth.thesaints.de), after the Authentik patch, plan focused stack hardening. Acceptance criteria: raw secrets are CT-root-only, Newt is either healthy with complete protected credentials or removed, telemetry uses auth.thesaints.de/container identity, supporting images and health checks are reviewed, and unused DRM/unconfined privileges are removed where compatible. Preserve CT movability, secrets, and unrelated identity configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3400 (auth.thesaints.de), after the Authentik patch, plan focused stack hardening. Acceptance criteria: raw secrets are CT-root-only, Newt is either healthy with complete protected credentials or removed, telemetry uses auth.thesaints.de/container identity, supporting images and health checks are reviewed, and unused DRM/unconfined privileges are removed where compatible. Preserve CT movability, secrets, and unrelated identity configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -957,7 +957,7 @@ cd /root/scripts && ./refreshCT.sh auth.thesaints.de
 
 **Prompt — LiteLLM and mutable image drift need controlled review**
 ```text
-For CT 3500 (ai.thesaints.home), plan a focused release-control update for LiteLLM and supporting images without changing hardware profiles. Evidence: LiteLLM 1.99.1 trails 1.100.0 and every mutable tag has registry drift. Acceptance criteria: PostgreSQL is backed up, compatible releases/digests are pinned, OIDC/providers/Ollama models pass, stable endpoints and CPU fallback remain functional, and rollback restores prior data/images. Preserve CT movability and secrets. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3500 (ai.thesaints.home), plan a focused release-control update for LiteLLM and supporting images without changing hardware profiles. Evidence: LiteLLM 1.99.1 trails 1.100.0 and every mutable tag has registry drift. Acceptance criteria: PostgreSQL is backed up, compatible releases/digests are pinned, OIDC/providers/Ollama models pass, stable endpoints and CPU fallback remain functional, and rollback restores prior data/images. Preserve CT movability and secrets. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `AI stack lacks intentional telemetry and readiness`
@@ -973,7 +973,7 @@ For CT 3500 (ai.thesaints.home), plan a focused release-control update for LiteL
 
 **Prompt — AI stack lacks intentional telemetry and readiness**
 ```text
-For CT 3500 (ai.thesaints.home), plan focused telemetry and readiness for LiteLLM, Ollama, and Caddy. Acceptance criteria: canonical ai.thesaints.home/container identity is exported without duplicate shipping, request and backend mode are measurable, health checks pass on CPU fallback and any future accelerator path, and failed GPU initialization is visible. Preserve CT movability, secrets, model data, and unrelated configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3500 (ai.thesaints.home), plan focused telemetry and readiness for LiteLLM, Ollama, and Caddy. Acceptance criteria: canonical ai.thesaints.home/container identity is exported without duplicate shipping, request and backend mode are measurable, health checks pass on CPU fallback and any future accelerator path, and failed GPU initialization is visible. Preserve CT movability, secrets, model data, and unrelated configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Small PostgreSQL state is placed on HDD-backed storage`
@@ -989,7 +989,7 @@ For CT 3500 (ai.thesaints.home), plan focused telemetry and readiness for LiteLL
 
 **Prompt — Small PostgreSQL state is placed on HDD-backed storage**
 ```text
-For CT 3500 (ai.thesaints.home), plan a focused migration of the small PostgreSQL data directory from HDD-backed /mnt/docker-data to SSD-backed /mnt/docker/postgres. Acceptance criteria: a database-consistent backup exists, ownership and permissions are correct, writers are stopped during the final copy, LiteLLM data integrity passes, and rollback retains the untouched source until acceptance. Preserve CT movability, secrets, models, and unrelated storage. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3500 (ai.thesaints.home), plan a focused migration of the small PostgreSQL data directory from HDD-backed /mnt/docker-data to SSD-backed /mnt/docker/postgres. Acceptance criteria: a database-consistent backup exists, ownership and permissions are correct, writers are stopped during the final copy, LiteLLM data integrity passes, and rollback retains the untouched source until acceptance. Preserve CT movability, secrets, models, and unrelated storage. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -1036,7 +1036,7 @@ cd /root/scripts && ./refreshCT.sh ai.thesaints.home
 
 **Prompt — Recurring Node-RED errors and HTTP-input authentication need diagnosis**
 ```text
-For CT 2200 (nodered.thesaints.home), plan a focused diagnosis of recurring Node-RED errors and HTTP-input access controls. Evidence: 68 error-keyword log events occurred while health stayed green, and two HTTP-input flows may not be covered by editor authentication. Acceptance criteria: errors are categorized with redacted evidence, affected flows are repaired, every HTTP route has explicit intended authentication, dependent callers pass, and /data rollback exists. Preserve CT movability, credentials, and unrelated flows. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2200 (nodered.thesaints.home), plan a focused diagnosis of recurring Node-RED errors and HTTP-input access controls. Evidence: 68 error-keyword log events occurred while health stayed green, and two HTTP-input flows may not be covered by editor authentication. Acceptance criteria: errors are categorized with redacted evidence, affected flows are repaired, every HTTP route has explicit intended authentication, dependent callers pass, and /data rollback exists. Preserve CT movability, credentials, and unrelated flows. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `Node-RED release and observability controls are incomplete`
@@ -1052,7 +1052,7 @@ For CT 2200 (nodered.thesaints.home), plan a focused diagnosis of recurring Node
 
 **Prompt — Node-RED release and observability controls are incomplete**
 ```text
-For CT 2200 (nodered.thesaints.home), plan a focused release and observability update. Acceptance criteria: contributed-node compatibility is tested, Node-RED 5.0.6 and a verified Caddy build are pinned, service readiness is meaningful, telemetry is intentionally wired or inert variables are removed, and seven representative days can support later sizing. Preserve CT movability, /data, credentials, and unrelated flows. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 2200 (nodered.thesaints.home), plan a focused release and observability update. Acceptance criteria: contributed-node compatibility is tested, Node-RED 5.0.6 and a verified Caddy build are pinned, service readiness is meaningful, telemetry is intentionally wired or inert variables are removed, and seven representative days can support later sizing. Preserve CT movability, /data, credentials, and unrelated flows. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**
@@ -1099,7 +1099,7 @@ cd /root/scripts && ./refreshCT.sh nodered.thesaints.home
 
 **Prompt — Glances exposure and CT isolation are broader than needed**
 ```text
-For CT 3300 (dns.thesaints.home), plan a focused Glances access and isolation update. Acceptance criteria: the UI is either removed or protected by the approved authentication path, Docker API access is minimized or justified, unused DRM is removed, required LXC privileges are documented, and DNS service remains independent of the UI. Preserve CT movability, secrets, and unrelated DNS configuration. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3300 (dns.thesaints.home), plan a focused Glances access and isolation update. Acceptance criteria: the UI is either removed or protected by the approved authentication path, Docker API access is minimized or justified, unused DRM is removed, required LXC privileges are documented, and DNS service remains independent of the UI. Preserve CT movability, secrets, and unrelated DNS configuration. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 #### `[medium]` — `DNS deployment is mutable and bootstrap failures are nonfatal`
@@ -1115,7 +1115,7 @@ For CT 3300 (dns.thesaints.home), plan a focused Glances access and isolation up
 
 **Prompt — DNS deployment is mutable and bootstrap failures are nonfatal**
 ```text
-For CT 3300 (dns.thesaints.home), plan a focused release and bootstrap-reliability update. Acceptance criteria: CoreDNS, Glances, Caddy, and collector releases are reviewed and pinned; DNS TCP/UDP readiness and telemetry health are checked; required configure failures are fatal and idempotent; obsolete environment keys are removed safely; and upstream DNS/network compatibility is verified. Preserve CT movability, secrets, and unrelated zones. Present a plan and wait for explicit confirmation before editing.
+/plan For CT 3300 (dns.thesaints.home), plan a focused release and bootstrap-reliability update. Acceptance criteria: CoreDNS, Glances, Caddy, and collector releases are reviewed and pinned; DNS TCP/UDP readiness and telemetry health are checked; required configure failures are fatal and idempotent; obsolete environment keys are removed safely; and upstream DNS/network compatibility is verified. Preserve CT movability, secrets, and unrelated zones. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff.
 ```
 
 **Lifecycle-covered actions — manual review only**

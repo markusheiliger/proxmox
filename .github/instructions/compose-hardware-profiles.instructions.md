@@ -12,4 +12,5 @@ description: "Use when implementing or modifying hardware-aware CT Compose profi
 - Exactly one hardware profile runs. Pull and down operations may cover all variants; runtime startup selects one variant and may combine the independent `published` profile.
 - Profile variants may share a Docker network alias to preserve a stable internal endpoint.
 - Lifecycle scripts must use `ct_compose()` so CTs with and without selectors remain compatible.
+- CPU-only stacks may include an empty `/mnt/docker/_config/disable-managed-gpu` marker. Lifecycle operations resolve it from the authoritative owner-node workload tree and remove managed DRM passthrough; the marker must not contain node or device identity.
 - Full architecture is documented in `documentation/hardware-compose-profiles.md`.

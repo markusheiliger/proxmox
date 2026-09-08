@@ -69,23 +69,21 @@ RESET_MODE=false
 #                       even when the app and Authentik are under different parent domains.
 #                       Runs BEFORE forward_auth.
 #   - 50_forward_auth : authenticate everything that is not an explicit bypass route.
-# Host header: the upstream is dialed at ${AUTH_HOSTNAME} (so TLS SNI/cert match Authentik),
-# but the HTTP Host MUST be the application's own host ({http.request.host}). The embedded
-# outpost selects the forward_single provider by Host == provider.external_host, and scopes
-# the proxy session cookie to that host. Overriding Host to ${AUTH_HOSTNAME} makes the outpost
-# match no provider (404 "Not Found") and would set the cookie on the wrong domain.
+# Host header: the Authentik outpost is reached through its HTTPS Caddy virtual host, so the
+# workload Caddy sends the Authentik host for TLS/HTTP routing. Caddy separately generates
+# X-Forwarded-Host from the original application request. Authentik's Caddy trusts that header
+# only from the CT network and preserves it for embedded-outpost provider selection.
 # The protected service owns the rest of the route via numeric-prefix bands:
 #   1_..49_   bypass routes (no auth), evaluated before forward_auth
 #   51_..98_  authenticated auxiliary routes
 #   99_       the app catch-all reverse_proxy
 FORWARD_AUTH_LABELS=(
   'caddy.route.0_reverse_proxy: "/outpost.goauthentik.io/* https://${AUTH_HOSTNAME}"'
-  'caddy.route.0_reverse_proxy.header_up: "Host {http.request.host}"'
+  'caddy.route.0_reverse_proxy.header_up: "Host {http.reverse_proxy.upstream.host}"'
   'caddy.route.50_forward_auth: "https://${AUTH_HOSTNAME}"'
   'caddy.route.50_forward_auth.uri: "/outpost.goauthentik.io/auth/caddy"'
-  'caddy.route.50_forward_auth.header_up: "Host {http.request.host}"'
+  'caddy.route.50_forward_auth.header_up: "Host {http.reverse_proxy.upstream.host}"'
   'caddy.route.50_forward_auth.copy_headers: "X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid"'
-  'caddy.route.50_forward_auth.trusted_proxies: private_ranges'
 )
 
 # Regex (PCRE) matching the injector-managed label keys (the two entries above).

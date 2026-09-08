@@ -54,6 +54,8 @@ Before editing, verify that the workspace's `/mnt/docker/<hostname>/docker-compo
 
 If an image is supplied, use it. Otherwise curate stable, maintained open-source/community candidates, explain tradeoffs, recommend a default, and ask the user to choose.
 
+For third-party images, select an explicit readable stable version tag after reviewing compatibility, migrations, registry availability, and required platforms. Do not deploy floating tags such as `latest`, `stable`, an unversioned variant, or an unbounded major tag. Keep resolved digests as verification and rollback evidence rather than appending them to Compose references. The mandatory repository-controlled Caddy images are the sole `:latest` exception.
+
 Preserve existing ordering, comments, label style, restart policies, and composition patterns. Add databases, caches, workers, or queues only when required by the application.
 
 ### Minimal footprint
@@ -98,7 +100,7 @@ Expose web workloads through Caddy. Determine domain mode from hostname and `/ro
 
 These project images and their mutable `:latest` references are mandatory. Never propose or implement official Caddy, another Caddy implementation, a fork, a version tag, or a digest deployment reference, even when the user requests general image pinning. For a Caddy security or version update, update and review the applicable project image build, publish it as `:latest`, verify the fixed runtime version, and leave the Compose image reference unchanged.
 
-If the workload has no suitable web UI, propose `nicolargo/glances` as a fallback UI, expose it through Caddy, and recommend forward auth. Do not add it silently.
+If the workload has no suitable web UI, propose `nicolargo/glances` as a fallback UI and expose it through Caddy/TLS. Glances never requires authentication: do not recommend or configure OIDC, forward auth, or another authentication layer for it. Do not publish port 61208 directly unless a separately documented consumer requires it. Do not add Glances silently.
 
 ## 4. Authentication
 
@@ -107,6 +109,8 @@ Classify the primary web workload as exactly one of:
 1. Native OIDC against Authentik, preferred when supported.
 2. Caddy forward auth when the app cannot authenticate itself.
 3. A justified public/no-auth exception.
+
+Glances is exempt from this classification and always uses the no-authentication policy defined above.
 
 ### Native OIDC
 

@@ -50,6 +50,33 @@ else
 fi
 assert_contains "degraded storage warning remains visible" "${TEST_ROOT}/storage-warning" "storage health warning"
 
+remote_release_log="${TEST_ROOT}/remote-release.log"
+run_remote_release_test() (
+  get_ct_owner_node() { echo pve02; }
+  get_ct_status() { echo stopped; }
+  pct_config() { echo "rootfs: DATA:subvol-2200-disk-0,size=20G"; }
+  run_on_node() {
+    local node="$1"
+    shift
+    printf '%s|%s\n' "$node" "$*" >>"$remote_release_log"
+    if [[ "$1" == pvesm ]]; then
+      echo /DATA/subvol-2200-disk-0
+    elif [[ "$1" == cut ]]; then
+      echo 3.23
+    fi
+  }
+  [[ "$(read_ct_release)" == 3.23 ]] \
+    && grep -Fq 'pve02|pvesm path DATA:subvol-2200-disk-0' "$remote_release_log" \
+    && grep -Fq 'pve02|cut -d. -f1,2 /DATA/subvol-2200-disk-0/etc/alpine-release' "$remote_release_log" \
+    && ! grep -Fq 'pve01|' "$remote_release_log"
+)
+if run_remote_release_test; then
+  pass "stopped CT release detection reads rootfs state on the owner node"
+else
+  cat "$remote_release_log" >&2
+  fail "stopped CT release detection reads rootfs state on the owner node"
+fi
+
 SNAPSHOT_NAME="pre-alpine-test"
 SNAPSHOT_CREATED=false
 SNAPSHOT_METHOD=""

@@ -21,8 +21,9 @@ workload-aware Proxmox backup subsystem.
 | `--cleanup-stale` | Remove interrupted archive and workload temporary directories |
 | `--restore-test <CT>` | Restore the newest complete pair in isolation |
 
-`--restore-test` requires `--restore-id <unused-CTID>` and accepts `--node`; the
-node defaults to the source CT's node. `--force` skips restore confirmation.
+`--restore-test` automatically allocates the next unused cluster ID and accepts
+`--restore-id <unused-CTID>` as an explicit override. `--node` defaults to the
+source CT's node. `--force` skips restore confirmation.
 For `--cleanup-stale`, `--force` bypasses only the 24-hour age guard. Mutating
 actions support `--dry-run`.
 
@@ -91,10 +92,10 @@ Run a full immediate backup and verify exact archive/workload pairs:
 ./backupCT.sh --verify
 ```
 
-Run a periodic restore test with an unused CTID:
+Run a periodic restore test with an automatically allocated CTID:
 
 ```bash
-./backupCT.sh --restore-test <source-CT> --restore-id <unused-CTID>
+./backupCT.sh --restore-test <source-CT>
 ```
 
 The restore test uses the newest complete pair and requires explicit confirmation

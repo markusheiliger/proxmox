@@ -1127,8 +1127,7 @@ run_move_transaction() {
 
   if phase_before mounts_detached; then
     move_status_progress 8 "Preparing CT rootfs migration to ${TARGET_NODE}..."
-    detect_node_gpu_capability "$TARGET_NODE"
-    reconcile_stopped_ct_gpu_config "$CTID"
+    reconcile_ct_gpu_config "$CTID" "$TARGET_NODE"
     detach_source_mounts
     checkpoint_move mounts_detached
   fi
@@ -1277,7 +1276,7 @@ main() {
   validate_move_node_contracts "$TARGET_NODE" "$rootfs_size_gib" || exit 1
   resolve_move_bridge_contracts || exit 1
 
-  detect_node_gpu_capability "$TARGET_NODE" || exit 1
+  resolve_ct_gpu_capability "$CTID" "$TARGET_NODE" || exit 1
   validate_target_devices || exit 1
   inspect_migration_bandwidth "$rootfs_size_gib"
 

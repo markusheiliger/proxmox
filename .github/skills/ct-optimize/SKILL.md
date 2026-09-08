@@ -112,10 +112,10 @@ Future remediation skills become eligible without changing this skill when all o
 
 Exclude a malformed, unreadable, or underspecified candidate and record the exclusion reason in run context. Do not fail the optimization run for that exclusion; route affected work to another unambiguous complete owner or `generic`.
 
-Match each uncovered issue against the catalog fail-closed:
+Match each prompt action against the catalog fail-closed:
 
 1. If exactly one eligible skill owns the complete remediation, select its exact frontmatter name.
-2. If multiple skills own separable parts, split the finding into one cohesive issue and prompt per owner. Parts are separable only when each is independently actionable within one owner's contract without requiring that owner to edit another owner's domain.
+2. If multiple skills own separable parts of one finding, create one cohesive prompt action per owner. Parts are separable only when each action stays within one owner's contract without requiring that owner to edit another owner's domain.
 3. If ownership overlaps, remains ambiguous, or no eligible skill owns the complete remediation, use `generic`; never choose the nearest description or emit duplicate competing prompts.
 
 Keep this catalog in run context only. Do not write a registry or modify discovered skills.
@@ -183,6 +183,7 @@ The parent skill—not either subagent—correlates each Recon workload profile 
 - Resolve contradictory evidence conservatively and state the conflict.
 - Independently attest every actionable image and guest OS upgrade against current official release/support sources and exact deployable artifacts before publication. Record the authoritative URL, UTC retrieval timestamp, and result as exactly `verified`, `not found`, `inaccessible`, `contradictory`, or `incomplete`; tool-call completion alone is not verification.
 - For an image upgrade, attest the deployed version, published stable target, exact registry manifest, required architecture/platform and variant, and every derived-build dependency. A mutable or old tag alone is neither deployed-version evidence nor proof that an upgrade exists.
+- For third-party Compose remediation, recommend an explicit readable stable version tag after verification. Keep registry digests as evidence for verification, drift, provenance, and rollback rather than making digest-appended references the default. Treat the mandatory repository-controlled `caddy-stepca:latest` and `caddy-dnsimple:latest` deployment references as compliant exceptions and verify their running digest and embedded Caddy version.
 - For a guest OS upgrade, attest the installed release, supported stable target, every intermediate branch/release and package repository, workload compatibility, and compatibility with the current `upgradeCT.sh` parser/path logic. Never generate a chain by numeric sequencing alone.
 - For a security finding, attest that the authoritative advisory exists and is published, its affected range matches the verified deployed version, and any named fixed version has an available exact artifact. A successful lookup with a missing, empty, unrelated, or contradictory result is not advisory evidence.
 - Preserve Recon's fail-closed disposition. If any required evidence is absent, stale, nonmatching, inaccessible, contradictory, or incomplete, classify the item `unverified — no recommendation`; describe the gap, omit the target and upgrade action, and do not create a prompt or command that presents the upgrade as available. Never synthesize a version, tag, digest, fixed release, advisory identifier, or OS chain from prior reports, likely numbering, or neighboring releases.
@@ -192,7 +193,7 @@ The parent skill—not either subagent—correlates each Recon workload profile 
 
 ### 4a. Rank findings by relevance
 
-Apply one deterministic relevance order to the executive review order, cluster findings, CT order in the table of contents and body, per-CT issues, uncovered prompts, and lifecycle actions:
+Apply one deterministic relevance order to the executive review order, cluster findings, CT order in the table of contents and body, per-CT findings, and their inline actions:
 
 1. Severity: `critical`, `high`, `medium`, `low`, then `informational`.
 2. Within one severity, prerequisites and blockers before work that depends on them.
@@ -230,35 +231,36 @@ Recommend `moveCT.sh` only when all of the following are supported by evidence:
 
 Do not recommend a move solely because another node has fewer CTs or lower instantaneous load. If evidence is incomplete, report the candidate and required verification rather than emitting a move command.
 
-### 7. Classify every issue by remediation coverage
+### 7. Build inline actions for every finding
 
-Assign exactly one coverage class to every **actionable** recommendation:
+Treat each finding as the report's organizing unit. An actionable finding owns one or more immediately following action records; it does not receive one issue-level coverage class. Each action has exactly one type and one owner:
 
-- **Lifecycle-covered** — the complete remediation can be applied through a currently supported `upgradeCT.sh`, `moveCT.sh`, or `refreshCT.sh` invocation after its stated prerequisites are complete.
-- **Uncovered** — remediation requires repository authoring, Compose/image/profile changes, telemetry wiring, authentication/configuration work, permission design, host/device preparation, or another change not directly implemented by those lifecycle commands.
+- **Prompt** — repository authoring, Compose/image/profile changes, telemetry wiring, authentication/configuration work, permission design, host/device preparation, or another change not directly implemented by an approved lifecycle command. Its owner is exactly one eligible remediation skill or `generic`.
+- **Lifecycle** — one currently supported `upgradeCT.sh`, `moveCT.sh`, or `refreshCT.sh` invocation. Its owner is exactly that script.
 
-Do not present the same remediation as independently complete in both classes. A plain refresh after an uncovered edit is a dependent lifecycle step, not the fix itself. Make that dependency explicit and never present the refresh as immediately runnable before the prerequisite edit is reviewed and completed. A rejected or unverified portability idea is non-actionable: mark its coverage `not applicable — portability blocked` or `not applicable — portability unknown` rather than misclassifying it as uncovered.
+A finding may contain several prompt actions, several lifecycle actions, or both. Do not present a dependent lifecycle action as independently complete: a plain refresh after repository authoring is an application step, not the authoring fix. A rejected, unverified, unchanged, blocked, unknown, or incomplete finding is non-actionable and must instead say `**Actions:** None — <specific reason>` with no `text` or `sh` code block.
 
-Assign every uncovered issue exactly one owner from the per-run remediation-owner catalog or `generic`. Use the discovered skill's complete contract, not keyword overlap alone. For example, the current catalog should assign Compose services/images, secrets, storage, health checks, permissions, authentication, initialization, and portable hardware profiles to `ct-compose`; it should assign application metrics/traces, native OTLP, Prometheus scrape sidecars, telemetry identity, duplicate-shipping prevention, migration, and stale-wiring garbage collection to `ct-telemetry`.
+Assign every prompt action exactly one owner from the per-run remediation-owner catalog or `generic`. Use the discovered skill's complete contract, not keyword overlap alone. For example, the current catalog should assign Compose services/images, secrets, storage, health checks, permissions, authentication, initialization, and portable hardware profiles to `ct-compose`; it should assign application metrics/traces, native OTLP, Prometheus scrape sidecars, telemetry identity, duplicate-shipping prevention, migration, and stale-wiring garbage collection to `ct-telemetry`.
 
 Use `generic` for central Telegraf or Proxmox resource telemetry, lifecycle Bash, host/storage/device preparation, and any work without one unambiguous complete owner. `ct-probe` may support a post-deploy acceptance check for unpublished HTTP endpoints but must not own remediation.
 
-An issue and its prompt must stay within one owner's contract. Split independently actionable work when a finding combines application telemetry with image, health, authentication, permission, LXC, device, or other Compose work. Do not ask `ct-compose` to reconcile application telemetry, do not ask `ct-telemetry` to perform unrelated hardening, and do not route missing central CT resource series to `ct-telemetry`.
+Each prompt action must stay within one owner's contract. Create separate prompt actions when a finding combines application telemetry with image, health, authentication, permission, LXC, device, or other Compose work. Do not ask `ct-compose` to reconcile application telemetry, do not ask `ct-telemetry` to perform unrelated hardening, and do not route missing central CT resource series to `ct-telemetry`.
 
-For each uncovered issue, emit exactly one focused copy/paste prompt. The prompt must:
+For each prompt action, emit one focused copy/paste prompt. The prompt must:
 
 - Begin with `/plan` as the first token so copying the complete block into VS Code Chat invokes the built-in Plan agent.
+- Request a planning-only response. Explicitly prohibit file edits, lifecycle or apply commands, and any other implementation until the operator uses the native **Start Implementation** handoff.
 - Identify the CT by hostname and CTID.
 - State the desired outcome, relevant evidence, and measurable acceptance criteria.
 - Require preservation of CT movability and automatic fallback where hardware is involved.
 - Require the Plan agent to inspect applicable files and project instructions, resolve material ambiguities, and present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification.
-- Keep the response in planning for user refinement or the **Start Implementation** handoff. Treat Start Implementation as explicit approval to leave planning; do not ask the planning response to edit files.
+- Keep the response in planning for user refinement or the native **Start Implementation** handoff. That handoff is the only transition requested by the generated prompt; prose such as "plan first" or "wait for confirmation" without the leading `/plan` and planning-only guard is insufficient.
 - Preserve secrets and exclude unrelated changes.
 - Be outcome-oriented rather than prescribing unverified implementation details.
 - Contain one cohesive issue owned by exactly one workflow.
 - Immediately after `/plan`, start skill-owned work with `Use the <skill-name> skill`, substituting the selected owner's exact discovered frontmatter name. For generic work, start with `/plan No discovered repository skill owns this complete remediation;` and request a reviewed implementation plan without inventing an owner.
 
-Record explicit ownership in coverage as `uncovered — <skill-name> — <prompt intent>` or `uncovered — generic — <prompt intent>`. Every non-generic `<skill-name>` must exist in the current run's eligible remediation-owner catalog.
+Record each action's stable title, type, owner, relationship, and purpose immediately before its code block. Relationship must be exactly `independent`, `depends on <exact action title(s)>`, or `blocks <exact action title(s)>`. Every dependency title must resolve to exactly one action in the same report. Every non-generic prompt owner must exist in the current run's eligible remediation-owner catalog.
 
 Do not emit a remediation prompt that applies an optimization classified **Blocked by missing fallback** or **Unknown**. Report what evidence or architecture is missing. When missing fallback architecture is itself a separate, evidence-backed shortcoming, create a distinct uncovered issue owned by the discovered skill whose complete contract covers portable profile authoring, currently `ct-compose`. Its prompt must design and validate generic profiles, stable endpoints, automatic CPU/generic fallback, and dynamic device discovery. Keep the original optimization blocked, and gate any later acceleration or move action on completion and validation of that separate remediation.
 
@@ -270,9 +272,9 @@ Do not emit a remediation prompt that applies an optimization classified **Block
 - Do not imply that `refreshCT.sh` authors prerequisite file changes. Name the files/settings that require operator review without editing them.
 - Rootfs growth, unsupported passthrough, firmware/driver work, or any change not expressible through the approved lifecycle interfaces is a prerequisite/blocker, not a fabricated command.
 
-### 9. Build safe lifecycle proposals per CT
+### 9. Build safe lifecycle actions per finding
 
-Include only commands justified for that CT. Validate every command against the live script parser before reporting it. Never use `--force`.
+Include only commands justified for that CT. Before reporting each command, read and validate it against both the current lifecycle script implementation and its matching operator guide (`refreshCT.sh` and `refreshCT.md`, `upgradeCT.sh` and `upgradeCT.md`, or `moveCT.sh` and `moveCT.md`). Validate the exact hostname or CTID target, supported flags, option exclusivity, recommended values, prerequisites, stop/start and downtime behavior, rollback semantics, and ordering. Never use `--force`.
 
 Supported forms are:
 
@@ -286,7 +288,7 @@ cd /root/scripts && ./refreshCT.sh <hostname>
 
 Use either `--size` or custom `--cores`/`--memory`, never both. A plain refresh is appropriate only after a separately reviewed image/config/profile prerequisite or when reconciliation itself is justified.
 
-Order commands by actual dependencies and explain the order. A common sequence is guest OS upgrade, capability-aligned move, then refresh/resize on the destination, but do not impose it when evidence or prerequisites require another sequence. Account for each script's validation, stop/start behavior, rollback model, and downtime. Commands retain their normal interactive confirmation; this skill must not run or confirm them.
+Order commands by actual dependencies and encode that order in each action's relationship metadata. A command that applies planned repository changes must say `depends on <exact prompt action title> completed and verified`; reviewing a plan alone does not satisfy the prerequisite. A command shared by several findings appears exactly once beneath the final blocking finding and names every prerequisite action. A common sequence is guest OS upgrade, capability-aligned move, then refresh/resize on the destination, but do not impose it when evidence or prerequisites require another sequence. Commands retain their normal interactive confirmation; this skill must not run or confirm them.
 
 ## Generated report contract
 
@@ -337,7 +339,7 @@ Use explicit lowercase anchors exactly as shown. The table of contents must cont
 In all-CT mode include:
 
 - CTs analyzed, incomplete, unchanged, and requiring review.
-- Counts by issue severity plus lifecycle commands, uncovered prompts by owner, cluster prompts, portability-blocked ideas, conditional actions, incomplete inspections, and unchanged CTs.
+- Counts by finding severity plus inline prompt actions by owner, lifecycle actions by script, mixed-action findings, cluster actions, portability-blocked ideas, conditional actions, incomplete inspections, and unchanged CTs.
 - Remediation owners actually used, plus any ineligible workspace skill whose exclusion forced an otherwise actionable issue to `generic`.
 - A risk/dependency-based operator review order matching the sorted body.
 
@@ -356,14 +358,13 @@ Do not copy every CT issue into this section. For a repeated pattern, summarize 
 - **Issue/shortcoming:** Current state and concise supporting evidence.
 - **Why it matters:** Concrete security, reliability, capacity, maintainability, or portability consequence.
 - **How to fix:** Desired target state and advisory remediation approach.
-- **Coverage:** Exactly one of `uncovered — <skill-name> — <prompt intent>`, `uncovered — generic — <prompt intent>`, `not applicable — portability blocked`, or `not applicable — portability unknown`; every non-generic skill name must be an eligible owner in the run catalog, and lifecycle coverage belongs to CT sections only.
 - **Portability impact:** Classification and effect on current or future placement.
 - **Prerequisites and dependencies:** Required evidence, backup, compatibility checks, and action ordering.
 - **Risk and rollback:** Likely failure modes and recovery path.
 - **Downtime:** Expected interruption, or `none`/`unknown` with justification.
 - **Confidence:** `high`, `medium`, or `low`, tied to evidence quality.
 
-For each actionable uncovered issue unique to this section, emit exactly one immediately following `text` block labeled with the matching issue title and owner. The block must begin with `/plan` and then explicitly invoke its discovered skill owner, or state that no discovered repository skill owns generic work. It must name the cluster or node and affected CTs and require the same implementation-ready, refinable Plan-agent output and **Start Implementation** handoff as CT prompts. Preserve secrets and movability, and exclude unrelated changes. Do not emit cluster-level shell commands. Do not add a second cluster prompt for a repeated issue already covered by per-CT prompts.
+Immediately after each unique cluster finding, emit its inline actions using the same action-record format as CT findings. Cluster actions may be prompts but never shell commands. Each prompt must name the cluster or node and affected CTs and require the same implementation-ready, refinable Plan-agent output and **Start Implementation** handoff as CT prompts. Preserve secrets and movability, exclude unrelated changes, and do not add a second cluster prompt for a repeated issue already covered by per-CT actions.
 
 If no cluster improvement is justified, include one informational record saying so. If Scout evidence is missing, the run must already have stopped before publication.
 
@@ -410,44 +411,37 @@ The table is an overview only. Mark blocked, conditional, and evidence-limited t
 - Overall classification: `portable`, `portable with degraded fallback`, `blocked by missing fallback`, or `unknown`.
 - Generic capability class required, compatible destination constraints, and move blockers. Never persist a node or device identity.
 
-**Issues and recommendations**
-
 List issues using the shared deterministic relevance order. Use `critical` for immediate compromise/data-loss/unavailability risk, `high` for verified material security or sustained capacity/reliability failure, `medium` for actionable maintenance or efficiency shortcomings, `low` for minor hardening/future-proofing, and `informational` for unchanged or evidence-limited observations. Use one record per distinct issue:
 
 #### `[severity]` — `<issue title>`
 - **Issue/shortcoming:** Current state and concise supporting evidence.
 - **Why it matters:** Concrete security, reliability, capacity, maintainability, or portability consequence.
 - **How to fix:** Desired target state and remediation approach. For a rejected optimization, state that it must not be applied.
-- **Coverage:** For actionable work, exactly `lifecycle-covered — <script>`, `uncovered — <skill-name> — <prompt intent>`, or `uncovered — generic — <prompt intent>`. Every non-generic skill name must be an eligible owner in the run catalog. For a rejected or unverified portability idea, use `not applicable — portability blocked` or `not applicable — portability unknown`.
 - **Portability impact:** Classification, automatic fallback behavior, and effect on future moves.
 - **Prerequisites:** Required evidence, backup, configuration, compatibility checks, and action ordering.
 - **Risk and rollback:** Likely failure modes and recovery path.
 - **Downtime:** Expected service/CT interruption, or `none`/`unknown` with justification.
 - **Confidence:** `high`, `medium`, or `low`, tied to evidence quality.
 
-If there are no shortcomings, include one informational record stating that no optimization is justified. If an idea is blocked or unknown for portability, explain why and omit all apply output for that idea.
+Immediately after the finding fields, emit `**Actions:**` and one or more action records. Each record must be adjacent to its finding and use this metadata in order:
 
-**Uncovered optimization prompts**
+- `##### Action: <stable unique title>`
+- `- **Type:** prompt | lifecycle`
+- `- **Owner:** <eligible-skill-name> | generic | refreshCT.sh | upgradeCT.sh | moveCT.sh`
+- `- **Relationship:** independent | depends on <exact action title(s)> | blocks <exact action title(s)>`
+- `- **Purpose:** <one cohesive outcome and scope>`
 
-For every uncovered issue, emit exactly one separate `text` code block immediately labeled with the matching issue title and owner. Prompts must be ready to copy into VS Code Chat, begin with `/plan`, explicitly invoke the owner recorded in coverage, and produce a plan that the operator can refine or hand off with **Start Implementation**. Example shape:
+A prompt action is followed immediately by one `text` block. It must be ready to copy into VS Code Chat, begin with `/plan`, explicitly invoke its declared owner, and produce planning content only until the operator uses the native **Start Implementation** handoff. Example shape:
 
 ```text
-/plan Use the <skill-name> skill for CT <CTID> (<hostname>) to plan a focused update that <desired outcome>. Evidence: <concise evidence>. Preserve CT movability by <fallback/profile constraint>. Acceptance criteria: <verifiable result>. Inspect the current files and applicable project instructions, resolve material ambiguities, then present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification. Remain in planning so I can refine the plan or use Start Implementation as explicit approval to begin edits. Preserve secrets and unrelated configuration.
+/plan Use the <skill-name> skill for CT <CTID> (<hostname>) to plan a focused update that <desired outcome>. Evidence: <concise evidence>. Preserve CT movability by <fallback/profile constraint>. Acceptance criteria: <verifiable result>. Inspect the current files and applicable project instructions, resolve material ambiguities, then present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification. Return planning content only; do not edit files, run lifecycle or apply commands, or begin implementation. Remain in planning so I can refine the plan or use the native Start Implementation handoff. Preserve secrets and unrelated configuration.
 ```
 
-For `generic`, replace the opening with: `/plan No discovered repository skill owns this complete remediation; plan a focused implementation for ...` and retain the same implementation-ready plan and handoff requirements.
+For `generic`, replace the opening with: `/plan No discovered repository skill owns this complete remediation; plan a focused implementation for ...` and retain the same implementation-ready plan and handoff requirements. Do not wrap prompts in shell fences or make them commands.
 
-Do not emit this subsection's prompt blocks when no uncovered issue exists. Do not wrap prompts in shell fences or make them commands.
+A lifecycle action is followed immediately by one `sh` block containing exactly one validated command. Its relationship names all prerequisites and, for authoring prerequisites, says they must be completed and verified. Multiple actions under one finding must use relationship metadata to state whether they are independent or sequential; visual order alone is insufficient.
 
-**Lifecycle-covered actions — manual review only**
-
-Emit exactly one `sh` code block for this CT. Include only applicable, validated lifecycle commands in dependency order. Place commands that depend on uncovered work after ordered `# BLOCKED UNTIL:` comments naming each exact prompt title that must be completed and verified; reviewing a plan alone does not satisfy the prerequisite. If no lifecycle action is justified, emit:
-
-```sh
-# No lifecycle change recommended for <hostname>.
-```
-
-Do not combine multiple CTs into a loop or batch command. Keep every CT's prompts and commands under its own report. A portability-blocked optimization appears only in its issue record and never in either apply subsection; only a distinct uncovered fallback-architecture issue may receive a prompt.
+If there are no shortcomings, include one informational record stating that no optimization is justified and finish it with `**Actions:** None — no evidence-backed change is justified.` Blocked, unknown, unchanged, unverified, and incomplete findings use the same `**Actions:** None — <specific reason>` form and contain no action heading or code block. A portability-blocked optimization receives no action; only a distinct evidence-backed fallback-architecture finding may receive a prompt action. Do not combine multiple CTs into a loop or batch command, and do not duplicate a lifecycle command under several findings.
 
 End the complete report with a truthful write-status disclaimer:
 
@@ -455,7 +449,7 @@ End the complete report with a truthful write-status disclaimer:
 
 ### Publication
 
-Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, prompt/action cardinality, lifecycle syntax, secret redaction, and the final disclaimer. Then create or replace only `/root/scripts/todos/optimization.md` in one file-edit operation. Never publish incrementally.
+Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, inline-action adjacency, unique action titles, dependency resolution, ownership, lifecycle syntax against both script and guide, secret redaction, and the final disclaimer. Then create or replace only `/root/scripts/todos/optimization.md` in one file-edit operation. Never publish incrementally.
 
 After successful publication, return a concise summary and link to `[todos/optimization.md](todos/optimization.md)`. If publication fails, report the error and provide the complete Markdown in chat without claiming the file was updated.
 
@@ -480,16 +474,16 @@ Before returning the report, confirm:
 - Every guest OS target and each intermediate chain release/repository has matching `upgrade verified` Recon evidence and independent parent attestation, including workload and lifecycle-parser compatibility. No numerically synthesized chain produced a recommendation.
 - Every actionable security upgrade is backed by an existing published authoritative advisory whose affected range matches the verified deployment and whose named fixed version has an attested exact artifact; retrieval/tool success alone was never treated as source evidence.
 - Every failed, inaccessible, contradictory, nonmatching, or incomplete version/advisory/artifact/chain check is reported as `unverified — no recommendation` with no synthesized target, apply-ready prompt, lifecycle command, or blocked refresh that implies an upgrade exists.
-- Every actionable issue has exactly one remediation-coverage class and one workflow owner. Every uncovered actionable issue has exactly one focused prompt whose first token is `/plan` and which explicitly invokes the same owner, cross-owner findings are split, rejected portability ideas remain non-actionable, and dependent lifecycle commands use exact `# BLOCKED UNTIL:` prompt titles for completed and verified prerequisite edits.
-- Every CT-level and unique cluster-level prompt requests affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification, then remains in planning for refinement or the **Start Implementation** handoff.
+- Every actionable finding has one or more adjacent inline actions. Every action has one type, one owner, a stable unique title, an explicit relationship, and one cohesive purpose; prompt actions begin with `/plan` and invoke the declared owner, while rejected, unverified, blocked, unknown, unchanged, and incomplete findings use `**Actions:** None — <reason>` and have no code block.
+- Every CT-level and unique cluster-level prompt requests affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification; requires planning content only with no edits, lifecycle/apply commands, or implementation; and remains in planning for refinement or the native **Start Implementation** handoff.
 - No rootfs shrink or unsupported flag is proposed.
-- Every issue states severity, evidence, why it matters, how to fix it, coverage, portability, prerequisites, risk/rollback, downtime, and confidence.
-- Every CT has exactly one minimal lifecycle-command block; prompt blocks are one per uncovered issue and counts reconcile by owner.
+- Every finding states severity, evidence, why it matters, how to fix it, portability, prerequisites, risk/rollback, downtime, confidence, and its adjacent actions or specific no-action reason.
+- Every lifecycle action was validated against both the current script implementation and matching operator guide; it has exactly one command, no `--force`, no mutually exclusive resize forms, the exact CT target, and explicit completed-and-verified prompt dependencies where applicable. Shared commands appear once under the final blocking finding.
 - Metadata contains UTC generation time, `WINDOW`, exact scope, and inspection completeness.
 - The table of contents has exactly one cluster link and one working `#ct-<CTID>` link for every selected CT; TOC and body CT order match.
 - Cluster findings and all CT findings follow the deterministic relevance order; prerequisites precede dependent actions.
-- Cluster rollups link to affected CTs without duplicating their prompts or commands; unique cluster uncovered issues have exactly one cluster prompt and no shell command.
-- Summary counts match the sorted issue records, owner-specific prompts, command blocks, incomplete CTs, and unchanged CTs.
+- Cluster rollups link to affected CTs without duplicating their actions; unique cluster findings may have prompt actions but no shell command.
+- Summary counts match the sorted findings, prompt actions by owner, lifecycle actions by script, mixed-action findings, conditional actions, incomplete CTs, and unchanged CTs.
 - Application telemetry and central Telegraf/Proxmox resource telemetry are reported separately; missing central CT series never route to `ct-telemetry`.
 - The complete document passed validation before one create/replace operation; no partial report was published.
 - `/root/scripts/todos/optimization.md` was the only file written; no command was executed, no confirmation was bypassed, no recommendation was applied, and no secret value was exposed.

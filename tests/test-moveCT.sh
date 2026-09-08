@@ -189,6 +189,12 @@ assert_output "GPU without render device is classified broken" "STATE broken" \
 
 assert_success "moveCT help parses" bash "${SCRIPT_DIR}/moveCT.sh" --help
 assert_failure_contains "legacy --gpu option is rejected" "Unknown option '--gpu'" bash "${SCRIPT_DIR}/moveCT.sh" --gpu
+if grep -Fq 'resolve_ct_gpu_capability "$CTID" "$TARGET_NODE"' "${SCRIPT_DIR}/moveCT.sh" \
+  && ! grep -Fq 'detect_node_gpu_capability "$TARGET_NODE"' "${SCRIPT_DIR}/moveCT.sh"; then
+  pass "move preflight uses CT-aware GPU capability"
+else
+  fail "move preflight uses CT-aware GPU capability"
+fi
 if grep -Fq "The CT will be stopped briefly for the final data sync" "${SCRIPT_DIR}/moveCT.sh"; then
   pass "move confirmation explains downtime in plain language"
 else

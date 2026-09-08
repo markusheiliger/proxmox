@@ -107,7 +107,12 @@ live host values in documentation or Compose files.
 
 Forward-auth labels use ordered Caddy route bands so the Authentik outpost,
 authentication gate, and application handler execute predictably. The forwarded
-host must remain the original request host for correct cookie scoping.
+host must remain the original request host for correct cookie scoping. Workload
+Caddy sends Authentik's hostname as `Host` for HTTPS routing and carries the
+application hostname in `X-Forwarded-Host`. Only Authentik's Caddy trusts this
+header, scoped to the site-local `192.168.0.0/16` CT networks so CTs remain
+movable between local VLANs; workload edge proxies do not trust client-supplied
+forwarding headers.
 
 ## Related documentation
 

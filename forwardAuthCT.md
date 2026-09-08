@@ -48,6 +48,14 @@ Authentik objects. It references `${AUTH_HOSTNAME}` in Compose so the CT `.env`
 remains the source of truth and renames do not hard-code the authentication
 host. Compose is restarted after a change.
 
+Workload Caddy instances connect to Authentik's HTTPS virtual host and therefore
+send the Authentik hostname in `Host`. Caddy independently generates
+`X-Forwarded-Host` from the application request. The Authentik Caddy proxy trusts
+that forwarded identity only from the site-local `192.168.0.0/16` CT networks
+and preserves it for embedded-outpost provider selection. Do not add
+`trusted_proxies` to workload forward-auth routes; edge clients must not be
+allowed to supply that identity.
+
 ## Recovery
 
 The operations are idempotent. If Authentik succeeds but Compose restart fails,

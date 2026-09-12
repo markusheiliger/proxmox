@@ -302,7 +302,7 @@ fi
 
 remote_backup_log="${TEST_ROOT}/remote-backup.log"
 remote_resources='[{"type":"lxc","vmid":2100,"name":"app.thesaints.home","node":"pve02"}]'
-config_get_backup_storage() { echo backup-nfs; }
+config_get_backup_ct_storage() { echo backup-nfs; }
 config_get_backup_hook_path() { echo /usr/local/lib/pve-backup/pve-workload-backup-hook; }
 config_get_backup_tmpdir() { echo /TEMP/vzdump-tmp; }
 config_get_backup_mode() { echo suspend; }
@@ -335,7 +335,7 @@ restore_archive="${BACKUP_MOUNT}/dump/vzdump-lxc-2100-2026_08_28-02_00_00.tar.zs
 restore_generation="${WORKLOAD_ROOT}/app.thesaints.home/vzdump-lxc-2100-2026_08_28-02_00_00"
 mkdir -p "${restore_generation}/docker" "${restore_generation}/docker-data"
 touch "$restore_archive"
-config_get_backup_storage() { printf '../../%s\n' "${BACKUP_MOUNT#/}"; }
+config_get_backup_ct_storage() { printf '../../%s\n' "${BACKUP_MOUNT#/}"; }
 online_nodes() { printf 'pve01\npve02\n'; }
 bridge_policy_resolve() {
   BRIDGE_POLICY_SELECTED=vmbr0

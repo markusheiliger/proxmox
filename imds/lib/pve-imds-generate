@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PVESH="${PVE_IMDS_PVESH:-/usr/bin/pvesh}"
+MAX_INPUT_BYTES="${PVE_IMDS_MAX_INPUT_BYTES:-1048576}"
+TIMEOUT_SECONDS="${PVE_IMDS_TIMEOUT_SECONDS:-5}"
+
+usage() {
+  echo "Usage: pve-imds-generate <metadata|profiles> <CTID>" >&2
+  exit 64
+}
+
+[[ $# -eq 2 ]] || usage
+operation="$1"
+ctid="$2"
+
+[[ "$operation" == metadata || "$operation" == profiles ]] || usage
+[[ "$ctid" =~ ^[1-9][0-9]{0,8}$ ]] || {
+  echo "ERROR: invalid CTID: ${ctid}" >&2
+  exit 64
+}
+[[ "$MAX_INPUT_BYTES" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ERROR: invalid input byte limit" >&2
+  exit 64
+}
+[[ "$TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || {
+  echo "ERROR: invalid timeout" >&2
+  exit 64
+}
+[[ "$PVESH" == /* && -x "$PVESH" ]] || {
+  echo "ERROR: pvesh executable is unavailable: ${PVESH}" >&2
+  exit 69
+}
+
+work_dir="$(mktemp -d)"
+trap 'rm -rf "$work_dir"' EXIT
+raw_json="${work_dir}/raw.json"
+metadata_json="${work_dir}/metadata.json"
+
+if ! timeout --kill-after=1s "${TIMEOUT_SECONDS}s" \
+  "$PVESH" get "/nodes/localhost/lxc/${ctid}/config" --output-format json >"$raw_json"; then
+  echo "ERROR: failed to retrieve metadata for CT ${ctid}" >&2
+  exit 74
+fi
+
+input_bytes="$(stat -c %s "$raw_json")"
+if ((input_bytes > MAX_INPUT_BYTES)); then
+  echo "ERROR: metadata for CT ${ctid} exceeds ${MAX_INPUT_BYTES} bytes" >&2
+  exit 74
+fi
+
+if ! jq -cS -f "${SCRIPT_DIR}/filters/redact.jq" "$raw_json" >"$metadata_json"; then
+  echo "ERROR: invalid metadata JSON for CT ${ctid}" >&2
+  exit 74
+fi
+
+if [[ "$operation" == metadata ]]; then
+  cat "$metadata_json"
+else
+  jq -c -f "${SCRIPT_DIR}/filters/profiles.jq" "$metadata_json"
+fi

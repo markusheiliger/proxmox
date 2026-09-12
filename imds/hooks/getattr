@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/hook-common.sh"
+
+path="${1:-}"
+if [[ "$path" == / ]]; then
+  imds_emit_stat 1 dr-xr-xr-x 2 0
+  exit 0
+fi
+
+if imds_parse_ct_path "$path"; then
+  imds_ct_is_local "$IMDS_CTID" || exit 2
+  imds_emit_stat "$(imds_dir_inode "$IMDS_CTID")" dr-xr-xr-x 2 0
+  exit 0
+fi
+
+if imds_parse_file_path "$path"; then
+  imds_ct_is_local "$IMDS_CTID" || exit 2
+  output="$(mktemp)"
+  trap 'rm -f "$output"' EXIT
+  imds_generate_to_file "$IMDS_KIND" "$IMDS_CTID" "$output" || exit 5
+  size="$(stat -c %s "$output")"
+  imds_emit_stat "$(imds_file_inode "$IMDS_CTID" "$IMDS_KIND")" -r--r--r-- 1 "$size"
+  exit 0
+fi
+
+exit 2

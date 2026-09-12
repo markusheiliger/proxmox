@@ -32,8 +32,9 @@ Run workload tests through the cluster-aware runner:
 - `test-forwardAuthCT.sh`: generated Authentik forward-auth label contract.
 - `test-glances-policy.sh`: shared Glances no-authentication policy contract.
 - `test-moveCT.sh`: migration and rollback.
-- `test-optimization-contract.sh`: fail-closed image, advisory, artifact, and guest
-  OS upgrade verification contracts for Recon and `ct-optimize`.
+- `test-optimization-contract.sh`: fail-closed image, advisory, artifact, guest OS
+  upgrade, and per-action native `/plan` handoff contracts for Recon and
+  `ct-optimize`.
 - `test-permissions.sh`: bind ownership policy.
 - `test-refresh.sh`: refresh and initialization behavior.
 - `test-testCT.sh`: workload discovery, owner-node routing, selection, ordering,

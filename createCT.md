@@ -62,16 +62,17 @@ same system disk. CT rootfs allocation consumes `pve/data`, not `pve/root`.
 The ZFS `DATA` pool remains required behind the `DOCKER` directory storage for
 the `/mnt/docker` tree; only rootfs allocation has moved away from `DATA`.
 
-The script creates the CT rootfs on `local-lvm`, creates `/mnt/docker/<hostname>` and
-`/mnt/docker-data/<hostname>`, attaches them as `/mnt/docker` and
-`/mnt/docker-data`, writes the CT `.env`, and uses the matching fallback Compose
-template when no per-CT Compose file exists. An existing CT is refreshed instead
-of duplicated.
+The script creates the CT rootfs on `local-lvm`, creates `/mnt/docker/<hostname>`
+and `/mnt/docker-data/<hostname>`, and reconciles exactly three bind mounts:
+node-local IMDS at read-only `mp0`, Docker at `mp1`, and Docker-data at `mp2`.
+It writes the CT `.env` and uses the matching fallback Compose template when no
+per-CT Compose file exists. An existing CT is refreshed instead of duplicated.
 
-Stacks with an executable `_config/select-compose-profile.sh` select one generic
-hardware profile before Compose validation and startup. Selection is local to
-the CT and is reevaluated on boot; node-specific render-device names are never
-persisted in `.env`.
+Profile-aware stacks put grouped `x-profiles` metadata first in their Compose
+file. Creation installs Python/PyYAML, validates that metadata, evaluates its
+requirements inside the CT, and reevaluates selection on boot. Selection is
+process-local; node and device identity are never persisted in `.env`. Existing
+`_config/select-compose-profile.sh` workloads remain supported during migration.
 
 ## Recovery
 

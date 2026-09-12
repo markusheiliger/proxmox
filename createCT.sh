@@ -415,6 +415,7 @@ start_compose() {
 # MAIN
 # -----------------------------
 main() {
+  local relevant_profile_groups
   lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
   # Parse arguments
   [[ $# -lt 1 ]] && usage
@@ -552,7 +553,8 @@ main() {
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Configuring LXC for Docker..."
   configure_lxc_docker
-  reconcile_ct_gpu_config "${CTID}" "$CREATE_NODE" || exit 1
+  relevant_profile_groups=$(ct_relevant_profile_groups "${CTID}" "$HOSTNAME") || exit 1
+  reconcile_ct_gpu_config "${CTID}" "$CREATE_NODE" "$relevant_profile_groups" || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Starting container..."
   start_ct
@@ -574,12 +576,13 @@ main() {
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Applying configuration..."
   apply_ct_configuration "${CTID}" "${HOSTNAME}"
-  finalize_ct_gpu_capability "${CTID}" "$CREATE_NODE" || exit 1
+  finalize_ct_gpu_capability "${CTID}" "$CREATE_NODE" "$relevant_profile_groups" || exit 1
 
   step=$((step + 1)); status_progress "$step" "$total_steps" "Setting up mountpoints..."
-  setup_mountpoints
+  setup_mountpoints || exit 1
   sync_config_shared
   reboot_ct || echo "  [!] Reboot verification failed (non-fatal)"
+  evaluate_and_reconcile_ct_profiles "${CTID}" "$relevant_profile_groups" || exit 1
   
   step=$((step + 1)); status_progress "$step" "$total_steps" "Verifying setup..."
   verify_setup

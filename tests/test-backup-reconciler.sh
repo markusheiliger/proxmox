@@ -25,9 +25,7 @@ mkdir -p "${BACKUP_MOUNT}/dump" "${BACKUP_MOUNT}/workloads"
 cat >"$BACKUP_POLICY_FILE" <<'EOF'
 BACKUP_CT_JOB_ID=ct-backup
 BACKUP_VM_JOB_ID=vm-backup
-BACKUP_VM_ENABLED=true
 BACKUP_EXCLUDE_TAGS=no-backup,backup-restore-test
-BACKUP_PRUNE_POLICY=keep-daily=7,keep-weekly=4,keep-monthly=6
 EOF
 source "${SCRIPT_DIR}/backup/reconcile-backup-jobs"
 
@@ -38,8 +36,8 @@ TEST_RESOURCES='[
   {"type":"qemu","vmid":101,"name":"vm-101","node":"pve01","tags":"backup-restore-test"}
 ]'
 TEST_NODE=pve01
-CT_JOB='{"enabled":1,"vmid":"999","prune-backups":{"keep-daily":"7","keep-weekly":"4","keep-monthly":"6"}}'
-VM_JOB='{"enabled":1,"vmid":"100","prune-backups":{"keep-daily":"7","keep-weekly":"4","keep-monthly":"6"}}'
+CT_JOB='{"enabled":1,"vmid":"999"}'
+VM_JOB='{"enabled":1,"vmid":"100"}'
 CT_LOCK=""
 ACTIVE_TASKS='[]'
 hostname() { printf '%s\n' "$TEST_NODE"; }
@@ -59,32 +57,28 @@ pvesh() {
 
 : >"$TEST_ROOT/calls"
 main >/dev/null
-assert_contains "leader reconciles exact CT membership" "set /cluster/backup/ct-backup --vmid 200 --enabled 1 --prune-backups keep-daily=7,keep-weekly=4,keep-monthly=6"
+assert_contains "leader reconciles exact CT membership" "set /cluster/backup/ct-backup --vmid 200 --enabled 1"
+assert_not_contains "reconciler does not override storage retention" "--prune-backups"
 assert_not_contains "current VM membership is not rewritten" "set /cluster/backup/vm-backup"
 
 : >"$TEST_ROOT/calls"
 TEST_RESOURCES='[{"type":"lxc","vmid":200,"name":"ct-200","node":"pve01"},{"type":"qemu","vmid":101,"name":"vm-101","node":"pve01","tags":"no-backup"}]'
 VM_JOB='{"enabled":1,"vmid":"100"}'
 main >/dev/null
-assert_contains "empty eligible VM set disables its job" "set /cluster/backup/vm-backup --enabled 0 --prune-backups keep-daily=7,keep-weekly=4,keep-monthly=6"
+assert_contains "empty eligible VM set disables its job" "set /cluster/backup/vm-backup --enabled 0"
 assert_not_contains "empty eligible VM set does not retain a stale VMID" "set /cluster/backup/vm-backup --vmid"
 
 : >"$TEST_ROOT/calls"
 TEST_RESOURCES='[{"type":"lxc","vmid":200,"name":"ct-200","node":"pve01"},{"type":"qemu","vmid":100,"name":"vm-100","node":"pve01"}]'
-CT_JOB='{"enabled":1,"vmid":"200","prune-backups":{"keep-last":"1"}}'
-VM_JOB='{"enabled":1,"vmid":"100","prune-backups":{"keep-daily":"7","keep-weekly":"4","keep-monthly":"6"}}'
-main >/dev/null
-assert_contains "retention drift is reconciled on CT job" "set /cluster/backup/ct-backup --vmid 200 --enabled 1 --prune-backups keep-daily=7,keep-weekly=4,keep-monthly=6"
-
-: >"$TEST_ROOT/calls"
-CT_JOB='{"enabled":1,"vmid":"999","prune-backups":{"keep-daily":"7","keep-weekly":"4","keep-monthly":"6"}}'
+CT_JOB='{"enabled":1,"vmid":"999"}'
+VM_JOB='{"enabled":1,"vmid":"100"}'
 CT_LOCK=backup
 if main >"${TEST_ROOT}/stale-lock-output" 2>&1; then
   fail "stale backup lock fails reconciler health"
 else
   pass "stale backup lock fails reconciler health"
 fi
-assert_contains "membership still reconciles before stale-lock failure" "set /cluster/backup/ct-backup --vmid 200 --enabled 1 --prune-backups keep-daily=7,keep-weekly=4,keep-monthly=6"
+assert_contains "membership still reconciles before stale-lock failure" "set /cluster/backup/ct-backup --vmid 200 --enabled 1"
 if grep -Fq 'STALE LOCK CT 200' "${TEST_ROOT}/stale-lock-output"; then
   pass "reconciler reports stale lock recovery guidance"
 else

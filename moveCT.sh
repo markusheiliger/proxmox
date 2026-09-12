@@ -13,6 +13,7 @@ FORCE=false
 MOVE_ACTION="move"
 ORIGINAL_STATUS=""
 ORIGINAL_GPU_CONFIG=""
+RELEVANT_PROFILE_GROUPS=""
 EXPECTED_SERVICES=""
 MIGRATED=false
 TARGET_DIRS_CREATED=false
@@ -56,8 +57,8 @@ phase_rank() {
     initialized) echo 0 ;; source_network_reconciled) echo 1 ;; target_prepared) echo 2 ;; seeded) echo 3 ;;
     live_sync_complete) echo 4 ;; stopped_sync_complete) echo 5 ;; data_verified) echo 6 ;;
     mounts_detached) echo 7 ;; migration_submitted) echo 8 ;; migration_complete) echo 9 ;;
-    target_network_reconciled) echo 10 ;; mounts_restored) echo 11 ;; services_verified) echo 12 ;;
-    dns_verified) echo 13 ;; committed) echo 14 ;; *) echo -1 ;;
+    target_network_reconciled) echo 10 ;; mounts_restored) echo 11 ;; profile_tags_reconciled) echo 12 ;;
+    services_verified) echo 13 ;; dns_verified) echo 14 ;; committed) echo 15 ;; *) echo -1 ;;
   esac
 }
 
@@ -92,6 +93,7 @@ save_move_state() {
     --arg ctid "$CTID" --arg hostname "$CT_HOSTNAME" \
     --arg source "$SOURCE_NODE" --arg target "$TARGET_NODE" \
     --arg original_status "$ORIGINAL_STATUS" --arg original_gpu "$ORIGINAL_GPU_CONFIG" \
+    --arg relevant_profile_groups "$RELEVANT_PROFILE_GROUPS" \
     --arg expected_services "$EXPECTED_SERVICES" \
     --arg docker "$DIR_DOCKER" --arg docker_data "$DIR_DOCKER_DATA" \
     --arg seed "$BACKUP_SEED_GENERATION" --arg upid "$MOVE_TASK_UPID" \
@@ -104,6 +106,7 @@ save_move_state() {
     '{schema:2,revision:$revision,phase:$phase,ctid:$ctid,hostname:$hostname,
       source_node:$source,target_node:$target,original_status:$original_status,
       original_gpu_config:$original_gpu,
+      relevant_profile_groups:($relevant_profile_groups | split("\n") | map(select(length > 0))),
       expected_services:$expected_services,paths:{docker:$docker,docker_data:$docker_data},
       backup_seed:$seed,mount_keys:$mount_keys,mount_values:$mount_values,
       network:{original_keys:$network_keys,original_values:$network_values,
@@ -136,6 +139,7 @@ load_move_state() {
   TARGET_NODE=$(jq -r '.target_node' "$MOVE_STATE_FILE")
   ORIGINAL_STATUS=$(jq -r '.original_status' "$MOVE_STATE_FILE")
   ORIGINAL_GPU_CONFIG=$(jq -r '.original_gpu_config // ""' "$MOVE_STATE_FILE")
+  RELEVANT_PROFILE_GROUPS=$(jq -r '.relevant_profile_groups[]?' "$MOVE_STATE_FILE")
   EXPECTED_SERVICES=$(jq -r '.expected_services' "$MOVE_STATE_FILE")
   DIR_DOCKER=$(jq -r '.paths.docker' "$MOVE_STATE_FILE")
   DIR_DOCKER_DATA=$(jq -r '.paths.docker_data' "$MOVE_STATE_FILE")
@@ -153,6 +157,11 @@ load_move_state() {
   TARGET_BRIDGE=$(jq -r '.network.target_bridge' "$MOVE_STATE_FILE")
   TARGET_BRIDGE_REASON=$(jq -r '.network.target_reason' "$MOVE_STATE_FILE")
   TARGET_DIRS_CREATED=true
+  if phase_before migration_complete; then
+    CT_NODE["$CTID"]="$SOURCE_NODE"
+  else
+    CT_NODE["$CTID"]="$TARGET_NODE"
+  fi
   [[ $(phase_rank "$MOVE_PHASE") -lt $(phase_rank mounts_detached) ]] || MOUNT_TRANSACTION_STARTED=true
   [[ $(phase_rank "$MOVE_PHASE") -lt $(phase_rank migration_complete) ]] || MIGRATED=true
   [[ $(phase_rank "$MOVE_PHASE") -lt $(phase_rank mounts_restored) ]] || TARGET_MOUNTS_ATTACHED=true
@@ -236,7 +245,8 @@ collect_device_requirements() {
 
   if [[ "$ORIGINAL_STATUS" == "running" ]]; then
     compose_json=$(ct_exec --timeout 30 "$CTID" \
-      'cd /mnt/docker && docker compose config --format json' 2>/dev/null || true)
+      'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --format json; else docker compose config --format json; fi' \
+      2>/dev/null || true)
   fi
 
   if [[ -n "$compose_json" ]] && jq -e '.services' >/dev/null 2>&1 <<< "$compose_json"; then
@@ -291,10 +301,44 @@ collect_device_requirements() {
   fi
 }
 
+has_device_free_profile() {
+  local compose_json default_profiles source_node="${SOURCE_NODE:-$(hostname -s)}"
+  local compose_file="$DIR_DOCKER/docker-compose.yaml"
+
+  # Compose is available only inside a running CT. A stopped workload cannot
+  # prove that its fallback renders device-free, so destination checks fail closed.
+  [[ "$ORIGINAL_STATUS" == "running" ]] || return 1
+
+  if compose_file_has_managed_profiles "$source_node" "$compose_file"; then
+    default_profiles=$(jq -er '
+      .profiles | to_entries | map("\(.key)-\(.value.default)") | join(",")
+    ' "$CONFIG_FILE") || return 1
+    compose_json=$(ct_exec --timeout 30 "$CTID" \
+      "cd /mnt/docker && COMPOSE_PROFILES='${default_profiles}' docker compose config --format json" \
+      2>/dev/null) || return 1
+  else
+    compose_json=$(ct_exec --timeout 30 "$CTID" \
+      'cd /mnt/docker && test -x ./_config/select-compose-profile.sh && COMPOSE_PROFILES=no-discrete-gpu VULKAN_DEVICE=/dev/null docker compose config --format json' \
+      2>/dev/null) || return 1
+  fi
+
+  jq -e '
+    (.services | length) > 0
+    and all(.services[];
+      ((.devices // []) | length) == 0
+      and (.runtime // "") != "nvidia"
+      and all(.deploy.resources.reservations.devices[]?;
+        all(.capabilities[]?; . != "gpu")))
+  ' >/dev/null 2>&1 <<< "$compose_json"
+}
+
 validate_target_devices() {
-  local requirement service source
+  local requirement service source device_free_fallback=false
   local failures=()
   collect_device_requirements
+  if [[ "$NODE_GPU_STATE" != "available" ]] && has_device_free_profile; then
+    device_free_fallback=true
+  fi
 
   for requirement in "${DEVICE_REQUIREMENTS[@]}"; do
     service="${requirement%%$'\t'*}"
@@ -305,6 +349,14 @@ validate_target_devices() {
     fi
     if [[ "$source" == "/dev/bus/usb" ]]; then
       failures+=("${service}: maps /dev/bus/usb; USB device identity cannot be proven on another node")
+      continue
+    fi
+    if [[ "$source" == "/dev/dri" || "$source" == /dev/dri/* ]] \
+      && [[ "$NODE_GPU_STATE" != "available" ]]; then
+      if [[ "$device_free_fallback" == "true" ]]; then
+        continue
+      fi
+      failures+=("${service}: requires DRM, but the target has no usable render device or validated CPU profile")
       continue
     fi
     if ! remote "test -e '$source'" 2>/dev/null; then
@@ -361,7 +413,7 @@ validate_move_node_contracts() {
 validate_ct_storage_scope() {
   local line key value source storage
   local failures=()
-  local docker_mount=false docker_data_mount=false
+  local imds_mount=false docker_mount=false docker_data_mount=false
 
   while IFS= read -r line; do
     key="${line%%:*}"
@@ -369,6 +421,15 @@ validate_ct_storage_scope() {
     source="${value%%,*}"
     if [[ "$source" == /* ]]; then
       case "$source" in
+        "/run/pve-imds/${CTID}")
+          if [[ "$key" == mp0 && ",$value," == *,mp=/mnt/pve-imds,* \
+            && ",$value," == *,ro=1,* && ",$value," == *,shared=1,* \
+            && ",$value," == *,backup=0,* ]]; then
+            imds_mount=true
+          else
+            echo "  [i] ${key}: noncanonical IMDS mount will be replaced during migration."
+          fi
+          ;;
         "$DIR_DOCKER")
           if [[ ",$value," == *,mp=/mnt/docker,* ]]; then
             docker_mount=true
@@ -383,7 +444,7 @@ validate_ct_storage_scope() {
             failures+=("${key}: '${source}' must map to /mnt/docker-data")
           fi
           ;;
-        *) failures+=("${key}: unsupported bind mount '${source}'") ;;
+        *) echo "  [i] ${key}: unrelated bind mount '${source}' will be deleted during migration." ;;
       esac
     else
       storage="${source%%:*}"
@@ -400,6 +461,8 @@ validate_ct_storage_scope() {
     || failures+=("required bind mount '${DIR_DOCKER},mp=/mnt/docker' is missing")
   [[ "$docker_data_mount" == true ]] \
     || failures+=("required bind mount '${DIR_DOCKER_DATA},mp=/mnt/docker-data' is missing")
+  [[ "$imds_mount" == true ]] \
+    || echo "  [i] Canonical IMDS mount will be added during migration."
 
   if [[ ${#failures[@]} -gt 0 ]]; then
     echo "ERROR: CT storage layout is outside moveCT scope:" >&2
@@ -480,14 +543,14 @@ ensure_source_mounts_restored() {
 }
 
 restore_target_mounts() {
-  local index key value quoted_value
-  for index in "${!ORIGINAL_MOUNT_KEYS[@]}"; do
-    key="${ORIGINAL_MOUNT_KEYS[$index]}"
-    value="${ORIGINAL_MOUNT_VALUES[$index]}"
+  local line key value quoted_value
+  while IFS= read -r line; do
+    key="${line%%:*}"
+    value="${line#*: }"
     printf -v quoted_value '%q' "$value"
     echo "  Restoring ${key} on ${TARGET_NODE}"
     remote "pct set '$CTID' '-${key}' ${quoted_value}" || return 1
-  done
+  done < <(canonical_ct_mounts "$CTID" "$CT_HOSTNAME")
   TARGET_MOUNTS_ATTACHED=true
 }
 
@@ -662,6 +725,7 @@ wait_for_migration_task() {
       fi
       [[ -z "$MOVE_SUBMISSION_LOG" ]] || rm -f "$MOVE_SUBMISSION_LOG"
       MIGRATED=true
+      CT_NODE["$CTID"]="$TARGET_NODE"
       checkpoint_move migration_complete
       return 0
     fi
@@ -757,10 +821,13 @@ seed_target_or_fallback() {
 restore_original_gpu_config() {
   local config_file="/etc/pve/lxc/${CTID}.conf"
   run_on_node "$SOURCE_NODE" sed -i \
+    -e '\|^# BEGIN commonCT managed GPU$|,\|^# END commonCT managed GPU$|d' \
     -e '\|^lxc.cgroup2.devices.allow: c 226:\* rwm$|d' \
     -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
     "$config_file"
-  [[ -n "$ORIGINAL_GPU_CONFIG" ]] && printf '%s\n' "$ORIGINAL_GPU_CONFIG" >> "$config_file"
+  if [[ -n "$ORIGINAL_GPU_CONFIG" ]]; then
+    run_node_shell "$SOURCE_NODE" "cat >> '$config_file'" <<<"$ORIGINAL_GPU_CONFIG"
+  fi
 }
 
 get_ct_owner_node() {
@@ -851,6 +918,7 @@ rollback() {
       exit "$recovery_failure_code"
     fi
     MIGRATED=false
+    CT_NODE["$CTID"]="$SOURCE_NODE"
     owner_node="$SOURCE_NODE"
   elif [[ -z "$owner_node" ]]; then
     echo "[✗] CT ${CTID} live ownership is unknown; refusing automatic rollback mutation." >&2
@@ -897,7 +965,12 @@ rollback() {
       move_status_cleanup
       exit "$recovery_failure_code"
     }
-    if ct_exec --timeout 10 "$CTID" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+    if ! evaluate_and_reconcile_ct_profiles "$CTID"; then
+      echo "[✗] CT ${CTID} restarted on ${SOURCE_NODE}, but source profile tags could not be reconciled." >&2
+      move_status_cleanup
+      exit "$recovery_failure_code"
+    fi
+    if ct_has_compose_profile_policy "$CTID"; then
       compose_up "$CTID" || {
         echo "[✗] CT ${CTID} restarted on ${SOURCE_NODE}, but its selected hardware profile could not be reconciled." >&2
         move_status_cleanup
@@ -922,18 +995,21 @@ rollback() {
 }
 
 verify_target_services() {
-  local service state health attempt
-  remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --quiet; else docker compose config --quiet; fi'"
+  local compose_json service container state health attempt
+  compose_json=$(remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh config --format json; else docker compose config --format json; fi'") \
+    || return 1
+  jq -e '.services and (.services | length > 0)' >/dev/null 2>&1 <<< "$compose_json" \
+    || { echo "ERROR: Target Compose model has no selected services." >&2; return 1; }
   COMPOSE_PERMISSION_EXECUTOR=target_ct_exec reconcile_compose_permissions "$CTID"
   remote "pct exec '$CTID' -- sh -c 'cd /mnt/docker && if [ -x ./_config/shared/compose-profile.sh ]; then ./_config/shared/compose-profile.sh up -d --remove-orphans; else docker compose up -d --remove-orphans; fi'"
 
-  while IFS= read -r service; do
-    [[ -n "$service" ]] || continue
+  while IFS=$'\t' read -r service container; do
+    [[ -n "$service" && -n "$container" ]] || continue
     state=""
     health=""
     for attempt in {1..60}; do
-      state=$(remote "pct exec '$CTID' -- docker inspect -f '{{.State.Status}}' '$service'" 2>/dev/null || true)
-      health=$(remote "pct exec '$CTID' -- docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' '$service'" 2>/dev/null || true)
+      state=$(remote "pct exec '$CTID' -- docker inspect -f '{{.State.Status}}' '$container'" 2>/dev/null || true)
+      health=$(remote "pct exec '$CTID' -- docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' '$container'" 2>/dev/null || true)
       if [[ "$state" == "running" && ( -z "$health" || "$health" == "healthy" ) ]]; then
         break
       fi
@@ -942,7 +1018,11 @@ verify_target_services() {
     done
     [[ "$state" == "running" ]] || { echo "ERROR: Service '${service}' is ${state:-missing}." >&2; return 1; }
     [[ -z "$health" || "$health" == "healthy" ]] || { echo "ERROR: Service '${service}' is ${health}." >&2; return 1; }
-  done <<< "$EXPECTED_SERVICES"
+  done < <(jq -r '
+    .services | to_entries[]
+    | select((.value.restart // "") != "no")
+    | [.key, (.value.container_name // .key)] | @tsv
+  ' <<< "$compose_json")
 }
 
 verify_target_dns() {
@@ -1106,7 +1186,7 @@ run_move_transaction() {
     [[ -z "$ct_lock" ]] || abort_move "CT ${CTID} became locked during pre-copy (${ct_lock})."
     move_status_progress 5 "Stopping CT for final synchronization..."
     if [[ "$ORIGINAL_STATUS" == "running" ]]; then
-      if ct_exec --timeout 10 "$CTID" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+      if ct_has_compose_profile_policy "$CTID"; then
         compose_down "$CTID"
       fi
       run_on_node "$SOURCE_NODE" pct shutdown "$CTID" --timeout 60 \
@@ -1127,7 +1207,7 @@ run_move_transaction() {
 
   if phase_before mounts_detached; then
     move_status_progress 8 "Preparing CT rootfs migration to ${TARGET_NODE}..."
-    reconcile_ct_gpu_config "$CTID" "$TARGET_NODE"
+    reconcile_ct_gpu_config "$CTID" "$TARGET_NODE" "$RELEVANT_PROFILE_GROUPS"
     detach_source_mounts
     checkpoint_move mounts_detached
   fi
@@ -1151,10 +1231,22 @@ run_move_transaction() {
     checkpoint_move mounts_restored
   fi
 
+  if phase_before profile_tags_reconciled; then
+    move_status_progress 10 "Starting target and reconciling hardware profiles..."
+    if [[ "$ORIGINAL_STATUS" == "running" ]]; then
+      CT_NODE["$CTID"]="$TARGET_NODE"
+      if [[ "$(get_ct_status "$CTID")" == "stopped" ]]; then
+        remote "pct start '$CTID'"
+      fi
+      finalize_ct_gpu_capability "$CTID" "$TARGET_NODE" "$RELEVANT_PROFILE_GROUPS"
+      evaluate_and_reconcile_ct_profiles "$CTID" "$RELEVANT_PROFILE_GROUPS"
+    fi
+    checkpoint_move profile_tags_reconciled
+  fi
+
   if phase_before services_verified; then
     move_status_progress 10 "Starting and validating target services..."
     if [[ "$ORIGINAL_STATUS" == "running" ]]; then
-      remote "pct start '$CTID'"
       remote "pct exec '$CTID' -- sh -c 'for i in \$(seq 1 60); do docker info >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'"
       verify_target_services
     fi
@@ -1180,6 +1272,21 @@ run_move_transaction() {
   trap - ERR HUP INT TERM
   move_status_cleanup
   echo "Move committed successfully. Transaction log: ${RUN_LOG_FILE}"
+}
+
+validate_stopped_profile_move() {
+  local detection_rc=0
+  [[ "$ORIGINAL_STATUS" == "stopped" ]] || return 0
+  compose_file_has_managed_profiles "$SOURCE_NODE" "$DIR_DOCKER/docker-compose.yaml" \
+    || detection_rc=$?
+  case "$detection_rc" in
+    0)
+      echo "ERROR: A stopped CT with managed profiles cannot be moved safely; start it so target profile tests can run after migration." >&2
+      return 1
+      ;;
+    1) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 main() {
@@ -1269,6 +1376,12 @@ main() {
   ct_lock=$(run_on_node "$SOURCE_NODE" pct config "$CTID" 2>/dev/null | sed -n 's/^lock:[[:space:]]*//p' || true)
   [[ -z "$ct_lock" ]] || { echo "ERROR: CT ${CTID} is locked (${ct_lock})." >&2; exit 1; }
   validate_ct_storage_scope || exit 1
+  validate_compose_profile_source "$SOURCE_NODE" \
+    "$DIR_DOCKER/docker-compose.yaml" \
+    "$DIR_DOCKER/_config/select-compose-profile.sh" || exit 1
+  RELEVANT_PROFILE_GROUPS=$(compose_file_managed_profile_groups "$SOURCE_NODE" \
+    "$DIR_DOCKER/docker-compose.yaml") || exit 1
+  validate_stopped_profile_move || exit 1
   capture_original_mounts
   capture_original_networks || exit 1
   rootfs_size_gib=$(get_ct_rootfs_size_gib) || exit 1
@@ -1276,7 +1389,7 @@ main() {
   validate_move_node_contracts "$TARGET_NODE" "$rootfs_size_gib" || exit 1
   resolve_move_bridge_contracts || exit 1
 
-  resolve_ct_gpu_capability "$CTID" "$TARGET_NODE" || exit 1
+  resolve_ct_gpu_capability "$CTID" "$TARGET_NODE" "$RELEVANT_PROFILE_GROUPS" || exit 1
   validate_target_devices || exit 1
   inspect_migration_bandwidth "$rootfs_size_gib"
 
@@ -1309,11 +1422,11 @@ main() {
   fi
   confirm_slow_migration
 
-  ORIGINAL_GPU_CONFIG=$(grep -E '^lxc\.(cgroup2\.devices\.allow: c 226:\* rwm|mount\.entry: /dev/dri dev/dri none bind,optional,create=dir)$' "/etc/pve/lxc/${CTID}.conf" || true)
-  if [[ "$ORIGINAL_STATUS" == "running" ]]; then
-    EXPECTED_SERVICES=$(ct_exec --timeout 30 "$CTID" 'docker ps --format {{.Names}}' 2>/dev/null || true)
-  fi
-
+  ORIGINAL_GPU_CONFIG=$(run_on_node "$SOURCE_NODE" sed -n \
+    -e '/^# BEGIN commonCT managed GPU$/,/^# END commonCT managed GPU$/p' \
+    -e '/^lxc.cgroup2.devices.allow: c 226:\* rwm$/p' \
+    -e '/^lxc.mount.entry: \/dev\/dri dev\/dri none bind,optional,create=dir$/p' \
+    "/etc/pve/lxc/${CTID}.conf" || true)
   acquire_move_state_lock
   [[ ! -e "$MOVE_STATE_FILE" ]] \
     || { echo "ERROR: Existing move transaction found; use --status or --resume for CT ${CTID}." >&2; exit 1; }

@@ -1,16 +1,17 @@
 ---
-applyTo: "**/{docker-compose.yaml,compose-profile.sh,select-compose-profile.sh,commonCT.sh,createCT.sh,refreshCT.sh,moveCT.sh}"
+applyTo: "**/{docker-compose.yaml,compose-profile.sh,resolve-compose-profile.py,select-compose-profile.sh,commonCT.sh,createCT.sh,refreshCT.sh,moveCT.sh}"
 description: "Use when implementing or modifying hardware-aware CT Compose profiles, GPU/Vulkan device selection, or lifecycle handling of profile variants."
 ---
 
 # Hardware-aware Compose profiles
 
-- Portable accelerator stacks use generic profiles `no-discrete-gpu` and `vulkan`; `cuda` is reserved for future end-to-end support.
-- Opt in with executable `/mnt/docker/_config/select-compose-profile.sh`. It must print exactly `profile|device` and rediscover hardware inside the CT on every operation and boot.
-- Never persist `COMPOSE_PROFILES`, node identity, or `renderD<N>` in `.env`.
-- NVIDIA Vulkan selection must verify PCI vendor `0x10de` through sysfs; `/dev/dri` alone may expose only an Intel iGPU.
-- Exactly one hardware profile runs. Pull and down operations may cover all variants; runtime startup selects one variant and may combine the independent `published` profile.
-- Profile variants may share a Docker network alias to preserve a stable internal endpoint.
-- Lifecycle scripts must use `ct_compose()` so CTs with and without selectors remain compatible.
-- CPU-only stacks may include an empty `/mnt/docker/_config/disable-managed-gpu` marker. Lifecycle operations resolve it from the authoritative owner-node workload tree and remove managed DRM passthrough; the marker must not contain node or device identity.
+- `commonCT.json` is the only capability-policy source. It defines ordered CT-local tests and one default for each group.
+- Do not add `x-profiles` to Compose. Workloads opt into a managed group only through normal service `profiles:` entries named `<group>-<name>`, such as `gpu-drm_intel` and `gpu-none`.
+- Lifecycle evaluates only groups declared by the authoritative owner-local Compose file, persists one `profile-<group>-<name>` Proxmox tag for each relevant group, and IMDS exposes the sanitized `<group>-<name>` value. Irrelevant groups have no managed tag, IMDS winner, predicate execution, or device passthrough.
+- Every managed winner must be supported by at least one workload service. Unsupported winners fail closed; workloads do not silently substitute another profile.
+- Compose owns all devices, capabilities, environment, topology, initializers, and fallback service behavior. Profile variants may share a network alias to preserve a stable endpoint.
+- Use stable in-CT device paths; never persist `COMPOSE_PROFILES`, node identity, or discovered device indices in `.env`.
+- Lifecycle scripts must use `ct_compose()`. Selected operations consume IMDS; all-profile operations validate declarations without requiring IMDS.
+- `_config/select-compose-profile.sh` and its `profile|device` output are legacy compatibility only. Never combine a selector with managed group-qualified service profiles.
+- GPU profiles describe exposed kernel interfaces and vendors, not userspace API readiness. Central predicates use `/dev` and `/sys`, never workload packages such as `nvidia-smi`, `vulkaninfo`, CUDA, Vulkan, or VA-API libraries.
 - Full architecture is documented in `documentation/hardware-compose-profiles.md`.

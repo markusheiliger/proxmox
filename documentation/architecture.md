@@ -44,8 +44,9 @@ mount is `/mnt/docker` and must not repeat the hostname.
 ```mermaid
 flowchart LR
     Host[Proxmox host] -->|pct exec CTID| Guest[LXC container]
-    HostDocker[/mnt/docker/hostname] -->|mp0| GuestDocker[/mnt/docker]
-    HostData[/mnt/docker-data/hostname] -->|mp1| GuestData[/mnt/docker-data]
+  HostIMDS[/run/pve-imds/CTID] -->|mp0, read-only| GuestIMDS[/mnt/pve-imds]
+  HostDocker[/mnt/docker/hostname] -->|mp1| GuestDocker[/mnt/docker]
+  HostData[/mnt/docker-data/hostname] -->|mp2| GuestData[/mnt/docker-data]
 ```
 
 ## Configuration flow

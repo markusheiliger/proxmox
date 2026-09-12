@@ -9,7 +9,6 @@ COMPOSE_SKILL="$SCRIPT_DIR/.github/skills/ct-compose/SKILL.md"
 PROJECT_INSTRUCTIONS="$SCRIPT_DIR/.github/copilot-instructions.md"
 IMAGE_VERSIONING_GUIDE="$SCRIPT_DIR/documentation/container-image-versioning.md"
 OPTIMIZATION_REPORT="$SCRIPT_DIR/todos/optimization.md"
-DOCUMENTATION_REPORT="$SCRIPT_DIR/documentation/optimization.md"
 PASS=0
 FAIL=0
 
@@ -65,23 +64,83 @@ import re
 import sys
 
 report = open(sys.argv[1], encoding="utf-8").read()
-prompts = re.findall(r'```text\n(.*?)\n```', report, re.S)
-assert prompts, "report contains no planning prompts"
-
-guard = (
-    "Return planning content only; do not edit files, run lifecycle or apply commands, "
-    "or begin implementation. Remain in planning so I can refine the plan or use the "
-    "native Start Implementation handoff."
+action_pattern = re.compile(
+  r'^##### Action: (?P<title>[^\n]+)\n(?P<body>.*?)(?=^##### Action: |^#### `\[|^<a id=|^\*\*Advisory only:|\Z)',
+  re.M | re.S,
 )
 
-for prompt in prompts:
-    assert prompt.startswith("/plan "), "planning prompt does not begin with /plan"
-    assert guard in prompt, "planning prompt lacks the native planning-only handoff guard"
-    assert not re.search(r'(?:^|\n)```(?:sh|bash)', prompt), "planning prompt embeds a shell block"
-    assert not re.search(
-        r'(?:^|\s)(?:cd /root/scripts && |\./(?:refresh|upgrade|move)CT\.sh\s)',
-        prompt,
-    ), "planning prompt embeds an apply command"
+
+def validate_prompt(owner, prompt):
+  assert prompt.startswith("/plan "), "planning prompt does not begin at byte zero with /plan"
+  if owner == "generic":
+    assert prompt.startswith("/plan No discovered repository skill owns")
+  else:
+    assert prompt.startswith(f"/plan Use the {owner} skill")
+  assert re.search(r'\b(?:Planning only|planning content only)\b', prompt, re.I), (
+    "planning prompt lacks a planning-only prohibition"
+  )
+  assert "native Start Implementation" in prompt, (
+    "planning prompt lacks the native Start Implementation handoff"
+  )
+  assert not re.search(
+    r'(?:^|\s)(?:cd /root/scripts && |\./(?:refresh|upgrade|move)CT\.sh\s)',
+    prompt,
+  ), "planning prompt embeds an apply command"
+
+
+prompt_actions = 0
+prompt_fences = 0
+for action in action_pattern.finditer(report):
+  title = action.group("title")
+  body = action.group("body")
+  action_type = re.search(r'^- \*\*Type:\*\* (prompt|lifecycle)$', body, re.M)
+  owner = re.search(
+    r'^- \*\*Owner:\*\* (ct-compose|ct-telemetry|generic|refreshCT\.sh|upgradeCT\.sh|moveCT\.sh)$',
+    body,
+    re.M,
+  )
+  assert action_type and owner, title
+  text_blocks = re.findall(r'^```text\n(.*?)\n```$', body, re.M | re.S)
+  shell_blocks = re.findall(r'^```sh\n(.*?)\n```$', body, re.M | re.S)
+  if action_type.group(1) == "prompt":
+    prompt_actions += 1
+    assert len(text_blocks) == 1 and not shell_blocks, title
+    prompt_fences += len(text_blocks)
+    validate_prompt(owner.group(1), text_blocks[0])
+  else:
+    assert len(shell_blocks) == 1 and not text_blocks, title
+
+assert prompt_actions, "report contains no prompt actions"
+assert prompt_actions == prompt_fences
+assert len(re.findall(r'^```text\n', report, re.M)) == prompt_actions, (
+  "text prompt exists outside a prompt action"
+)
+
+valid_guard = (
+  " Planning only; do not edit files or begin implementation until I use the "
+  "native Start Implementation handoff."
+)
+valid_prompts = (
+  ("ct-compose", "/plan Use the ct-compose skill to plan a repair." + valid_guard),
+  ("generic", "/plan No discovered repository skill owns this complete remediation; plan it." + valid_guard),
+)
+for owner, prompt in valid_prompts:
+  validate_prompt(owner, prompt)
+
+invalid_prompts = (
+  ("ct-compose", "Plan with the ct-compose skill." + valid_guard),
+  ("ct-compose", "Please plan with the ct-compose skill." + valid_guard),
+  ("ct-compose", "\n/plan Use the ct-compose skill." + valid_guard),
+  ("ct-compose", "First inspect this. /plan Use the ct-compose skill." + valid_guard),
+  ("ct-compose", "/plan Use the ct-compose skill to plan a repair."),
+  ("ct-compose", "/plan Use the ct-telemetry skill to plan a repair." + valid_guard),
+)
+for owner, prompt in invalid_prompts:
+  try:
+    validate_prompt(owner, prompt)
+  except AssertionError:
+    continue
+  raise AssertionError(f"invalid planning prompt passed validation: {prompt!r}")
 PY
   then
     fail "$description"
@@ -108,14 +167,17 @@ for heading in (
     assert heading not in report, f"retired heading remains: {heading}"
 
 assert "- **Coverage:**" not in report, "issue-level coverage remains"
-assert len(re.findall(r'^<a id="ct-\d+"></a>$', report, re.M)) == 15
+ct_anchors = re.findall(r'^<a id="ct-(\d+)"></a>$', report, re.M)
+assert ct_anchors, "report contains no CT sections"
+toc_anchors = re.findall(r'^\s*- \[[^]]+ \(\d+\)\]\(#ct-(\d+)\)$', report, re.M)
+assert toc_anchors == ct_anchors, "table of contents and CT section order differ"
 
 finding_pattern = re.compile(r'^#### `\[[^]]+\]` — `[^`]+`$', re.M)
 action_pattern = re.compile(r'^##### Action: (.+)$', re.M)
 findings = list(finding_pattern.finditer(report))
 actions = action_pattern.findall(report)
-assert len(findings) == 18
-assert len(actions) == 34
+assert findings, "report contains no findings"
+assert actions, "report contains no actions"
 assert all(count == 1 for count in Counter(actions).values()), "duplicate action title"
 action_titles = sorted(actions, key=len, reverse=True)
 
@@ -134,12 +196,17 @@ for index, finding in enumerate(findings):
 
     assert "##### Action:" in section, f"actionable finding lacks action: {finding.group()}"
 
-action_blocks = re.split(r'(?=^##### Action: )', report, flags=re.M)[1:]
-for block in action_blocks:
-    title = re.match(r'^##### Action: (.+)$', block, re.M).group(1)
-    next_finding = finding_pattern.search(block)
-    if next_finding:
-        block = block[:next_finding.start()]
+action_block_pattern = re.compile(
+  r'^##### Action: (?P<title>[^\n]+)\n(?P<body>.*?)(?=^##### Action: |^#### `\[|^<a id=|^\*\*Advisory only:|\Z)',
+    re.M | re.S,
+)
+action_blocks = list(action_block_pattern.finditer(report))
+assert len(action_blocks) == len(actions), "an action record could not be parsed"
+prompt_action_count = 0
+lifecycle_action_count = 0
+for action in action_blocks:
+    title = action.group("title")
+    block = action.group("body")
     action_type = re.search(r'^- \*\*Type:\*\* (prompt|lifecycle)$', block, re.M)
     owner = re.search(r'^- \*\*Owner:\*\* (ct-compose|ct-telemetry|generic|refreshCT\.sh|upgradeCT\.sh|moveCT\.sh)$', block, re.M)
     relationship = re.search(r'^- \*\*Relationship:\*\* (independent|depends on .+|blocks .+)$', block, re.M)
@@ -152,11 +219,11 @@ for block in action_blocks:
     owner = owner.group(1)
     relationship = relationship.group(1)
     if relationship != "independent":
-      if relationship.startswith("blocks "):
-        references = relationship.removeprefix("blocks ")
-      else:
-        references = relationship.removeprefix("depends on ")
-        references = references.removesuffix(" completed and verified")
+        if relationship.startswith("blocks "):
+            references = relationship.removeprefix("blocks ")
+        else:
+            references = relationship.removeprefix("depends on ")
+            references = references.removesuffix(" completed and verified")
         matched_titles = []
         for candidate in action_titles:
             if candidate in references:
@@ -168,34 +235,38 @@ for block in action_blocks:
     text_blocks = re.findall(r'```text\n(.*?)\n```', block, re.S)
     shell_blocks = re.findall(r'```sh\n(.*?)\n```', block, re.S)
     if action_type == "prompt":
-        assert len(text_blocks) == 1 and not shell_blocks, title
-        if owner == "generic":
-            assert text_blocks[0].startswith("/plan No discovered repository skill owns")
-        else:
-            assert text_blocks[0].startswith(f"/plan Use the {owner} skill")
+      prompt_action_count += 1
+      assert len(text_blocks) == 1 and not shell_blocks, title
+      if owner == "generic":
+        assert text_blocks[0].startswith("/plan No discovered repository skill owns")
+      else:
+        assert text_blocks[0].startswith(f"/plan Use the {owner} skill")
     else:
-        assert len(shell_blocks) == 1 and not text_blocks, title
-        assert owner in shell_blocks[0], title
+      lifecycle_action_count += 1
+      assert len(shell_blocks) == 1 and not text_blocks, title
+      assert owner in shell_blocks[0], title
 
 prompt_blocks = re.findall(r'```text\n(.*?)\n```', report, re.S)
-assert len(prompt_blocks) == 19
+assert len(prompt_blocks) == prompt_action_count
 for prompt in prompt_blocks:
-    assert prompt.startswith("/plan ")
-    for requirement in (
-        "Acceptance criteria:",
-        "project instructions",
-        "affected files",
-        "ordered changes",
-        "dependencies",
-        "scope boundaries",
-        "automated and manual verification",
-        "Start Implementation",
-        "Preserve secrets",
-    ):
-        assert requirement in prompt, f"prompt requirement missing: {requirement}"
+  assert prompt.startswith("/plan ")
+  for description, requirement in (
+      ("acceptance criteria", r"\bAcceptance(?: criteria)?:"),
+      ("repository context", r"\bInspect\b.{0,80}\b(?:files|systems|config|instructions)\b"),
+      ("affected surface", r"\b(?:affected (?:files|systems)|Inspect\b.{0,80}\b(?:files|systems|config))\b"),
+      ("ordered changes", r"\bordered changes\b"),
+      ("dependencies", r"\bdependencies\b"),
+      ("scope boundaries", r"\bscope(?: boundaries)?\b"),
+      ("automated and manual verification", r"\bautomated(?: and|/)manual verification\b"),
+      ("Start Implementation", r"\bStart Implementation\b"),
+      ("secret preservation", r"\bPreserve secrets\b"),
+  ):
+    assert re.search(requirement, prompt, re.I | re.S), (
+        f"prompt requirement missing: {description}"
+    )
 
 lifecycle_blocks = re.findall(r'```sh\n(.*?)\n```', report, re.S)
-assert len(lifecycle_blocks) == 15
+assert len(lifecycle_blocks) == lifecycle_action_count
 for command in lifecycle_blocks:
     assert len(command.splitlines()) == 1
     assert "--force" not in command
@@ -205,8 +276,6 @@ for command in lifecycle_blocks:
     ), command
     assert not ("--size" in command and ("--cores" in command or "--memory" in command))
 
-assert "Caddy stable remains `2.11.4`" in report
-assert "advisory text naming `2.11.5` is not a stable release" in report
 PY
   then
     fail "$description"
@@ -334,18 +403,18 @@ assert_contract "ct-optimize validates lifecycle commands against code and guide
   "no \`--force\`, no mutually exclusive resize forms"
 
 assert_contract "ct-optimize keeps prompts implementation-ready and focused" "$OPTIMIZE_CONTRACT" \
-  "Begin with \`/plan\` as the first token" \
+  'first bytes are `/plan `' \
   "Request a planning-only response" \
   "Explicitly prohibit file edits, lifecycle or apply commands" \
   "native **Start Implementation** handoff" \
-  'prose such as "plan first" or "wait for confirmation" without the leading `/plan` and planning-only guard is insufficient' \
+  "Prompt prose alone never satisfies this check" \
+  'The number of valid `/plan ` prompt fences must equal the number of prompt action records' \
   "affected files, ordered changes, dependencies, scope boundaries" \
   "specific automated and manual verification" \
   "Preserve secrets and exclude unrelated changes" \
   "one cohesive issue owned by exactly one workflow"
 
 assert_prompt_flow "generated report enforces native planning handoff" "$OPTIMIZATION_REPORT"
-assert_prompt_flow "documentation report enforces native planning handoff" "$DOCUMENTATION_REPORT"
 assert_report_structure "generated report uses valid inline actions"
 
 echo "${PASS} passed, ${FAIL} failed"

@@ -333,16 +333,7 @@ stop_ct() {
 # Re-point the CT bind mounts at the new folders (CT must be stopped).
 update_mounts() {
   echo "Updating mount points..."
-  local config_output mp
-  config_output=$(pct_config "$CTID" 2>/dev/null)
-  for mp in $(echo "$config_output" | awk -F: '/^mp[0-9]+/ {print $1}'); do
-    echo "  deleting $mp"
-    pct_set "$CTID" -delete "$mp"
-  done
-  pct_set "$CTID" -mp0 "${NEW_DOCKER},mp=/mnt/docker"
-  pct_set "$CTID" -mp1 "${NEW_DATA},mp=/mnt/docker-data"
-  echo "  mp0 -> ${NEW_DOCKER}"
-  echo "  mp1 -> ${NEW_DATA}"
+  reconcile_ct_mountpoints "$CTID" "$NEW_HOSTNAME"
 }
 
 # Update the UDM Pro client alias + local DNS record to the new hostname.

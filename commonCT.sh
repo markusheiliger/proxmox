@@ -70,9 +70,6 @@
 #   validate_size          Validate size and set SIZE_CORES/SIZE_MEMORY
 #   validate_priority      Validate priority and set PRIORITY_CPUUNITS
 #   validate_hostname      Validate hostname format and domain config
-#   config_get_newt_id     Get newt ID for hostname
-#   config_get_newt_secret Get newt secret for hostname
-#   config_get_newt_endpoint Get newt endpoint (global or per-site)
 #   config_get_registries  Get list of configured container registries
 #   config_get_registry_username Get username for registry
 #   config_get_registry_password Get password for registry
@@ -139,7 +136,7 @@ run_on_node() {
     printf -v quoted '%q' "$argument"
     command+="${command:+ }${quoted}"
   done
-  ssh -o BatchMode=yes -o ConnectTimeout=10 \
+  ssh -n -o BatchMode=yes -o ConnectTimeout=10 \
     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$node" "$command"
 }
 
@@ -235,19 +232,45 @@ node_download_file() {
 
 node_upload_file() {
   local node="${1:-}" local_path="${2:-}" remote_path="${3:-}" mode="${4:-0600}"
-  local quoted_path quoted_mode command
-  [[ -n "$node" && -f "$local_path" && -n "$remote_path" && "$mode" =~ ^0?[0-7]{3,4}$ ]] || {
+  local owner_uid="${5:-0}" owner_gid="${6:-0}"
+  local quoted_path quoted_mode quoted_owner command
+  [[ -n "$node" && -f "$local_path" && -n "$remote_path" && "$mode" =~ ^0?[0-7]{3,4}$ \
+    && "$owner_uid" =~ ^[0-9]+$ && "$owner_gid" =~ ^[0-9]+$ ]] || {
     echo "ERROR: node_upload_file received invalid arguments." >&2
     return 1
   }
   if [[ "$node" == "$(hostname -s)" ]]; then
-    install -D -o root -g root -m "$mode" "$local_path" "$remote_path"
+    install -D -o "$owner_uid" -g "$owner_gid" -m "$mode" "$local_path" "$remote_path"
     return
   fi
   printf -v quoted_path '%q' "$remote_path"
   printf -v quoted_mode '%q' "$mode"
-  command="set -eu; target=${quoted_path}; tmp=\"\${target}.tmp.\$$\"; umask 077; mkdir -p -- \"\$(dirname -- \"\$target\")\"; cat > \"\$tmp\"; chmod ${quoted_mode} \"\$tmp\"; chown root:root \"\$tmp\"; mv -f -- \"\$tmp\" \"\$target\""
+  printf -v quoted_owner '%q' "${owner_uid}:${owner_gid}"
+  command="set -eu; target=${quoted_path}; tmp=\"\${target}.tmp.\$$\"; umask 077; mkdir -p -- \"\$(dirname -- \"\$target\")\"; cat > \"\$tmp\"; chmod ${quoted_mode} \"\$tmp\"; chown ${quoted_owner} \"\$tmp\"; mv -f -- \"\$tmp\" \"\$target\""
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$node" "$command" < "$local_path"
+}
+
+get_ct_host_root_ids() {
+  local ctid="${1:-}" config unprivileged root_uid root_gid
+  [[ "$ctid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: get_ct_host_root_ids requires a numeric CTID." >&2
+    return 1
+  }
+  config=$(pct_config "$ctid") || return 1
+  unprivileged=$(awk -F': ' '$1 == "unprivileged" { print $2; exit }' <<<"$config")
+  if [[ "$unprivileged" != 1 ]]; then
+    printf '0 0\n'
+    return 0
+  fi
+  root_uid=$(awk '$1 == "lxc.idmap:" && $2 == "u" && $3 == 0 { print $4; exit }' <<<"$config")
+  root_gid=$(awk '$1 == "lxc.idmap:" && $2 == "g" && $3 == 0 { print $4; exit }' <<<"$config")
+  root_uid="${root_uid:-100000}"
+  root_gid="${root_gid:-100000}"
+  [[ "$root_uid" =~ ^[0-9]+$ && "$root_gid" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: Cannot resolve host root IDs for CT ${ctid}." >&2
+    return 1
+  }
+  printf '%s %s\n' "$root_uid" "$root_gid"
 }
 
 ct_upload_file() {
@@ -675,6 +698,131 @@ config_get_size_memory() {
   jq -r ".sizes.\"${size}\".memory // empty" "${CONFIG_FILE}" 2>/dev/null
 }
 
+validate_profiles_config() {
+  config_exists || {
+    echo "ERROR: Configuration file not found: ${CONFIG_FILE}" >&2
+    return 1
+  }
+
+  if ! jq -e '
+    def identifier:
+      type == "string" and test("^[a-z0-9_]+$");
+    .profiles
+    | type == "object" and length > 0
+      and all(to_entries[];
+        (.value.default) as $default
+        |
+        (.key | identifier)
+        and (.value | type == "object")
+        and (.value.default | identifier)
+        and (.value.profiles | type == "array")
+        and (([.value.profiles[].name] | length) == ([.value.profiles[].name] | unique | length))
+        and ([.value.profiles[].name] | index($default) == null)
+        and all(.value.profiles[];
+          (. | type == "object")
+          and (.name | identifier)
+          and (.tests | type == "array" and length > 0)
+          and all(.tests[];
+            type == "array" and length > 0
+            and all(.[]; type == "string" and length > 0)
+          )
+        )
+      )
+  ' "${CONFIG_FILE}" >/dev/null 2>&1; then
+    echo "ERROR: Invalid profiles configuration in ${CONFIG_FILE}." >&2
+    return 1
+  fi
+}
+
+config_get_profile_groups() {
+  validate_profiles_config || return 1
+  jq -r '.profiles | keys[]' "${CONFIG_FILE}"
+}
+
+evaluate_ct_profile_group() {
+  local ctid="${1:-}" group="${2:-}" timeout="${PROFILE_TEST_TIMEOUT:-15}"
+  local status default profile_count profile_index profile_name test_count test_index command rc
+  local candidate_matches
+
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && "$group" =~ ^[a-z0-9_]+$ ]] || {
+    echo "ERROR: evaluate_ct_profile_group requires a CTID and profile group." >&2
+    return 2
+  }
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: PROFILE_TEST_TIMEOUT must be a positive integer." >&2
+    return 2
+  }
+  validate_profiles_config || return 1
+  jq -e --arg group "$group" '.profiles | has($group)' "${CONFIG_FILE}" >/dev/null || {
+    echo "ERROR: Unknown profile group '${group}'." >&2
+    return 1
+  }
+  get_ct_owner_node "$ctid" >/dev/null || return 1
+  status=$(get_ct_status "$ctid") || {
+    echo "ERROR: Cannot determine status for CT ${ctid}." >&2
+    return 1
+  }
+  [[ "$status" == "running" ]] || {
+    echo "ERROR: CT ${ctid} must be running to evaluate profile group '${group}'." >&2
+    return 1
+  }
+
+  default=$(jq -er --arg group "$group" '.profiles[$group].default' "${CONFIG_FILE}") || return 1
+  profile_count=$(jq -er --arg group "$group" '.profiles[$group].profiles | length' "${CONFIG_FILE}") || return 1
+
+  for ((profile_index = 0; profile_index < profile_count; profile_index++)); do
+    profile_name=$(jq -er --arg group "$group" --argjson profile_index "$profile_index" \
+      '.profiles[$group].profiles[$profile_index].name' "${CONFIG_FILE}") || return 1
+    test_count=$(jq -er --arg group "$group" --argjson profile_index "$profile_index" \
+      '.profiles[$group].profiles[$profile_index].tests | length' "${CONFIG_FILE}") || return 1
+    candidate_matches=true
+
+    for ((test_index = 0; test_index < test_count; test_index++)); do
+      command=$(jq -er --arg group "$group" --argjson profile_index "$profile_index" \
+        --argjson test_index "$test_index" \
+        '.profiles[$group].profiles[$profile_index].tests[$test_index] | @sh' \
+        "${CONFIG_FILE}") || return 1
+      rc=0
+      ct_exec --timeout "$timeout" "$ctid" "cd /mnt/docker && ${command}" >/dev/null 2>&1 || rc=$?
+      if [[ "$rc" -eq 255 ]]; then
+        echo "ERROR: Transport failed while evaluating ${group}/${profile_name} test $((test_index + 1)) in CT ${ctid}." >&2
+        return 1
+      fi
+      if [[ "$rc" -ne 0 ]]; then
+        echo "  [!] CT ${ctid}: ${group}/${profile_name} test $((test_index + 1)) rejected the candidate (exit ${rc})" >&2
+        candidate_matches=false
+        break
+      fi
+    done
+
+    if [[ "$candidate_matches" == "true" ]]; then
+      printf '%s\n' "$profile_name"
+      return 0
+    fi
+  done
+
+  printf '%s\n' "$default"
+}
+
+evaluate_ct_profiles() {
+  local ctid="${1:-${CTID:-}}" relevant_groups="${2:-}" group profile
+  local -A relevant=()
+  validate_profiles_config || return 1
+  while IFS= read -r group; do
+    [[ -n "$group" ]] || continue
+    jq -e --arg group "$group" '.profiles | has($group)' "${CONFIG_FILE}" >/dev/null || {
+      echo "ERROR: Workload references unknown profile group '${group}'." >&2
+      return 1
+    }
+    relevant["$group"]=1
+  done <<<"$relevant_groups"
+  while IFS= read -r group; do
+    [[ -n "${relevant[$group]:-}" ]] || continue
+    profile=$(evaluate_ct_profile_group "$ctid" "$group") || return 1
+    printf '%s\t%s\n' "$group" "$profile"
+  done < <(jq -r '.profiles | keys[]' "${CONFIG_FILE}")
+}
+
 # Read one required backup policy value using a jq expression.
 config_get_backup_value() {
   local expression="${1:-}"
@@ -683,42 +831,52 @@ config_get_backup_value() {
   jq -er "$expression" "${CONFIG_FILE}" 2>/dev/null
 }
 
-config_get_backup_storage() { config_get_backup_value '.backup.storage'; }
-config_get_backup_tmpdir() { config_get_backup_value '.backup.tmpdir'; }
-config_get_backup_temp_storage_id() { config_get_backup_value '.backup.temp_storage.storage_id'; }
-config_get_backup_temp_vg() { config_get_backup_value '.backup.temp_storage.vg'; }
-config_get_backup_temp_thin_pool() { config_get_backup_value '.backup.temp_storage.thin_pool'; }
-config_get_backup_temp_lv() { config_get_backup_value '.backup.temp_storage.lv'; }
-config_get_backup_temp_filesystem() { config_get_backup_value '.backup.temp_storage.filesystem'; }
-config_get_backup_temp_size_multiplier() { config_get_backup_value '.backup.temp_storage.size_multiplier'; }
-config_get_backup_temp_headroom_percent() { config_get_backup_value '.backup.temp_storage.headroom_percent'; }
-config_get_backup_mode() { config_get_backup_value '.backup.mode'; }
-config_get_backup_schedule() { config_get_backup_value '.backup.schedule'; }
-config_get_backup_repeat_missed() { config_get_backup_value '.backup.repeat_missed'; }
-config_get_backup_compress() { config_get_backup_value '.backup.compress'; }
-config_get_backup_keep_daily() { config_get_backup_value '.backup.retention.keep_daily'; }
-config_get_backup_keep_weekly() { config_get_backup_value '.backup.retention.keep_weekly'; }
-config_get_backup_keep_monthly() { config_get_backup_value '.backup.retention.keep_monthly'; }
+config_get_backup_temp_storage() { config_get_backup_value '.backup.temp.storage'; }
+config_get_backup_temp_directory() { config_get_backup_value '.backup.temp.directory'; }
+config_get_backup_ct_storage() { config_get_backup_value '.backup.ct.storage'; }
+config_get_backup_ct_schedule() { config_get_backup_value '.backup.ct.schedule'; }
+config_get_backup_vm_storage() { config_get_backup_value '.backup.vm.storage'; }
+config_get_backup_vm_schedule() { config_get_backup_value '.backup.vm.schedule'; }
+config_get_backup_exclude_tags() { config_get_backup_value '.backup.exclude | @json'; }
+
+backup_effective_exclude_tags() {
+  config_get_backup_value '.backup.exclude + ["backup-restore-test"] | unique | @json'
+}
+
+# Compatibility accessors while backup callers migrate to the minimal schema.
+config_get_backup_storage() { config_get_backup_ct_storage; }
+config_get_backup_tmpdir() { printf '/TEMP/%s\n' "$(config_get_backup_temp_directory)"; }
+config_get_backup_temp_storage_id() { config_get_backup_temp_storage; }
+config_get_backup_temp_vg() { printf 'pve\n'; }
+config_get_backup_temp_thin_pool() { printf 'data\n'; }
+config_get_backup_temp_lv() { printf 'temp\n'; }
+config_get_backup_temp_filesystem() { printf 'ext4\n'; }
+config_get_backup_temp_size_multiplier() { printf '2\n'; }
+config_get_backup_temp_headroom_percent() { printf '20\n'; }
+config_get_backup_mode() { printf 'suspend\n'; }
+config_get_backup_schedule() { config_get_backup_ct_schedule; }
+config_get_backup_repeat_missed() { printf 'true\n'; }
+config_get_backup_compress() { printf 'zstd\n'; }
+config_get_backup_keep_daily() { printf '7\n'; }
+config_get_backup_keep_weekly() { printf '4\n'; }
+config_get_backup_keep_monthly() { printf '6\n'; }
 config_get_backup_prune_policy() {
   printf 'keep-daily=%s,keep-weekly=%s,keep-monthly=%s\n' \
     "$(config_get_backup_keep_daily)" \
     "$(config_get_backup_keep_weekly)" \
     "$(config_get_backup_keep_monthly)"
 }
-config_get_backup_bwlimit_kib() { config_get_backup_value '.backup.bwlimit_kib'; }
-config_get_backup_ionice() { config_get_backup_value '.backup.ionice'; }
-config_get_backup_notification_mode() { config_get_backup_value '.backup.notification_mode'; }
-config_get_backup_snapshot_headroom_percent() { config_get_backup_value '.backup.snapshot_headroom_percent'; }
-config_get_backup_job_id() { config_get_backup_value '.backup.job_id'; }
-config_get_backup_hook_path() { config_get_backup_value '.backup.hook_path'; }
-config_get_backup_state_dir() { config_get_backup_value '.backup.state_dir'; }
-config_get_backup_exclude_tags() { config_get_backup_value '.backup.exclude_tags | @json'; }
-config_get_backup_vm_enabled() { config_get_backup_value '.backup.vm.enabled'; }
-config_get_backup_vm_job_id() { config_get_backup_value '.backup.vm.job_id'; }
-config_get_backup_vm_mode() { config_get_backup_value '.backup.vm.mode'; }
-config_get_backup_vm_schedule() { config_get_backup_value '.backup.vm.schedule'; }
-config_get_backup_vm_repeat_missed() { config_get_backup_value '.backup.vm.repeat_missed'; }
-config_get_backup_vm_restore_storage() { config_get_backup_value '.backup.vm.restore_storage'; }
+config_get_backup_bwlimit_kib() { printf '0\n'; }
+config_get_backup_ionice() { printf '7\n'; }
+config_get_backup_notification_mode() { printf 'auto\n'; }
+config_get_backup_snapshot_headroom_percent() { printf '20\n'; }
+config_get_backup_job_id() { printf 'ct-workload-backup\n'; }
+config_get_backup_hook_path() { printf '/usr/local/sbin/pve-workload-backup-hook\n'; }
+config_get_backup_state_dir() { printf '/var/lib/pve-workload-backup\n'; }
+config_get_backup_vm_enabled() { printf 'true\n'; }
+config_get_backup_vm_job_id() { printf 'vm-backup\n'; }
+config_get_backup_vm_mode() { printf 'snapshot\n'; }
+config_get_backup_vm_repeat_missed() { printf 'true\n'; }
 
 backup_resource_ids() {
   local resource_type="${1:-}" resources="${2:-}" exclude_tags
@@ -726,7 +884,7 @@ backup_resource_ids() {
     echo "ERROR: Backup resource type must be lxc or qemu." >&2
     return 1
   }
-  exclude_tags=$(config_get_backup_exclude_tags) || return 1
+  exclude_tags=$(backup_effective_exclude_tags) || return 1
   if [[ -z "$resources" ]]; then
     resources=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null) || return 1
   fi
@@ -752,56 +910,32 @@ validate_backup_config() {
   if ! errors=$(jq -r '
     def required_string($path; $value):
       if ($value | type) != "string" or ($value | length) == 0 then $path + " must be a non-empty string" else empty end;
-    def nonnegative_integer($path; $value):
-      if ($value | type) != "number" or ($value | floor) != $value or $value < 0 then $path + " must be a non-negative integer" else empty end;
-    def ranged_integer($path; $value; $minimum; $maximum):
-      if ($value | type) != "number" or ($value | floor) != $value or $value < $minimum or $value > $maximum
-      then $path + " must be an integer from " + ($minimum | tostring) + " to " + ($maximum | tostring) else empty end;
+    def exact_keys($path; $value; $expected):
+      if ($value | type) != "object" or ($value | keys) != ($expected | sort)
+      then $path + " must contain exactly: " + ($expected | join(", ")) else empty end;
+    def storage_id($path; $value):
+      required_string($path; $value),
+      (if ($value | type) == "string" and ($value | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true
+       then $path + " contains unsupported characters" else empty end);
     [
-      required_string("backup.storage"; .backup.storage),
-      required_string("backup.tmpdir"; .backup.tmpdir),
-      required_string("backup.temp_storage.storage_id"; .backup.temp_storage.storage_id),
-      required_string("backup.temp_storage.vg"; .backup.temp_storage.vg),
-      required_string("backup.temp_storage.thin_pool"; .backup.temp_storage.thin_pool),
-      required_string("backup.temp_storage.lv"; .backup.temp_storage.lv),
-      (if .backup.temp_storage.filesystem != "ext4" then "backup.temp_storage.filesystem must be ext4" else empty end),
-      ranged_integer("backup.temp_storage.size_multiplier"; .backup.temp_storage.size_multiplier; 2; 10),
-      ranged_integer("backup.temp_storage.headroom_percent"; .backup.temp_storage.headroom_percent; 1; 90),
-      required_string("backup.schedule"; .backup.schedule),
-      required_string("backup.job_id"; .backup.job_id),
-      required_string("backup.hook_path"; .backup.hook_path),
-      required_string("backup.state_dir"; .backup.state_dir),
-      (if (.backup.exclude_tags | type) != "array" or (.backup.exclude_tags | length) == 0
-        or any(.backup.exclude_tags[]; (type != "string") or length == 0 or test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$") != true)
-        then "backup.exclude_tags must be a non-empty array of valid tags" else empty end),
-      (if (.backup.vm.enabled | type) != "boolean" then "backup.vm.enabled must be boolean" else empty end),
-      required_string("backup.vm.job_id"; .backup.vm.job_id),
-      (if .backup.vm.mode != "snapshot" then "backup.vm.mode must be snapshot" else empty end),
+      exact_keys("backup"; .backup; ["exclude", "temp", "ct", "vm"]),
+      exact_keys("backup.temp"; .backup.temp; ["storage", "directory"]),
+      exact_keys("backup.ct"; .backup.ct; ["storage", "schedule"]),
+      exact_keys("backup.vm"; .backup.vm; ["storage", "schedule"]),
+        (if (.backup.exclude | type) != "array" or
+          any(.backup.exclude[]; (type != "string") or length == 0 or test("^[A-Za-z0-9_][A-Za-z0-9_.-]*$") != true)
+         then "backup.exclude must be an array of valid tags" else empty end),
+      storage_id("backup.temp.storage"; .backup.temp.storage),
+      required_string("backup.temp.directory"; .backup.temp.directory),
+      (if (.backup.temp.directory | type) == "string" and
+          ((.backup.temp.directory | startswith("/")) or
+           (.backup.temp.directory | split("/") | any(. == "" or . == "." or . == "..")))
+       then "backup.temp.directory must be a safe relative directory" else empty end),
+      storage_id("backup.ct.storage"; .backup.ct.storage),
+      required_string("backup.ct.schedule"; .backup.ct.schedule),
+      storage_id("backup.vm.storage"; .backup.vm.storage),
       required_string("backup.vm.schedule"; .backup.vm.schedule),
-      (if (.backup.vm.repeat_missed | type) != "boolean" then "backup.vm.repeat_missed must be boolean" else empty end),
-      required_string("backup.vm.restore_storage"; .backup.vm.restore_storage),
-      (if .backup.vm.job_id == .backup.job_id then "backup.vm.job_id must differ from backup.job_id" else empty end),
-      (if .backup.mode != "suspend" then "backup.mode must be suspend" else empty end),
-      (if .backup.compress != "zstd" then "backup.compress must be zstd" else empty end),
-      (if (.backup.repeat_missed | type) != "boolean" then "backup.repeat_missed must be boolean" else empty end),
-      nonnegative_integer("backup.retention.keep_daily"; .backup.retention.keep_daily),
-      nonnegative_integer("backup.retention.keep_weekly"; .backup.retention.keep_weekly),
-      nonnegative_integer("backup.retention.keep_monthly"; .backup.retention.keep_monthly),
-      nonnegative_integer("backup.bwlimit_kib"; .backup.bwlimit_kib),
-      ranged_integer("backup.ionice"; .backup.ionice; 0; 8),
-      (.backup.notification_mode as $notification_mode
-        | if (["auto", "legacy-sendmail", "notification-system"] | index($notification_mode)) == null then "backup.notification_mode is invalid" else empty end),
-      ranged_integer("backup.snapshot_headroom_percent"; .backup.snapshot_headroom_percent; 1; 90),
-      (if (.backup.hook_path | startswith("/")) != true then "backup.hook_path must be absolute" else empty end),
-      (if (.backup.tmpdir | startswith("/")) != true then "backup.tmpdir must be absolute" else empty end),
-      (if (.backup.temp_storage.storage_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.temp_storage.storage_id contains unsupported characters" else empty end),
-      (if (.backup.temp_storage.vg | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.vg contains unsupported characters" else empty end),
-      (if (.backup.temp_storage.thin_pool | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.thin_pool contains unsupported characters" else empty end),
-      (if (.backup.temp_storage.lv | test("^[A-Za-z0-9_+.-]+$")) != true then "backup.temp_storage.lv contains unsupported characters" else empty end),
-      (if (.backup.state_dir | startswith("/")) != true then "backup.state_dir must be absolute" else empty end),
-      (if (.backup.job_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.job_id contains unsupported characters" else empty end),
-      (if (.backup.vm.job_id | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.vm.job_id contains unsupported characters" else empty end),
-      (if (.backup.vm.restore_storage | test("^[A-Za-z0-9][A-Za-z0-9_-]*$")) != true then "backup.vm.restore_storage contains unsupported characters" else empty end)
+      empty
     ] | .[]' "${CONFIG_FILE}" 2>&1); then
     echo "ERROR: Cannot parse backup policy in ${CONFIG_FILE}: ${errors}" >&2
     return 1
@@ -903,51 +1037,6 @@ validate_hostname() {
   fi
   
   return 0
-}
-
-# -----------------------------
-# NEWT CONFIGURATION FUNCTIONS
-# -----------------------------
-
-# Get newt ID for hostname
-# Args: $1 = hostname (e.g., seafile.thesaints.home)
-# Returns: newt ID or empty
-config_get_newt_id() {
-  local hostname="$1"
-  if ! config_exists; then
-    return 1
-  fi
-  jq -r ".newt.sites.\"${hostname}\".id // empty" "${CONFIG_FILE}" 2>/dev/null
-}
-
-# Get newt secret for hostname
-# Args: $1 = hostname (e.g., seafile.thesaints.home)
-# Returns: newt secret or empty
-config_get_newt_secret() {
-  local hostname="$1"
-  if ! config_exists; then
-    return 1
-  fi
-  jq -r ".newt.sites.\"${hostname}\".secret // empty" "${CONFIG_FILE}" 2>/dev/null
-}
-
-# Get newt endpoint (global or per-site override)
-# Args: $1 = hostname (optional, for per-site override)
-# Returns: endpoint URL or empty
-config_get_newt_endpoint() {
-  local hostname="$1"
-  if ! config_exists; then
-    return 1
-  fi
-  # Check for per-site endpoint first, fall back to global
-  local endpoint
-  if [[ -n "$hostname" ]]; then
-    endpoint=$(jq -r ".newt.sites.\"${hostname}\".endpoint // empty" "${CONFIG_FILE}" 2>/dev/null)
-  fi
-  if [[ -z "$endpoint" ]]; then
-    endpoint=$(jq -r ".newt.endpoint // empty" "${CONFIG_FILE}" 2>/dev/null)
-  fi
-  echo "$endpoint"
 }
 
 # -----------------------------
@@ -1680,20 +1769,20 @@ ensure_packages_and_ca() {
       echo "  Using Alpine Linux (apk)"
       apk update
       apk upgrade --no-cache
-      # Ensure ca-certificates and jq are installed
-      apk add --no-cache ca-certificates jq 2>/dev/null || true
+      # Ensure shared lifecycle/runtime dependencies are installed
+      apk add --no-cache ca-certificates jq python3 py3-yaml 2>/dev/null || true
     elif command -v apt-get >/dev/null 2>&1; then
       echo "  Using Debian/Ubuntu (apt-get)"
       DEBIAN_FRONTEND=noninteractive apt-get update -qq
       DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq
-      # Ensure ca-certificates and jq are installed
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates jq 2>/dev/null || true
+      # Ensure shared lifecycle/runtime dependencies are installed
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ca-certificates jq python3 python3-yaml 2>/dev/null || true
     elif command -v dnf >/dev/null 2>&1; then
       echo "  Using RHEL/Fedora (dnf)"
       dnf check-update -q || true
       dnf upgrade -y -q
-      # Ensure ca-certificates and jq are installed
-      dnf install -y -q ca-certificates jq 2>/dev/null || true
+      # Ensure shared lifecycle/runtime dependencies are installed
+      dnf install -y -q ca-certificates jq python3 python3-pyyaml 2>/dev/null || true
     else
       echo "  [!] Unknown package manager"
       exit 1
@@ -1897,7 +1986,7 @@ install_docker() {
   ct_exec --timeout 120 "${ctid}" '
     set -e
     apk update
-    apk add docker docker-cli-compose ca-certificates
+    apk add docker docker-cli-compose ca-certificates python3 py3-yaml
     service docker start || true
   '
 }
@@ -2385,10 +2474,11 @@ configure_authentik_forward_auth() {
 
 # Emit a machine-readable description of local DRM capability.
 probe_local_gpu_capability() {
-  local pci_gpu=false class_file class_value device major_hex gid
+  local pci_gpu=false class_file class_value device major_hex minor_hex gid
   local pci_root="${GPU_PCI_ROOT:-/sys/bus/pci/devices}"
   local dri_root="${GPU_DRI_ROOT:-/dev/dri}"
-  local render_devices=()
+  local nvidia_root="${GPU_NVIDIA_ROOT:-/dev}"
+  local render_devices=() nvidia_devices=()
 
   for class_file in "$pci_root"/*/class; do
     [[ -r "$class_file" ]] || continue
@@ -2423,16 +2513,37 @@ probe_local_gpu_capability() {
     [[ -n "$gid" ]] || { echo "STATE broken"; return 0; }
     echo "DEVICE ${device} ${gid}"
   done
+
+  shopt -s nullglob
+  nvidia_devices=("$nvidia_root"/nvidia[0-9]*)
+  shopt -u nullglob
+  for device in "$nvidia_root"/nvidiactl "$nvidia_root"/nvidia-uvm \
+    "$nvidia_root"/nvidia-uvm-tools; do
+    [[ -e "$device" ]] && nvidia_devices+=("$device")
+  done
+  for device in "${nvidia_devices[@]}"; do
+    [[ -c "$device" ]] || { echo "STATE broken"; return 0; }
+    major_hex=$(stat -c '%t' "$device" 2>/dev/null || true)
+    minor_hex=$(stat -c '%T' "$device" 2>/dev/null || true)
+    gid=$(stat -c '%g' "$device" 2>/dev/null || true)
+    [[ "$major_hex" =~ ^[0-9a-fA-F]+$ && "$minor_hex" =~ ^[0-9a-fA-F]+$ && -n "$gid" ]] \
+      || { echo "STATE broken"; return 0; }
+    echo "NVIDIA ${device} $((16#$major_hex)) $((16#$minor_hex)) ${gid}"
+  done
 }
 
-# Sets NODE_GPU_STATE and NODE_GPU_RENDER_DEVICES/NODE_GPU_RENDER_GIDS.
+# Sets node GPU state and discovered DRM/NVIDIA device arrays.
 detect_node_gpu_capability() {
   local node="${1:-$(hostname -s)}"
-  local local_node probe state="" key device gid
+  local local_node probe state="" key device value1 value2 value3
   local_node=$(hostname -s)
   NODE_GPU_STATE="indeterminate"
   NODE_GPU_RENDER_DEVICES=()
   NODE_GPU_RENDER_GIDS=()
+  NODE_GPU_NVIDIA_DEVICES=()
+  NODE_GPU_NVIDIA_MAJORS=()
+  NODE_GPU_NVIDIA_MINORS=()
+  NODE_GPU_NVIDIA_GIDS=()
 
   if [[ "$node" == "$local_node" ]]; then
     probe=$(probe_local_gpu_capability) || return 1
@@ -2444,12 +2555,18 @@ detect_node_gpu_capability() {
     }
   fi
 
-  while read -r key device gid; do
+  while read -r key device value1 value2 value3; do
     case "$key" in
       STATE) state="$device" ;;
       DEVICE)
         NODE_GPU_RENDER_DEVICES+=("$device")
-        NODE_GPU_RENDER_GIDS+=("$gid")
+        NODE_GPU_RENDER_GIDS+=("$value1")
+        ;;
+      NVIDIA)
+        NODE_GPU_NVIDIA_DEVICES+=("$device")
+        NODE_GPU_NVIDIA_MAJORS+=("$value1")
+        NODE_GPU_NVIDIA_MINORS+=("$value2")
+        NODE_GPU_NVIDIA_GIDS+=("$value3")
         ;;
     esac
   done <<< "$probe"
@@ -2472,25 +2589,26 @@ detect_node_gpu_capability() {
   esac
 }
 
-ct_managed_gpu_disabled() {
-  local ctid="$1"
-  local target_hostname="${2:-${CT_HOSTNAME:-}}"
-  local node marker
-  [[ -n "$target_hostname" ]] || target_hostname="${CT_MAP[$ctid]:-}"
-  [[ "$target_hostname" == ca.* ]] && return 0
-  [[ -n "$target_hostname" ]] || return 1
-  node=$(get_ct_owner_node "$ctid") || return 1
-  marker="/mnt/docker/${target_hostname}/_config/disable-managed-gpu"
-  node_path_is_file "$node" "$marker"
+profile_group_is_relevant() {
+  local expected_group="${1:-}" relevant_groups="${2:-}" group
+  while IFS= read -r group; do
+    [[ "$group" == "$expected_group" ]] && return 0
+  done <<<"$relevant_groups"
+  return 1
 }
 
 resolve_ct_gpu_capability() {
   local ctid="$1"
   local node="$2"
-  if ct_managed_gpu_disabled "$ctid"; then
+  local relevant_groups="${3:-}"
+  if ! profile_group_is_relevant gpu "$relevant_groups"; then
     NODE_GPU_STATE="absent"
     NODE_GPU_RENDER_DEVICES=()
     NODE_GPU_RENDER_GIDS=()
+    NODE_GPU_NVIDIA_DEVICES=()
+    NODE_GPU_NVIDIA_MAJORS=()
+    NODE_GPU_NVIDIA_MINORS=()
+    NODE_GPU_NVIDIA_GIDS=()
   else
     detect_node_gpu_capability "$node"
   fi
@@ -2499,22 +2617,38 @@ resolve_ct_gpu_capability() {
 ct_gpu_config_matches_capability() {
   local ctid="$1"
   local config_file="/etc/pve/lxc/${ctid}.conf"
-  local node has_allow=false has_mount=false
+  local node device major relative
+  local has_begin=false has_end=false
   node=$(get_ct_owner_node "$ctid") || return 1
-  run_on_node "$node" grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null && has_allow=true
-  run_on_node "$node" grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null && has_mount=true
+  run_on_node "$node" grep -Fxq '# BEGIN commonCT managed GPU' "$config_file" 2>/dev/null && has_begin=true
+  run_on_node "$node" grep -Fxq '# END commonCT managed GPU' "$config_file" 2>/dev/null && has_end=true
 
-  if [[ "$NODE_GPU_STATE" == "available" ]] && ! ct_managed_gpu_disabled "$ctid"; then
-    [[ "$has_allow" == "true" && "$has_mount" == "true" ]]
+  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+    [[ "$has_begin" == "true" && "$has_end" == "true" ]] || return 1
+    run_on_node "$node" grep -Fxq 'lxc.cgroup2.devices.allow: c 226:* rwm' "$config_file" 2>/dev/null || return 1
+    run_on_node "$node" grep -Fxq 'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' "$config_file" 2>/dev/null || return 1
+    for major in $(printf '%s\n' "${NODE_GPU_NVIDIA_MAJORS[@]:-}" | sed '/^$/d' | sort -un); do
+      run_on_node "$node" grep -Fxq "lxc.cgroup2.devices.allow: c ${major}:* rwm" "$config_file" 2>/dev/null || return 1
+    done
+    for device in "${NODE_GPU_NVIDIA_DEVICES[@]:-}"; do
+      [[ -n "$device" ]] || continue
+      relative="${device#/}"
+      run_on_node "$node" grep -Fxq \
+        "lxc.mount.entry: ${device} ${relative} none bind,optional,create=file" \
+        "$config_file" 2>/dev/null || return 1
+    done
   else
-    [[ "$has_allow" == "false" && "$has_mount" == "false" ]]
+    [[ "$has_begin" == "false" && "$has_end" == "false" ]] \
+      && ! run_on_node "$node" grep -Eq \
+        '^lxc\.(cgroup2\.devices\.allow: c 226:\* rwm|mount\.entry: /dev/dri dev/dri none bind,optional,create=dir)$' \
+        "$config_file" 2>/dev/null
   fi
 }
 
 reconcile_stopped_ct_gpu_config() {
   local ctid="$1"
   local config_file="/etc/pve/lxc/${ctid}.conf"
-  local node
+  local node device major relative
   node=$(get_ct_owner_node "$ctid") || return 1
 
   if [[ "$(get_ct_status "$ctid")" != "stopped" ]]; then
@@ -2523,15 +2657,26 @@ reconcile_stopped_ct_gpu_config() {
   fi
 
   run_on_node "$node" sed -i \
+    -e '\|^# BEGIN commonCT managed GPU$|,\|^# END commonCT managed GPU$|d' \
     -e '\|^lxc.cgroup2.devices.allow: c 226:\* rwm$|d' \
     -e '\|^lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir$|d' \
     "$config_file"
 
-  if [[ "$NODE_GPU_STATE" == "available" ]] && ! ct_managed_gpu_disabled "$ctid"; then
-    run_node_shell "$node" "printf '%s\\n' \
+  if [[ "$NODE_GPU_STATE" == "available" ]]; then
+    run_node_shell "$node" "printf '%s\n' '# BEGIN commonCT managed GPU' \
       'lxc.cgroup2.devices.allow: c 226:* rwm' \
       'lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir' >> '$config_file'"
-    echo "  [✓] CT ${ctid}: exposing ${#NODE_GPU_RENDER_DEVICES[@]} DRM render device(s)"
+    for major in $(printf '%s\n' "${NODE_GPU_NVIDIA_MAJORS[@]:-}" | sed '/^$/d' | sort -un); do
+      run_node_shell "$node" "printf '%s\n' 'lxc.cgroup2.devices.allow: c ${major}:* rwm' >> '$config_file'"
+    done
+    for device in "${NODE_GPU_NVIDIA_DEVICES[@]:-}"; do
+      [[ -n "$device" ]] || continue
+      relative="${device#/}"
+      run_node_shell "$node" "printf '%s\n' \
+        'lxc.mount.entry: ${device} ${relative} none bind,optional,create=file' >> '$config_file'"
+    done
+    run_node_shell "$node" "printf '%s\n' '# END commonCT managed GPU' >> '$config_file'"
+    echo "  [✓] CT ${ctid}: exposing ${#NODE_GPU_RENDER_DEVICES[@]} DRM and ${#NODE_GPU_NVIDIA_DEVICES[@]} NVIDIA device(s)"
   else
     echo "  [✓] CT ${ctid}: removed managed DRM passthrough"
   fi
@@ -2540,10 +2685,11 @@ reconcile_stopped_ct_gpu_config() {
 reconcile_ct_gpu_config() {
   local ctid="${1:-${CTID}}"
   local node="${2:-$(hostname -s)}"
+  local relevant_groups="${3:-}"
   local original_status
   original_status=$(get_ct_status "$ctid")
 
-  resolve_ct_gpu_capability "$ctid" "$node" || return 1
+  resolve_ct_gpu_capability "$ctid" "$node" "$relevant_groups" || return 1
   if ct_gpu_config_matches_capability "$ctid"; then
     echo "  [✓] CT ${ctid}: GPU config matches node '${node}' (${NODE_GPU_STATE})"
     return 0
@@ -2563,10 +2709,11 @@ reconcile_ct_gpu_config() {
 finalize_ct_gpu_capability() {
   local ctid="${1:-${CTID}}"
   local node="${2:-}"
+  local relevant_groups="${3:-}"
   local index device gid group
 
-  if ct_managed_gpu_disabled "$ctid"; then
-    echo "  [✓] CT ${ctid}: managed GPU passthrough is disabled"
+  if ! profile_group_is_relevant gpu "$relevant_groups"; then
+    echo "  [✓] CT ${ctid}: GPU profile group is not used by the workload"
     return 0
   fi
 
@@ -2585,7 +2732,14 @@ finalize_ct_gpu_capability() {
       return 1
     fi
   done
-  echo "  [✓] CT ${ctid}: all DRM render devices are accessible"
+  for index in "${!NODE_GPU_NVIDIA_DEVICES[@]}"; do
+    device="${NODE_GPU_NVIDIA_DEVICES[$index]}"
+    if ! ct_exec --timeout 15 "$ctid" "test -c '${device}' && test -r '${device}' && test -w '${device}'" 2>/dev/null; then
+      echo "ERROR: ${device} is not read/write accessible inside CT ${ctid}." >&2
+      return 1
+    fi
+  done
+  echo "  [✓] CT ${ctid}: all DRM and NVIDIA devices are accessible"
 }
 
 # Run Docker Compose inside a CT through the optional hardware-profile wrapper.
@@ -2685,7 +2839,7 @@ is_transient_registry_error() {
 }
 
 # Pull all images for a CT's compose stack with exponential backoff.
-# Detects all profiles so every image (incl. published/newt) is cached locally,
+# Detects all profiles so every image is cached locally,
 # allowing a subsequent 'compose up --pull missing' to start without network.
 # Args:
 #   $1 - CTID (optional, defaults to global CTID)
@@ -2748,8 +2902,6 @@ compose_pull() {
 }
 
 # Start Docker Compose services in a CT
-# Updates .env with newt configuration from commonCT.json
-# Enables 'published' profile if newt credentials are configured
 # Args:
 #   $1 - CTID (optional, defaults to global CTID)
 # Returns: exit code from docker compose
@@ -2761,39 +2913,31 @@ compose_up() {
   hostname=$(pct_config "$ctid" 2>/dev/null | awk -F': ' '/^hostname:/ {print $2}')
   node=$(get_ct_owner_node "$ctid") || return 1
   
-  # Get newt configuration
-  local newt_id newt_secret newt_endpoint
-  newt_id=$(config_get_newt_id "$hostname")
-  newt_secret=$(config_get_newt_secret "$hostname")
-  newt_endpoint=$(config_get_newt_endpoint "$hostname")
-
   # Reconcile .env through the same consumption-aware path used during mount setup.
   local hostname_lower
   hostname_lower=$(echo "$hostname" | tr '[:upper:]' '[:lower:]')
   local env_file="/mnt/docker/${hostname_lower}/.env"
   
   if node_path_is_file "$node" "$env_file"; then
-    local stage_dir stage_env
+    local stage_dir stage_env root_uid root_gid
     stage_dir=$(mktemp -d)
     stage_env="${stage_dir}/.env"
-    node_download_file "$node" "$env_file" "$stage_env"
-    update_env_file "$stage_env" "/mnt/docker/${hostname_lower}/_config" "$node"
-    ct_upload_file "$ctid" "$stage_env" /mnt/docker/.env 0600
+    if ! node_download_file "$node" "$env_file" "$stage_env" \
+      || ! update_env_file "$stage_env" "/mnt/docker/${hostname_lower}/_config" "$node" \
+      || ! read -r root_uid root_gid < <(get_ct_host_root_ids "$ctid") \
+      || ! node_upload_file "$node" "$stage_env" "$env_file" 0600 "$root_uid" "$root_gid"; then
+      rm -rf "$stage_dir"
+      echo "  [!] Failed to publish the Compose environment for CT ${ctid}." >&2
+      return 1
+    fi
     rm -rf "$stage_dir"
   fi
   
-  # Build compose command with optional published profile
-  local -a profile_args=()
-  if [[ -n "$newt_id" && -n "$newt_secret" && -n "$newt_endpoint" ]]; then
-    profile_args=(--profile published)
-    echo "  Newt tunnel enabled (published profile)"
-  fi
-
   # Images are pre-pulled by compose_pull (see reset_docker), so use the default
   # --pull missing here: start from cached images and avoid a redundant network hit.
   local max_attempts=3
   local attempt output
-  local -a compose_args=("${profile_args[@]}" up -d --pull missing --remove-orphans)
+  local -a compose_args=(up -d --pull missing --remove-orphans)
 
   for ((attempt=1; attempt<=max_attempts; attempt++)); do
     echo "  Starting services (attempt ${attempt}/${max_attempts})..."
@@ -3702,6 +3846,96 @@ ct_has_tag() {
   return 1
 }
 
+reconcile_ct_profile_tags() {
+  local ctid="${1:-}" selections="${2:-}" relevant_groups="${3:-}" config current_tags desired_tags group name tag
+  local -a groups=() tags=() desired=()
+  local -A configured_groups=() relevant=() selected_profiles=()
+
+  [[ "$ctid" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: reconcile_ct_profile_tags requires a CTID." >&2
+    return 2
+  }
+  validate_profiles_config || return 1
+  mapfile -t groups < <(jq -r '.profiles | keys[]' "${CONFIG_FILE}")
+  for group in "${groups[@]}"; do
+    configured_groups["$group"]=1
+  done
+
+  while IFS= read -r group; do
+    [[ -n "$group" ]] || continue
+    [[ -n "${configured_groups[$group]:-}" ]] || {
+      echo "ERROR: Workload references unknown profile group '${group}'." >&2
+      return 1
+    }
+    relevant["$group"]=1
+  done <<<"$relevant_groups"
+
+  while IFS=$'\t' read -r group name; do
+    [[ -n "$group" || -n "$name" ]] || continue
+    [[ -n "$group" && -n "$name" && -z "${selected_profiles[$group]:-}" ]] || {
+      echo "ERROR: Profile selections must contain one unique group/name pair per line." >&2
+      return 1
+    }
+    [[ -n "${configured_groups[$group]:-}" ]] || {
+      echo "ERROR: Selection references unknown profile group '${group}'." >&2
+      return 1
+    }
+    if ! jq -e --arg group "$group" --arg name "$name" \
+      '.profiles[$group] | .default == $name or any(.profiles[]; .name == $name)' \
+      "${CONFIG_FILE}" >/dev/null; then
+      echo "ERROR: Selection '${group}/${name}' is not configured." >&2
+      return 1
+    fi
+    selected_profiles["$group"]="$name"
+  done <<<"$selections"
+
+  for group in "${!relevant[@]}"; do
+    [[ -n "${selected_profiles[$group]:-}" ]] || {
+      echo "ERROR: No selected profile provided for group '${group}'." >&2
+      return 1
+    }
+  done
+
+  config=$(pct_config "$ctid") || {
+    echo "ERROR: Cannot read current tags for CT ${ctid}." >&2
+    return 1
+  }
+  current_tags=$(sed -n 's/^tags:[[:space:]]*//p' <<<"$config" | head -n 1)
+  IFS=';' read -r -a tags <<<"$current_tags"
+
+  for tag in "${tags[@]}"; do
+    [[ -n "$tag" ]] || continue
+    [[ "$tag" == compose-profile.* ]] && continue
+    for group in "${groups[@]}"; do
+      [[ "$tag" == "profile-${group}-"* ]] && continue 2
+    done
+    desired+=("$tag")
+  done
+  for group in "${!relevant[@]}"; do
+    desired+=("profile-${group}-${selected_profiles[$group]}")
+  done
+
+  mapfile -t desired < <(printf '%s\n' "${desired[@]}" | LC_ALL=C sort -u)
+  desired_tags=$(IFS=';'; printf '%s' "${desired[*]}")
+  if [[ "$current_tags" == "$desired_tags" ]]; then
+    CT_TAGS["$ctid"]="$desired_tags"
+    return 0
+  fi
+
+  pct_set "$ctid" -tags "$desired_tags" || {
+    echo "ERROR: Cannot reconcile profile tags for CT ${ctid}." >&2
+    return 1
+  }
+  CT_TAGS["$ctid"]="$desired_tags"
+  echo "  [✓] CT ${ctid}: reconciled profile tags (${desired_tags})"
+}
+
+evaluate_and_reconcile_ct_profiles() {
+  local ctid="${1:-${CTID:-}}" relevant_groups="${2:-}" selections
+  selections=$(evaluate_ct_profiles "$ctid" "$relevant_groups") || return 1
+  reconcile_ct_profile_tags "$ctid" "$selections" "$relevant_groups"
+}
+
 # Display interactive single-select container menu using whiptail
 # Args: $1 = action verb (e.g., "delete", "refresh", "select")
 # Sets: CTID, CT_HOSTNAME
@@ -4382,6 +4616,97 @@ ct_exists() {
   get_ct_owner_node "$ctid" &>/dev/null
 }
 
+compose_file_has_managed_profiles() {
+  local node="${1:-}" compose_file="${2:-}"
+  local stage_compose detection group
+  local -a managed_group_args=()
+  [[ -n "$node" && -n "$compose_file" ]] || return 2
+  node_path_is_file "$node" "$compose_file" || return 1
+  if ! python3 -c 'import yaml' 2>/dev/null; then
+    echo "ERROR: Python 3 and PyYAML are required on the lifecycle host." >&2
+    return 2
+  fi
+  stage_compose=$(mktemp)
+  if ! node_download_file "$node" "$compose_file" "$stage_compose"; then
+    rm -f "$stage_compose"
+    return 2
+  fi
+  while IFS= read -r group; do
+    [[ -n "$group" ]] && managed_group_args+=(--managed-group "$group")
+  done < <(config_get_profile_groups)
+  detection=$("${SCRIPT_DIR}/configure/resolve-compose-profile.py" \
+    --file "$stage_compose" "${managed_group_args[@]}" --detect) || {
+    rm -f "$stage_compose"
+    return 2
+  }
+  rm -f "$stage_compose"
+  [[ "$detection" == "true" ]]
+}
+
+compose_file_managed_profile_groups() {
+  local node="${1:-}" compose_file="${2:-}"
+  local stage_compose group
+  local -a managed_group_args=()
+  [[ -n "$node" && -n "$compose_file" ]] || return 2
+  node_path_is_file "$node" "$compose_file" || return 0
+  if ! python3 -c 'import yaml' 2>/dev/null; then
+    echo "ERROR: Python 3 and PyYAML are required on the lifecycle host." >&2
+    return 1
+  fi
+  stage_compose=$(mktemp)
+  if ! node_download_file "$node" "$compose_file" "$stage_compose"; then
+    rm -f "$stage_compose"
+    return 1
+  fi
+  while IFS= read -r group; do
+    [[ -n "$group" ]] && managed_group_args+=(--managed-group "$group")
+  done < <(config_get_profile_groups)
+  "${SCRIPT_DIR}/configure/resolve-compose-profile.py" \
+    --file "$stage_compose" "${managed_group_args[@]}" --list-groups
+  local rc=$?
+  rm -f "$stage_compose"
+  return "$rc"
+}
+
+ct_relevant_profile_groups() {
+  local ctid="${1:-${CTID:-}}" hostname="${2:-${CT_HOSTNAME:-}}" node
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && -n "$hostname" ]] || {
+    echo "ERROR: ct_relevant_profile_groups requires a CTID and hostname." >&2
+    return 2
+  }
+  node=$(get_ct_owner_node "$ctid") || return 1
+  compose_file_managed_profile_groups "$node" "/mnt/docker/${hostname}/docker-compose.yaml"
+}
+
+validate_compose_profile_source() {
+  local node="${1:-}" compose_file="${2:-}" selector="${3:-}"
+  local stage_compose detection_rc=0
+  compose_file_has_managed_profiles "$node" "$compose_file" || detection_rc=$?
+  [[ "$detection_rc" -eq 1 ]] && return 0
+  [[ "$detection_rc" -eq 0 ]] || return 1
+  if [[ -n "$selector" ]] && node_path_exists "$node" "$selector"; then
+    echo "ERROR: Compose stack defines both managed service profiles and a legacy hardware selector." >&2
+    return 1
+  fi
+  stage_compose=$(mktemp)
+  if ! node_download_file "$node" "$compose_file" "$stage_compose"; then
+    rm -f "$stage_compose"
+    return 1
+  fi
+  if ! "${SCRIPT_DIR}/configure/resolve-compose-profile.py" \
+    --file "$stage_compose" --validate; then
+    rm -f "$stage_compose"
+    return 1
+  fi
+  rm -f "$stage_compose"
+}
+
+ct_has_compose_profile_policy() {
+  local ctid="${1:-${CTID}}"
+  ct_exec --timeout 10 "$ctid" \
+    'test -x /mnt/docker/_config/select-compose-profile.sh || [ "$(/mnt/docker/_config/shared/resolve-compose-profile.py --file /mnt/docker/docker-compose.yaml --detect)" = true ]'
+}
+
 # Mirror the shared configure library into the CT before configure.sh runs.
 # Source of truth: ${SCRIPT_DIR}/configure on the Proxmox host. The folder is
 # COPIED (not symlinked/mounted) into ${DIR_DOCKER}/_config/shared because only
@@ -4389,17 +4714,27 @@ ct_exists() {
 # anything sourced as /mnt/docker/_config/shared/*.sh must live there for real.
 #
 # Idempotent: the destination is fully mirrored (rm -rf + cp -a) on every run.
-# Non-fatal: a CT without a _config/ dir, or a missing source library, is skipped.
+# Non-fatal: a CT without a _config/ dir or managed profiles, or a missing source
+# library, is skipped.
 #
 # Args: none (uses globals SCRIPT_DIR, DIR_DOCKER)
 sync_config_shared() {
   local src="${SCRIPT_DIR}/configure"
   local dest="${DIR_DOCKER}/_config/shared"
-  local node
+  local compose_file="${DIR_DOCKER}/docker-compose.yaml"
+  local node profile_aware=false detection_rc=0
   node=$(get_ct_owner_node "$CTID") || return 1
 
-  # Only CTs that ship a _config/ (i.e. have a configure.sh) need the library.
-  if ! node_path_is_dir "$node" "${DIR_DOCKER}/_config"; then
+  compose_file_has_managed_profiles "$node" "$compose_file" || detection_rc=$?
+  if [[ "$detection_rc" -eq 0 ]]; then
+    profile_aware=true
+  elif [[ "$detection_rc" -ne 1 ]]; then
+    return 1
+  fi
+
+  # Configure scripts and profile-aware stacks consume the shared library.
+  if ! node_path_is_dir "$node" "${DIR_DOCKER}/_config" \
+    && [[ "$profile_aware" != true ]]; then
     return 0
   fi
 
@@ -4408,17 +4743,28 @@ sync_config_shared() {
     return 0
   fi
 
+  if [[ "$profile_aware" == true ]]; then
+    validate_compose_profile_source "$node" "$compose_file" \
+      "${DIR_DOCKER}/_config/select-compose-profile.sh" || return 1
+  fi
+
   node_sync_tree "$node" "$src" "$dest"
   echo "  [✓] Synced shared configure library -> _config/shared"
+
+  if [[ "$profile_aware" == true ]] \
+    && ! ct_exec --timeout 15 "$CTID" "python3 -c 'import yaml'" 2>/dev/null; then
+    echo "ERROR: Python 3 and PyYAML are required in profile-aware CT ${CTID}." >&2
+    return 1
+  fi
 
   configure_compose_profile_boot "$CTID"
 }
 
 # Reconcile profile-aware Compose stacks after Docker starts on Alpine boot.
-# CTs without a selector are explicitly kept free of this optional service.
+# Ordinary stacks are explicitly kept free of this optional service.
 configure_compose_profile_boot() {
   local ctid="${1:-${CTID}}"
-  if ! ct_exec --timeout 10 "$ctid" 'test -x /mnt/docker/_config/select-compose-profile.sh'; then
+  if ! ct_has_compose_profile_policy "$ctid"; then
     ct_exec --timeout 15 "$ctid" \
       'if [ -e /etc/init.d/compose-profile ]; then rc-update del compose-profile default >/dev/null 2>&1 || true; rm -f /etc/init.d/compose-profile; fi'
     return 0
@@ -4434,7 +4780,7 @@ depend() {
 }
 
 start() {
-  ebegin "Reconciling Docker Compose hardware profile"
+  ebegin "Reconciling Docker Compose profiles"
   cd /mnt/docker || return 1
   ./_config/shared/compose-profile.sh up -d --pull missing --remove-orphans
   eend $?
@@ -4527,10 +4873,6 @@ update_env_file() {
   dns_account_id=$(config_get_dns_account_id "${domain}")
   local email
   email=$(config_get_email "${domain}")
-  local newt_id newt_secret newt_endpoint
-  newt_id=$(config_get_newt_id "$target_hostname")
-  newt_secret=$(config_get_newt_secret "$target_hostname")
-  newt_endpoint=$(config_get_newt_endpoint "$target_hostname")
   
   # Create file if it doesn't exist
   touch "$env_file"
@@ -4683,27 +5025,10 @@ update_env_file() {
     remove_env_key "OTEL_EXPORTER_OTLP_INSECURE"
   fi
 
-  if compose_references_env_key "NEWT_ID" \
-     || compose_references_env_key "NEWT_SECRET" \
-     || compose_references_env_key "NEWT_ENDPOINT"; then
-    if [[ -n "$newt_id" && -n "$newt_secret" && -n "$newt_endpoint" ]]; then
-      set_env_value "NEWT_ID" "$newt_id" "Newt/Pangolin tunnel configuration (from commonCT.json)"
-      set_env_value "NEWT_SECRET" "$newt_secret" ""
-      set_env_value "NEWT_ENDPOINT" "$newt_endpoint" ""
-    else
-      if ! grep -q '^NEWT_\(ID\|SECRET\|ENDPOINT\)=' "$env_file"; then
-        echo -e "\n# Newt/Pangolin tunnel configuration (for 'published' profile)" >> "$env_file"
-      fi
-      ensure_env_key "NEWT_ID"
-      ensure_env_key "NEWT_SECRET"
-      ensure_env_key "NEWT_ENDPOINT"
-    fi
-  else
-    remove_env_key "NEWT_ID"
-    remove_env_key "NEWT_SECRET"
-    remove_env_key "NEWT_ENDPOINT"
-    sed -i "/^# Newt\/Pangolin tunnel configuration/d" "$env_file"
-  fi
+  remove_env_key "NEWT_ID"
+  remove_env_key "NEWT_SECRET"
+  remove_env_key "NEWT_ENDPOINT"
+  sed -i "/^# Newt\/Pangolin tunnel configuration/d" "$env_file"
   
   # Clean up multiple blank lines
   sed -i '/^$/N;/^\n$/d' "$env_file"
@@ -4725,8 +5050,170 @@ create_compose_template() {
   cp "$template" "$compose_file"
 }
 
+# Print the canonical managed mount configuration for one CT.
+canonical_ct_mounts() {
+  local ctid="$1" hostname="$2" hostname_lower
+  hostname_lower=$(tr '[:upper:]' '[:lower:]' <<<"$hostname")
+  printf 'mp0: /run/pve-imds/%s,mp=/mnt/pve-imds,ro=1,shared=1,backup=0\n' "$ctid"
+  printf 'mp1: /mnt/docker/%s,mp=/mnt/docker\n' "$hostname_lower"
+  printf 'mp2: /mnt/docker-data/%s,mp=/mnt/docker-data\n' "$hostname_lower"
+}
+
+normalize_ct_mounts() {
+  local mounts="$1" line key value source option normalized_options
+  local -a fields sorted_options
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    value="${line#*: }"
+    IFS=',' read -r -a fields <<<"$value"
+    source="${fields[0]}"
+    sorted_options=()
+    if ((${#fields[@]} > 1)); then
+      mapfile -t sorted_options < <(printf '%s\n' "${fields[@]:1}" | LC_ALL=C sort)
+    fi
+    normalized_options=""
+    for option in "${sorted_options[@]}"; do
+      normalized_options+=",${option}"
+    done
+    printf '%s: %s%s\n' "$key" "$source" "$normalized_options"
+  done <<<"$mounts"
+}
+
+ct_mounts_match() {
+  local actual="$1" expected="$2"
+  [[ "$(normalize_ct_mounts "$actual")" == "$(normalize_ct_mounts "$expected")" ]]
+}
+
+wait_for_ct_status() {
+  local ctid="$1" expected="$2" timeout="${3:-60}" i
+  for ((i=1; i<=timeout; i++)); do
+    [[ "$(get_ct_status "$ctid")" == "$expected" ]] && return 0
+    sleep 1
+  done
+  echo "ERROR: CT ${ctid} did not reach status '${expected}' within ${timeout}s." >&2
+  return 1
+}
+
+warn_if_imds_unavailable() {
+  local ctid="$1" node="$2"
+  if ! run_on_node "$node" /usr/local/sbin/pve-imds-health >/dev/null 2>&1 \
+    || ! run_on_node "$node" test -d "/run/pve-imds/${ctid}"; then
+    echo "  [!] IMDS is unavailable for CT ${ctid} on ${node}; configuring its bind mount anyway." >&2
+  fi
+}
+
+restore_ct_mount_snapshot() {
+  local ctid="$1" expected="$2" line key value current
+  current=$(pct_config "$ctid" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    pct_set "$ctid" -delete "$key" || return 1
+  done <<<"$current"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    value="${line#*: }"
+    pct_set "$ctid" "-${key}" "$value" || return 1
+  done <<<"$expected"
+  current=$(pct_config "$ctid" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  ct_mounts_match "$current" "$expected"
+}
+
+reconcile_ct_mountpoints() {
+  local ctid="$1" hostname="$2" node original desired current status line key value
+  local was_running=false mutation_failed=false
+
+  node=$(get_ct_owner_node "$ctid") || return 1
+  original=$(pct_config "$ctid" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+  desired=$(canonical_ct_mounts "$ctid" "$hostname")
+  if ct_mounts_match "$original" "$desired"; then
+    echo "Mountpoints already canonical."
+    return 0
+  fi
+
+  warn_if_imds_unavailable "$ctid" "$node"
+  echo "Replacing CT ${ctid} mountpoints with the canonical mp0-mp2 layout."
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo "  deleting ${line}"
+  done <<<"$original"
+
+  status=$(get_ct_status "$ctid") || return 1
+  case "$status" in
+    running)
+      was_running=true
+      pct_stop "$ctid" || return 1
+      wait_for_ct_status "$ctid" stopped || return 1
+      ;;
+    stopped) ;;
+    *) echo "ERROR: CT ${ctid} is in unexpected state '${status}'." >&2; return 1 ;;
+  esac
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    key="${line%%:*}"
+    pct_set "$ctid" -delete "$key" || { mutation_failed=true; break; }
+  done <<<"$original"
+  if [[ "$mutation_failed" == false ]]; then
+    while IFS= read -r line; do
+      key="${line%%:*}"
+      value="${line#*: }"
+      pct_set "$ctid" "-${key}" "$value" || { mutation_failed=true; break; }
+    done <<<"$desired"
+  fi
+  if [[ "$mutation_failed" == false ]]; then
+    current=$(pct_config "$ctid" 2>/dev/null | grep -E '^mp[0-9]+:' || true)
+    if ! ct_mounts_match "$current" "$desired"; then
+      echo "ERROR: Canonical mount verification mismatch." >&2
+      echo "Expected:" >&2
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && printf '  %s\n' "$line" >&2
+      done <<<"$desired"
+      echo "Observed:" >&2
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && printf '  %s\n' "$line" >&2
+      done <<<"$current"
+      mutation_failed=true
+    fi
+  fi
+
+  if [[ "$mutation_failed" == true ]]; then
+    echo "ERROR: Mountpoint reconciliation failed; restoring the original configuration." >&2
+    if ! restore_ct_mount_snapshot "$ctid" "$original"; then
+      echo "ERROR: Mountpoint rollback could not be verified; CT ${ctid} remains stopped." >&2
+      return 1
+    fi
+    if [[ "$was_running" == true ]]; then
+      pct_start "$ctid" || return 1
+      wait_for_ct_status "$ctid" running || return 1
+    fi
+    return 1
+  fi
+
+  if [[ "$was_running" == true ]]; then
+    if ! pct_start "$ctid" || ! wait_for_ct_status "$ctid" running; then
+      echo "ERROR: CT ${ctid} could not start with canonical mounts; restoring the original configuration." >&2
+      status=$(get_ct_status "$ctid" || true)
+      if [[ "$status" == running ]]; then
+        pct_stop "$ctid" || return 1
+        wait_for_ct_status "$ctid" stopped || return 1
+      fi
+      if ! restore_ct_mount_snapshot "$ctid" "$original"; then
+        echo "ERROR: Mountpoint rollback could not be verified; CT ${ctid} remains stopped." >&2
+        return 1
+      fi
+      if ! pct_start "$ctid" || ! wait_for_ct_status "$ctid" running; then
+        echo "ERROR: Original mountpoints were restored, but CT ${ctid} could not be restarted." >&2
+        return 1
+      fi
+      return 1
+    fi
+  fi
+  echo "Mountpoints updated: mp0=IMDS, mp1=Docker, mp2=Docker data."
+}
+
 # Register/verify container mountpoints
-# Idempotent: checks if mounts are correct before modifying
 # Args: (none - uses $CTID and CT hostname from $CT_HOSTNAME or $HOSTNAME)
 # Sets: DIR_DOCKER, DIR_DOCKER_DATA
 setup_mountpoints() {
@@ -4744,7 +5231,7 @@ setup_mountpoints() {
   DIR_DOCKER="/mnt/docker/${hostname_lower}"
   DIR_DOCKER_DATA="/mnt/docker-data/${hostname_lower}"
 
-  local node stage_dir stage_compose stage_env
+  local node stage_dir stage_compose stage_env root_uid root_gid
   node=$(get_ct_owner_node "$CTID") || return 1
 
   node_mkdir "$node" "$DIR_DOCKER" "$DIR_DOCKER_DATA"
@@ -4772,49 +5259,18 @@ setup_mountpoints() {
     : > "$stage_env"
   fi
   update_env_file "$stage_env" "${DIR_DOCKER}/_config" "$node"
-  ct_upload_file "$CTID" "$stage_env" /mnt/docker/.env 0600
-  rm -rf "$stage_dir"
 
-  # Idempotent mount setup: only reconfigure if mounts are missing or incorrect
   echo "Verifying bind mounts..."
-  
-  local current_mp0 current_mp1 needs_update=0
-  local config_output
-  config_output=$(pct_config "$CTID" 2>/dev/null)
-  
-  # Extract current mp0 and mp1 paths (format: mp0: /path/on/host,mp=/path/in/ct)
-  # `|| true`: a fresh CT has no mp lines, so grep exits 1; under `set -euo pipefail`
-  # the bare assignment would abort the script before the mounts are ever added.
-  current_mp0=$(echo "$config_output" | grep -E '^mp0:' | sed -E 's/^mp0:\s*([^,]+),.*/\1/') || true
-  current_mp1=$(echo "$config_output" | grep -E '^mp1:' | sed -E 's/^mp1:\s*([^,]+),.*/\1/') || true
-  
-  # Check if mounts are correct
-  if [[ "$current_mp0" != "$DIR_DOCKER" ]] || [[ "$current_mp1" != "$DIR_DOCKER_DATA" ]]; then
-    needs_update=1
+  if ! reconcile_ct_mountpoints "$CTID" "$target_hostname"; then
+    rm -rf "$stage_dir"
+    return 1
   fi
-  
-  if [[ $needs_update -eq 1 ]]; then
-    echo "Mountpoints need update (expected: mp0=$DIR_DOCKER, mp1=$DIR_DOCKER_DATA)"
-    echo "Current: mp0=$current_mp0, mp1=$current_mp1"
-    
-    # Remove all existing mountpoints to avoid conflicts
-    echo "Removing existing mountpoints..."
-    for mp in $(echo "$config_output" | awk -F: '/^mp[0-9]+/ {print $1}'); do
-      echo "  deleting $mp"
-      pct_set "$CTID" -delete "$mp"
-    done
-    
-    # Add correct mounts
-    echo "Adding correct bind mounts..."
-    pct_set "$CTID" -mp0 "${DIR_DOCKER},mp=/mnt/docker"
-    pct_set "$CTID" -mp1 "${DIR_DOCKER_DATA},mp=/mnt/docker-data"
-    echo "Mountpoints updated."
-  else
-    echo "Mountpoints already correct:"
-    echo "  mp0: $current_mp0 → /mnt/docker"
-    echo "  mp1: $current_mp1 → /mnt/docker-data"
-    echo "No changes needed."
+  if ! read -r root_uid root_gid < <(get_ct_host_root_ids "$CTID") \
+    || ! node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600 "$root_uid" "$root_gid"; then
+    rm -rf "$stage_dir"
+    return 1
   fi
+  rm -rf "$stage_dir"
 }
 
 # Get hostname-based directory paths

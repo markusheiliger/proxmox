@@ -1,0 +1,23 @@
+[Unit]
+Description=Proxmox node-local instance metadata filesystem
+Requires=pve-cluster.service
+After=local-fs.target pve-cluster.service
+Before=pve-guests.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0755 /run/pve-imds
+ExecStart=/usr/local/libexec/pve-imds/current/execfuse /usr/local/libexec/pve-imds/current/hooks /run/pve-imds -f -oro,allow_other,default_permissions,nodev,nosuid,noexec,fsname=pve-imds,subtype=pve-imds
+ExecStop=/usr/bin/timeout 10 /usr/bin/fusermount -u /run/pve-imds
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+TasksMax=128
+MemoryMax=512M
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

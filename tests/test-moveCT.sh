@@ -189,7 +189,7 @@ assert_output "GPU without render device is classified broken" "STATE broken" \
 
 assert_success "moveCT help parses" bash "${SCRIPT_DIR}/moveCT.sh" --help
 assert_failure_contains "legacy --gpu option is rejected" "Unknown option '--gpu'" bash "${SCRIPT_DIR}/moveCT.sh" --gpu
-if grep -Fq 'resolve_ct_gpu_capability "$CTID" "$TARGET_NODE"' "${SCRIPT_DIR}/moveCT.sh" \
+if grep -Fq 'resolve_ct_gpu_capability "$CTID" "$TARGET_NODE" "$RELEVANT_PROFILE_GROUPS"' "${SCRIPT_DIR}/moveCT.sh" \
   && ! grep -Fq 'detect_node_gpu_capability "$TARGET_NODE"' "${SCRIPT_DIR}/moveCT.sh"; then
   pass "move preflight uses CT-aware GPU capability"
 else
@@ -280,6 +280,108 @@ else
   fail "fallback device parser ignores command redirections"
 fi
 
+original_collect_device_requirements=$(declare -f collect_device_requirements)
+original_remote=$(declare -f remote)
+device_validation_calls="${TEST_ROOT}/device-validation-calls"
+mock_device_requirement=$'frigate\t/dev/dri'
+collect_device_requirements() {
+  DEVICE_REQUIREMENTS=("$mock_device_requirement")
+}
+remote() {
+  printf '%s\t%s\n' "$TARGET_NODE" "$*" >> "$device_validation_calls"
+  [[ "$TARGET_NODE" == pve02 && "$*" == "test -e '/dev/dri'" ]]
+}
+TARGET_NODE=pve02
+NODE_GPU_STATE=available
+: > "$device_validation_calls"
+assert_success "generic DRM passes on a capable remote target" validate_target_devices
+if grep -Fxq $'pve02\ttest -e \'/dev/dri\'' "$device_validation_calls"; then
+  pass "generic DRM existence check uses the selected target"
+else
+  fail "generic DRM existence check uses the selected target"
+fi
+
+for unavailable_state in absent broken; do
+  NODE_GPU_STATE="$unavailable_state"
+  : > "$device_validation_calls"
+  assert_failure_contains "generic DRM rejects ${unavailable_state} target capability" \
+    "requires DRM, but the target has no usable render device" validate_target_devices
+  if [[ ! -s "$device_validation_calls" ]]; then
+    pass "${unavailable_state} DRM rejection occurs before target path probing"
+  else
+    fail "${unavailable_state} DRM rejection occurs before target path probing"
+  fi
+done
+
+original_has_device_free_profile=$(declare -f has_device_free_profile)
+has_device_free_profile() { return 0; }
+NODE_GPU_STATE=absent
+: > "$device_validation_calls"
+assert_success "validated CPU profile permits a target without DRM" validate_target_devices
+if [[ ! -s "$device_validation_calls" ]]; then
+  pass "CPU fallback bypasses irrelevant target DRM path probing"
+else
+  fail "CPU fallback bypasses irrelevant target DRM path probing"
+fi
+eval "$original_has_device_free_profile"
+
+NODE_GPU_STATE=available
+mock_device_requirement=$'frigate\t/dev/bus/usb'
+assert_failure_contains "broad USB remains rejected during move preflight" \
+  "USB device identity cannot be proven on another node" validate_target_devices
+
+eval "$original_collect_device_requirements"
+eval "$original_remote"
+
+original_ct_exec=$(declare -f ct_exec)
+original_compose_file_has_managed_profiles=$(declare -f compose_file_has_managed_profiles)
+profile_validation_calls="${TEST_ROOT}/profile-validation-calls"
+device_free_compose_json='{"services":{"app":{"container_name":"app"}}}'
+ct_exec() {
+  printf '%s\n' "$*" >> "$profile_validation_calls"
+  printf '%s\n' "$device_free_compose_json"
+}
+SOURCE_NODE=pve02
+ORIGINAL_STATUS=running
+DIR_DOCKER=/mnt/docker/app.thesaints.home
+assert_success "device-free profile structure is accepted" has_device_free_profile
+if grep -Fq "COMPOSE_PROFILES=no-discrete-gpu" \
+  "$profile_validation_calls"; then
+  pass "CPU fallback validation renders inside the source CT"
+else
+  fail "CPU fallback validation renders inside the source CT"
+fi
+device_free_compose_json='{"services":{"app":{"container_name":"app","devices":[{"source":"/dev/dri"}]}}}'
+assert_failure "device mapping invalidates CPU fallback profile" has_device_free_profile
+
+compose_file_has_managed_profiles() { return 0; }
+device_free_compose_json='{"services":{"app":{"container_name":"app"}}}'
+: > "$profile_validation_calls"
+assert_success "grouped device-free fallback structure is accepted" has_device_free_profile
+if grep -Fq "COMPOSE_PROFILES='gpu-none'" "$profile_validation_calls"; then
+  pass "managed fallback validation uses the configured default"
+else
+  fail "managed fallback validation uses the configured default"
+fi
+
+ORIGINAL_STATUS=stopped
+assert_failure "stopped CT cannot claim a rendered device-free fallback" has_device_free_profile
+eval "$original_ct_exec"
+eval "$original_compose_file_has_managed_profiles"
+
+SOURCE_NODE=pve01
+DIR_DOCKER=/mnt/docker/app.thesaints.home
+ORIGINAL_STATUS=stopped
+compose_file_has_managed_profiles() { return 0; }
+assert_failure_contains "stopped managed-profile CT move is rejected before mutation" \
+  "cannot be moved safely" validate_stopped_profile_move
+compose_file_has_managed_profiles() { return 1; }
+assert_success "stopped legacy-profile CT remains movable" validate_stopped_profile_move
+ORIGINAL_STATUS=running
+compose_file_has_managed_profiles() { return 0; }
+assert_success "running managed-profile CT remains movable" validate_stopped_profile_move
+eval "$original_compose_file_has_managed_profiles"
+
 assert_output "migration-specific bandwidth overrides default" "2048" \
   parse_migration_bwlimit_kib "default=1024,migration=2048,restore=4096"
 assert_output "default bandwidth applies without migration override" "1024" \
@@ -331,13 +433,15 @@ fi
 MOVE_PHASE=""
 ORIGINAL_MOUNT_KEYS=()
 ORIGINAL_MOUNT_VALUES=()
+CT_NODE["$CTID"]=""
 load_move_state
 if [[ "$MOVE_PHASE" == target_prepared \
   && "${ORIGINAL_MOUNT_VALUES[1]}" == "/mnt/docker-data/app.thesaints.home,mp=/mnt/docker-data" \
-  && "$SOURCE_BRIDGE" == vmbr1 && "$TARGET_BRIDGE" == vmbr2 ]]; then
-  pass "saved move transaction reloads for resume"
+  && "$SOURCE_BRIDGE" == vmbr1 && "$TARGET_BRIDGE" == vmbr2 \
+  && "${CT_NODE[$CTID]}" == pve01 ]]; then
+  pass "saved pre-migration transaction reloads with source ownership"
 else
-  fail "saved move transaction reloads for resume"
+  fail "saved pre-migration transaction reloads with source ownership"
 fi
 
 MOVE_PHASE=mounts_restored
@@ -345,10 +449,19 @@ MOUNT_TRANSACTION_STARTED=false
 save_move_state
 MOUNT_TRANSACTION_STARTED=false
 load_move_state
-if [[ "$MOUNT_TRANSACTION_STARTED" == true ]]; then
-  pass "resumed post-migration rollback remembers detached source mounts"
+if [[ "$MOUNT_TRANSACTION_STARTED" == true && "${CT_NODE[$CTID]}" == pve02 ]]; then
+  pass "resumed post-migration state restores target ownership and detached mounts"
 else
-  fail "resumed post-migration rollback remembers detached source mounts"
+  fail "resumed post-migration state restores target ownership and detached mounts"
+fi
+
+profile_checkpoint_line=$(grep -n 'checkpoint_move profile_tags_reconciled' "${SCRIPT_DIR}/moveCT.sh" | head -1 | cut -d: -f1)
+service_verify_line=$(grep -n 'verify_target_services' "${SCRIPT_DIR}/moveCT.sh" | tail -1 | cut -d: -f1)
+if [[ -n "$profile_checkpoint_line" && -n "$service_verify_line" \
+  && "$profile_checkpoint_line" -lt "$service_verify_line" ]]; then
+  pass "target profile reconciliation checkpoints before Compose verification"
+else
+  fail "target profile reconciliation checkpoints before Compose verification"
 fi
 
 task_commands="${TEST_ROOT}/task-commands"
@@ -428,6 +541,7 @@ pct() {
   fi
 }
 CTID=2200
+CT_HOSTNAME=app.thesaints.home
 SOURCE_NODE=pve01
 TARGET_NODE=pve02
 assert_success "original bind mount values are captured" capture_original_mounts
@@ -462,12 +576,13 @@ fi
 : > "$mount_commands"
 remote() { printf '%s\n' "$*" >> "$mount_commands"; }
 assert_success "target bind mounts restore exactly" restore_target_mounts
-if grep -Fq "pct set '2200' '-mp0' /mnt/docker/app.thesaints.home\,mp=/mnt/docker\,backup=0" "$mount_commands" \
-  && grep -Fq "pct set '2200' '-mp1' /mnt/docker-data/app.thesaints.home\,mp=/mnt/docker-data\,ro=0" "$mount_commands"; then
-  pass "target restore preserves complete mount values"
+if grep -Fq "pct set '2200' '-mp0' /run/pve-imds/2200\,mp=/mnt/pve-imds\,ro=1\,shared=1\,backup=0" "$mount_commands" \
+  && grep -Fq "pct set '2200' '-mp1' /mnt/docker/app.thesaints.home\,mp=/mnt/docker" "$mount_commands" \
+  && grep -Fq "pct set '2200' '-mp2' /mnt/docker-data/app.thesaints.home\,mp=/mnt/docker-data" "$mount_commands"; then
+  pass "target restore applies the canonical three mount values"
 else
   cat "$mount_commands" >&2
-  fail "target restore preserves complete mount values"
+  fail "target restore applies the canonical three mount values"
 fi
 unset -f pct
 
@@ -545,9 +660,8 @@ assert_output "rootfs size is parsed for target capacity" "16" get_ct_rootfs_siz
 capacity_config=$'rootfs: DATA:subvol-2200-disk-0,size=16G\nmp0: /mnt/docker/app.thesaints.home,mp=/mnt/docker\nmp1: /mnt/docker-data/app.thesaints.home,mp=/mnt/docker-data'
 assert_failure_contains "DATA rootfs is rejected for cross-node moves" "must use managed storage 'local-lvm'" \
   validate_ct_storage_scope
-capacity_config=$'rootfs: local-lvm:vm-2200-disk-0,size=16G\nmp0: /srv/unmanaged,mp=/mnt/docker\nmp1: /mnt/docker-data/app.thesaints.home,mp=/mnt/docker-data'
-assert_failure_contains "unmanaged bind sources remain rejected" "unsupported bind mount '/srv/unmanaged'" \
-  validate_ct_storage_scope
+capacity_config=$'rootfs: local-lvm:vm-2200-disk-0,size=16G\nmp0: /mnt/docker/app.thesaints.home,mp=/mnt/docker\nmp1: /mnt/docker-data/app.thesaints.home,mp=/mnt/docker-data\nmp2: /srv/unmanaged,mp=/srv/unmanaged'
+assert_success "unmanaged bind sources are accepted for canonical deletion" validate_ct_storage_scope
 capacity_config='rootfs: local-lvm:vm-2200-disk-0,size=16G'
 assert_failure_contains "move rejects a CT whose required bind mounts are absent" \
   "required bind mount '/mnt/docker/app.thesaints.home,mp=/mnt/docker' is missing" \
@@ -577,7 +691,15 @@ CTID=2200
 CT_HOSTNAME=app.thesaints.home
 
 move_commands="${TEST_ROOT}/move-commands"
-remote() { printf '%s\n' "$*" >> "$move_commands"; }
+remote() {
+  printf '%s\n' "$*" >> "$move_commands"
+  case "$*" in
+    *"config --format json"*)
+      printf '%s\n' '{"services":{"frigate-config-cpu":{"container_name":"frigate-config-cpu","restart":"no"},"frigate-cpu":{"container_name":"frigate-cpu","restart":"always"}}}'
+      ;;
+    *".State.Status"*"frigate-cpu"*) printf '%s\n' running ;;
+  esac
+}
 target_ct_exec --timeout 30 2200 "echo target"
 if grep -Fq "timeout 30 pct exec '2200' -- sh -c echo\\ target" "$move_commands"; then
   pass "target CT executor preserves timeout and CTID"
@@ -587,20 +709,21 @@ else
 fi
 
 : > "$move_commands"
-EXPECTED_SERVICES=""
 reconcile_compose_permissions() { echo "reconcile $*" >> "$move_commands"; }
 if verify_target_services; then
   mapfile -t move_steps < "$move_commands"
-  if [[ "${move_steps[0]}" == *"docker compose config --quiet"* \
+  if [[ "${move_steps[0]}" == *"docker compose config --format json"* \
     && "${move_steps[1]}" == "reconcile 2200" \
-    && "${move_steps[2]}" == *"docker compose up -d"* ]]; then
-    pass "target permissions reconcile before Compose startup"
+    && "${move_steps[2]}" == *"docker compose up -d"* ]] \
+    && [[ "$(grep -c "docker inspect.*frigate-cpu" "$move_commands")" -eq 2 ]] \
+    && ! grep -q "docker inspect.*frigate-config-cpu" "$move_commands"; then
+    pass "target verifies the selected runtime after permissions and startup"
   else
     cat "$move_commands" >&2
-    fail "target permissions reconcile before Compose startup"
+    fail "target verifies the selected runtime after permissions and startup"
   fi
 else
-  fail "target permissions reconcile before Compose startup"
+  fail "target verifies the selected runtime after permissions and startup"
 fi
 
 rollback_commands="${TEST_ROOT}/rollback-commands"

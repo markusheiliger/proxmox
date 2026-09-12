@@ -51,7 +51,7 @@ configure_job >"${TEST_ROOT}/configure-output"
 assert_contains "VM job uses snapshot mode" "${TEST_ROOT}/configure-output" "--mode snapshot"
 assert_contains "VM job uses the midnight schedule" "${TEST_ROOT}/configure-output" "00:00:00"
 assert_contains "VM job contains eligible VMID" "${TEST_ROOT}/configure-output" "--vmid 1000"
-assert_contains "VM job uses shared retention policy" "${TEST_ROOT}/configure-output" "--prune-backups keep-daily=7\,keep-weekly=4\,keep-monthly=6"
+assert_not_contains "VM job inherits storage retention" "${TEST_ROOT}/configure-output" "--prune-backups"
 assert_not_contains "VM job has no workload hook" "${TEST_ROOT}/configure-output" "--script"
 assert_not_contains "VM job has no TEMP staging" "${TEST_ROOT}/configure-output" "--tmpdir"
 

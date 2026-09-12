@@ -50,13 +50,7 @@ Evaluate portability for every proposed optimization, including sizing, placemen
 - **Blocked by missing fallback** — creates a node/device dependency with no functional fallback. Reject the optimization and emit no apply command or prompt that presents the optimization as ready. A separate evidence-backed remediation may still design and validate the missing portable fallback under the rules in section 7.
 - **Unknown** — fallback or destination behavior is unverified. Do not recommend or emit an apply action until verified.
 
-Portable accelerator stacks use generic capability profiles and rediscover hardware on every boot, refresh, and move. Follow the project contract:
-
-- Use capability classes such as `no-discrete-gpu` and `vulkan`, never node names or durable device indices.
-- Keep a functional CPU or generic fallback unless the workload already has an equally portable supported alternative.
-- Let `/mnt/docker/_config/select-compose-profile.sh` select the profile/device dynamically and print exactly `profile|device`.
-- Never persist `COMPOSE_PROFILES`, node identity, PCI identity, or `renderD<N>` in `.env` or Compose configuration.
-- Preserve stable service endpoints across profile variants and use profile-aware lifecycle wrappers.
+Portable accelerator stacks rediscover hardware on every boot, refresh, and move. Capability policy and ordered tests live in `commonCT.json`; workloads declare supported group-qualified values through normal service `profiles:` and provide a functional default variant. Treat `_config/select-compose-profile.sh` as a legacy workload awaiting migration; do not combine it with managed group-qualified service profiles. Never persist `COMPOSE_PROFILES`, node identity, PCI identity, or discovered device indices in `.env`. Preserve stable service endpoints across profile variants and use profile-aware lifecycle wrappers.
 
 `ai.thesaints.home` is the canonical pattern: Ollama may select Vulkan where compatible hardware exists and automatically select the CPU profile elsewhere. Model/data storage and the service endpoint remain portable; the current node and render index are not durable identity. Treat this as an architectural example, not evidence that every workload benefits from acceleration.
 
@@ -248,13 +242,13 @@ Each prompt action must stay within one owner's contract. Create separate prompt
 
 For each prompt action, emit one focused copy/paste prompt. The prompt must:
 
-- Begin with `/plan` as the first token so copying the complete block into VS Code Chat invokes the built-in Plan agent.
+- Contain exactly one `text` fence whose first bytes are `/plan `, with no leading whitespace, blank line, prose, or Markdown. This literal first token is what invokes the built-in Plan agent when the complete block is copied into VS Code Chat.
 - Request a planning-only response. Explicitly prohibit file edits, lifecycle or apply commands, and any other implementation until the operator uses the native **Start Implementation** handoff.
 - Identify the CT by hostname and CTID.
 - State the desired outcome, relevant evidence, and measurable acceptance criteria.
 - Require preservation of CT movability and automatic fallback where hardware is involved.
 - Require the Plan agent to inspect applicable files and project instructions, resolve material ambiguities, and present an implementation-ready plan with affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification.
-- Keep the response in planning for user refinement or the native **Start Implementation** handoff. That handoff is the only transition requested by the generated prompt; prose such as "plan first" or "wait for confirmation" without the leading `/plan` and planning-only guard is insufficient.
+- Keep the response in planning for user refinement or the native **Start Implementation** handoff. That handoff is the only transition requested by the generated prompt. Mentioning "plan," "planning-only," approval, or **Start Implementation** anywhere else in the prompt does not replace the literal leading `/plan ` token and planning-only guard.
 - Preserve secrets and exclude unrelated changes.
 - Be outcome-oriented rather than prescribing unverified implementation details.
 - Contain one cohesive issue owned by exactly one workflow.
@@ -449,7 +443,7 @@ End the complete report with a truthful write-status disclaimer:
 
 ### Publication
 
-Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, inline-action adjacency, unique action titles, dependency resolution, ownership, lifecycle syntax against both script and guide, secret redaction, and the final disclaimer. Then create or replace only `/root/scripts/todos/optimization.md` in one file-edit operation. Never publish incrementally.
+Before writing, assemble and validate the entire document in memory. Check counts, anchors, ordering, inline-action adjacency, unique action titles, dependency resolution, ownership, lifecycle syntax against both script and guide, secret redaction, and the final disclaimer. Parse every action record independently. Every `Type: prompt` action must have exactly one `text` fence, no `sh` fence, and content beginning at byte zero with `/plan ` followed immediately by the owner-specific prefix. It must also contain the planning-only prohibition and native **Start Implementation** handoff. Every lifecycle action must have exactly one `sh` fence and no `text` fence. The number of valid `/plan ` prompt fences must equal the number of prompt action records; a global substring or line count is not sufficient. Reject publication and preserve the previous report if any check fails. Then create or replace only `/root/scripts/todos/optimization.md` in one file-edit operation. Never publish incrementally.
 
 After successful publication, return a concise summary and link to `[todos/optimization.md](todos/optimization.md)`. If publication fails, report the error and provide the complete Markdown in chat without claiming the file was updated.
 
@@ -474,7 +468,7 @@ Before returning the report, confirm:
 - Every guest OS target and each intermediate chain release/repository has matching `upgrade verified` Recon evidence and independent parent attestation, including workload and lifecycle-parser compatibility. No numerically synthesized chain produced a recommendation.
 - Every actionable security upgrade is backed by an existing published authoritative advisory whose affected range matches the verified deployment and whose named fixed version has an attested exact artifact; retrieval/tool success alone was never treated as source evidence.
 - Every failed, inaccessible, contradictory, nonmatching, or incomplete version/advisory/artifact/chain check is reported as `unverified — no recommendation` with no synthesized target, apply-ready prompt, lifecycle command, or blocked refresh that implies an upgrade exists.
-- Every actionable finding has one or more adjacent inline actions. Every action has one type, one owner, a stable unique title, an explicit relationship, and one cohesive purpose; prompt actions begin with `/plan` and invoke the declared owner, while rejected, unverified, blocked, unknown, unchanged, and incomplete findings use `**Actions:** None — <reason>` and have no code block.
+- Every actionable finding has one or more adjacent inline actions. Every action has one type, one owner, a stable unique title, an explicit relationship, and one cohesive purpose; each prompt action has exactly one `text` fence beginning at byte zero with `/plan `, invokes the declared owner immediately after that token, and includes the planning-only and native **Start Implementation** guards. Prompt prose alone never satisfies this check. Rejected, unverified, blocked, unknown, unchanged, and incomplete findings use `**Actions:** None — <reason>` and have no code block.
 - Every CT-level and unique cluster-level prompt requests affected files, ordered changes, dependencies, scope boundaries, and specific automated and manual verification; requires planning content only with no edits, lifecycle/apply commands, or implementation; and remains in planning for refinement or the native **Start Implementation** handoff.
 - No rootfs shrink or unsupported flag is proposed.
 - Every finding states severity, evidence, why it matters, how to fix it, portability, prerequisites, risk/rollback, downtime, confidence, and its adjacent actions or specific no-action reason.

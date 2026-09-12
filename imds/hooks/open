@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/hook-common.sh"
+
+imds_parse_file_path "${1:-}" || exit 2
+imds_ct_is_local "$IMDS_CTID" || exit 2

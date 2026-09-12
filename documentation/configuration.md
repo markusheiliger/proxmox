@@ -23,12 +23,13 @@ The configuration currently covers these concerns:
 - `sizes`: named CPU and memory allocations.
 - `ssl`: certificate issuer settings and domain-specific policy.
 - `registries`: container registry credentials.
-- `newt`: connectivity settings consumed by relevant workloads.
 - `udmpro`: network controller integration.
 - `authentik`: authentication host, API access, and flow slugs.
 - `telemetry`: central telemetry endpoints and identity settings.
 - `splitdns`: split-DNS service and domain policy.
-- `backup`: storage, staging, retention, and snapshot policy.
+- `backup`: CT/VM storage and schedules, TEMP staging, and shared exclusion
+  tags. `backup.exclude` defaults to `["no-backup"]`; the internal
+  `backup-restore-test` tag is always excluded as a safety invariant.
 
 Use the `config_get_*` and `config_*_configured` functions in `commonCT.sh`
 instead of parsing the file independently. Validation functions fail before

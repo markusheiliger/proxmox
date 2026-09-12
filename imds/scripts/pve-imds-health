@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNTPOINT=/run/pve-imds
+WAIT=false
+case "${1:-}" in
+  "") ;;
+  --wait) WAIT=true ;;
+  *) echo "Usage: pve-imds-health [--wait]" >&2; exit 64 ;;
+esac
+[[ $# -le 1 ]] || exit 64
+
+if [[ "$WAIT" == true ]]; then
+  deadline=$((SECONDS + 15))
+  until systemctl is-active --quiet pve-imds.service && mountpoint -q "$MOUNTPOINT"; do
+    ((SECONDS < deadline)) || { echo "ERROR: pve-imds did not become ready." >&2; exit 1; }
+    sleep 0.1
+  done
+fi
+
+systemctl is-active --quiet pve-imds.service || { echo "ERROR: pve-imds.service is not active." >&2; exit 1; }
+filesystem="$(findmnt -rn -o FSTYPE --target "$MOUNTPOINT")"
+[[ "$filesystem" == fuse.pve-imds ]] || { echo "ERROR: unexpected filesystem at ${MOUNTPOINT}: ${filesystem}" >&2; exit 1; }
+options="$(findmnt -rn -o OPTIONS --target "$MOUNTPOINT")"
+[[ ",$options," == *,ro,* ]] || { echo "ERROR: ${MOUNTPOINT} is not read-only." >&2; exit 1; }
+
+local_ctids_output=$(
+  find "$MOUNTPOINT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | sed -n '/^[1-9][0-9]\{0,8\}$/p' \
+    | sort -n
+)
+mapfile -t local_ctids <<<"$local_ctids_output"
+ctid="${local_ctids[0]:-}"
+if [[ -n "$ctid" ]]; then
+  timeout 10 jq -e 'type == "object"' "$MOUNTPOINT/$ctid/metadata.json" >/dev/null
+  timeout 10 jq -e 'type == "array" and all(.[]; type == "string")' \
+    "$MOUNTPOINT/$ctid/profiles.json" >/dev/null
+fi
+
+echo "pve-imds is healthy on $(hostname -s)."

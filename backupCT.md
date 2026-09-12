@@ -27,6 +27,10 @@ source CT's node. `--force` skips restore confirmation.
 For `--cleanup-stale`, `--force` bypasses only the 24-hour age guard. Mutating
 actions support `--dry-run`.
 
+An isolated restore mounts IMDS for the temporary restore CTID at read-only
+`mp0`, the restored Docker tree at `mp1`, and the restored Docker-data tree at
+`mp2`.
+
 ## Initial setup
 
 Run setup in this order from one Proxmox host:

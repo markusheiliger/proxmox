@@ -55,12 +55,12 @@ cluster_vm_ids() {
 }
 
 backup_storage_mount() {
-  printf '%s/%s\n' "${BACKUP_MOUNT_ROOT:-/mnt/pve}" "$(config_get_backup_storage)"
+  printf '%s/%s\n' "${BACKUP_MOUNT_ROOT:-/mnt/pve}" "$(config_get_backup_vm_storage)"
 }
 
 verify_backup_storage_nodes() {
   local requested_node="${1:-}" storage node status failed=false
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_vm_storage)
   while IFS= read -r node; do
     [[ -z "$requested_node" || "$node" == "$requested_node" ]] || continue
     status=$(pvesh get "/nodes/${node}/storage/${storage}/status" --output-format json 2>/dev/null || true)
@@ -94,15 +94,14 @@ resolve_cluster_vm() {
 }
 
 configure_job() {
-  local job_id storage schedule repeat_missed compress prune_policy
-    verify_backup_storage_nodes
+  local job_id storage schedule repeat_missed compress
+  verify_backup_storage_nodes
   local bwlimit ionice notification_mode vmids enabled_value repeat_value
   job_id=$(config_get_backup_vm_job_id)
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_vm_storage)
   schedule=$(config_get_backup_vm_schedule)
   repeat_missed=$(config_get_backup_vm_repeat_missed)
   compress=$(config_get_backup_compress)
-  prune_policy=$(config_get_backup_prune_policy)
   bwlimit=$(config_get_backup_bwlimit_kib)
   ionice=$(config_get_backup_ionice)
   notification_mode=$(config_get_backup_notification_mode)
@@ -126,7 +125,6 @@ configure_job() {
 
   local arguments=(--storage "$storage" --mode "$(config_get_backup_vm_mode)" --compress "$compress"
     --schedule "$schedule" --repeat-missed "$repeat_value" --enabled "$enabled_value" --vmid "$vmids"
-    --prune-backups "$prune_policy"
     --ionice "$ionice" --notification-mode "$notification_mode")
   (( bwlimit == 0 )) || arguments+=(--bwlimit "$bwlimit")
   if [[ "$DRY_RUN" == true ]]; then
@@ -177,7 +175,7 @@ run_backup() {
     resolve_cluster_vm "$target"
     selected=("$VMID")
   fi
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_vm_storage)
   mode=$(config_get_backup_vm_mode)
   compress=$(config_get_backup_compress)
   bwlimit=$(config_get_backup_bwlimit_kib)
@@ -219,7 +217,7 @@ verify_archives() {
     else
       echo "OK VM ${vmid} (${name}): $(basename "$archive")"
     fi
-  done < <(jq -r --argjson excluded "$(config_get_backup_exclude_tags)" '.[]
+  done < <(jq -r --argjson excluded "$(backup_effective_exclude_tags)" '.[]
     | select(.type == "qemu")
     | select(((.tags // "") | split(";")) as $tags
         | all($excluded[]; . as $tag | ($tags | index($tag)) == null))

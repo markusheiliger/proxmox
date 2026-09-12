@@ -27,13 +27,3 @@ services:
       caddy.acme_dns: dnsimple
       caddy.acme_dns.api_access_token: "{env.DNSIMPLE_API_ACCESS_TOKEN}"
       caddy.acme_dns.account_id: "{env.DNSIMPLE_ACCOUNT_ID}"
-
-  # Newt tunnel for external access via Pangolin
-  newt:
-    container_name: newt
-    restart: always
-    image: fosrl/newt
-    environment:
-      NEWT_ID: ${NEWT_ID}
-      NEWT_SECRET: ${NEWT_SECRET}
-      NEWT_ENDPOINT: ${NEWT_ENDPOINT}

@@ -9,9 +9,7 @@ fi
 
 BACKUP_CT_JOB_ID="${BACKUP_CT_JOB_ID:-}"
 BACKUP_VM_JOB_ID="${BACKUP_VM_JOB_ID:-}"
-BACKUP_VM_ENABLED="${BACKUP_VM_ENABLED:-true}"
 BACKUP_EXCLUDE_TAGS="${BACKUP_EXCLUDE_TAGS:-no-backup,backup-restore-test}"
-BACKUP_PRUNE_POLICY="${BACKUP_PRUNE_POLICY:-}"
 BACKUP_STORAGE="${BACKUP_STORAGE:-SYNOLOGY}"
 BACKUP_MOUNT="${BACKUP_MOUNT:-/mnt/pve/${BACKUP_STORAGE}}"
 BACKUP_HEALTH_LIB="${BACKUP_HEALTH_LIB:-/usr/local/lib/pve-backup/lib-backup-health.sh}"
@@ -30,9 +28,7 @@ validate_policy() {
   [[ "$BACKUP_CT_JOB_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "Invalid CT backup job ID."
   [[ "$BACKUP_VM_JOB_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "Invalid VM backup job ID."
   [[ "$BACKUP_CT_JOB_ID" != "$BACKUP_VM_JOB_ID" ]] || fail "CT and VM backup job IDs must differ."
-  [[ "$BACKUP_VM_ENABLED" == true || "$BACKUP_VM_ENABLED" == false ]] || fail "BACKUP_VM_ENABLED must be true or false."
   [[ -n "$BACKUP_EXCLUDE_TAGS" ]] || fail "BACKUP_EXCLUDE_TAGS must not be empty."
-  [[ -n "$BACKUP_PRUNE_POLICY" ]] || fail "BACKUP_PRUNE_POLICY must not be empty."
 }
 
 is_elected_node() {
@@ -57,30 +53,25 @@ resource_ids() {
 }
 
 reconcile_job() {
-  local resource_type="$1" job_id="$2" policy_enabled="$3" resources="$4"
-  local current vmids desired_enabled current_enabled current_vmids desired_prune_policy retention_current=false
+  local resource_type="$1" job_id="$2" resources="$3"
+  local current vmids desired_enabled current_enabled current_vmids
   current=$(pvesh get "/cluster/backup/${job_id}" --output-format json 2>/dev/null) || {
     echo "Backup job ${job_id} does not exist; skipping membership reconciliation."
     return 0
   }
   vmids=$(resource_ids "$resource_type" "$resources") || return 1
   desired_enabled=0
-  [[ "$policy_enabled" == true && -n "$vmids" ]] && desired_enabled=1
+  [[ -n "$vmids" ]] && desired_enabled=1
   current_enabled=$(jq -r '.enabled // 1' <<<"$current")
   current_vmids=$(jq -r '.vmid // ""' <<<"$current")
-  desired_prune_policy=$(jq -cn --arg policy "$BACKUP_PRUNE_POLICY" '
-    $policy | split(",") | map(split("=") | {(.[0]): .[1]}) | add')
-  if jq -e --argjson desired "$desired_prune_policy" '.["prune-backups"] == $desired' <<<"$current" >/dev/null; then
-    retention_current=true
-  fi
-  if [[ "$current_enabled" == "$desired_enabled" && "$retention_current" == true && ( -z "$vmids" || "$current_vmids" == "$vmids" ) ]]; then
+  if [[ "$current_enabled" == "$desired_enabled" && ( -z "$vmids" || "$current_vmids" == "$vmids" ) ]]; then
     echo "Backup job ${job_id} selection is current."
     return 0
   fi
   if [[ -n "$vmids" ]]; then
-    pvesh set "/cluster/backup/${job_id}" --vmid "$vmids" --enabled "$desired_enabled" --prune-backups "$BACKUP_PRUNE_POLICY" >/dev/null
+    pvesh set "/cluster/backup/${job_id}" --vmid "$vmids" --enabled "$desired_enabled" >/dev/null
   else
-    pvesh set "/cluster/backup/${job_id}" --enabled 0 --prune-backups "$BACKUP_PRUNE_POLICY" >/dev/null
+    pvesh set "/cluster/backup/${job_id}" --enabled 0 >/dev/null
   fi
   echo "Reconciled backup job ${job_id}: enabled=${desired_enabled} vmids=${vmids:-none}."
 }
@@ -93,8 +84,8 @@ main() {
     return 0
   fi
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
-  reconcile_job lxc "$BACKUP_CT_JOB_ID" true "$resources" || failed=true
-  reconcile_job qemu "$BACKUP_VM_JOB_ID" "$BACKUP_VM_ENABLED" "$resources" || failed=true
+  reconcile_job lxc "$BACKUP_CT_JOB_ID" "$resources" || failed=true
+  reconcile_job qemu "$BACKUP_VM_JOB_ID" "$resources" || failed=true
   check_stale_backup_locks "$resources" "$BACKUP_MOUNT" || failed=true
   [[ "$failed" == false ]]
 }

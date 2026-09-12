@@ -22,6 +22,45 @@ assert_not_contains() {
 source "${SCRIPT_DIR}/refreshCT.sh"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
+if parse_refresh_args --all \
+  && [[ "$REFRESH_ALL" == true && -z "$REFRESH_CT_ARG" && "$REFRESH_HAS_OPTIONS" == false ]]; then
+  pass "--all selects non-interactive fleet refresh"
+else
+  fail "--all selects non-interactive fleet refresh"
+fi
+if parse_refresh_args --all app.thesaints.home >"${TEST_ROOT}/args.out" 2>&1; then
+  fail "--all rejects an explicit CT target"
+elif grep -Fq -- '--all cannot be combined' "${TEST_ROOT}/args.out"; then
+  pass "--all rejects an explicit CT target"
+else
+  cat "${TEST_ROOT}/args.out" >&2
+  fail "--all rejects an explicit CT target"
+fi
+if parse_refresh_args --all --reset >"${TEST_ROOT}/args.out" 2>&1; then
+  fail "--all rejects destructive single-CT options"
+elif grep -Fq -- '--all cannot be combined' "${TEST_ROOT}/args.out"; then
+  pass "--all rejects destructive single-CT options"
+else
+  cat "${TEST_ROOT}/args.out" >&2
+  fail "--all rejects destructive single-CT options"
+fi
+if parse_refresh_args --memory >"${TEST_ROOT}/args.out" 2>&1; then
+  fail "missing option value is rejected"
+elif grep -Fq 'requires a value' "${TEST_ROOT}/args.out"; then
+  pass "missing option value is rejected"
+else
+  cat "${TEST_ROOT}/args.out" >&2
+  fail "missing option value is rejected"
+fi
+MONITOR_AFTER=false
+RESET=false
+
+if declare -f run_on_node | grep -Fq 'ssh -n -o BatchMode=yes'; then
+  pass "remote owner-node execution cannot consume caller stdin"
+else
+  fail "remote owner-node execution cannot consume caller stdin"
+fi
+
 upload_source="${TEST_ROOT}/upload.env"
 upload_log="${TEST_ROOT}/upload.log"
 printf 'KEY=value\n' > "$upload_source"
@@ -36,6 +75,54 @@ SCRIPT_DIR="$SCRIPT_DIR" UPLOAD_LOG="$upload_log" UPLOAD_SOURCE="$upload_source"
 assert_contains "CT upload stages remote source privately" "$upload_log" "node_upload_file pve02 $upload_source /tmp/ct-upload-2700-"
 assert_contains "CT upload creates mapped root-owned file" "$upload_log" "pct push 2700 /tmp/ct-upload-2700-"
 assert_contains "CT upload atomically replaces destination" "$upload_log" "pct exec 2700 -- mv -f -- /mnt/docker/.env.tmp."
+
+pct_config() { printf '%s\n' 'unprivileged: 1'; }
+if [[ "$(get_ct_host_root_ids 2200)" == "100000 100000" ]]; then
+  pass "default unprivileged root IDs map to 100000"
+else
+  fail "default unprivileged root IDs map to 100000"
+fi
+pct_config() { printf '%s\n' $'unprivileged: 1\nlxc.idmap: u 0 200000 65536\nlxc.idmap: g 0 300000 65536'; }
+if [[ "$(get_ct_host_root_ids 2200)" == "200000 300000" ]]; then
+  pass "custom unprivileged root IDs are parsed from lxc.idmap"
+else
+  fail "custom unprivileged root IDs are parsed from lxc.idmap"
+fi
+pct_config() { printf '%s\n' 'unprivileged: 0'; }
+if [[ "$(get_ct_host_root_ids 2200)" == "0 0" ]]; then
+  pass "privileged CT root IDs remain host root"
+else
+  fail "privileged CT root IDs remain host root"
+fi
+unset -f pct_config
+
+setup_log="${TEST_ROOT}/setup-mountpoints.log"
+SCRIPT_DIR="$SCRIPT_DIR" SETUP_LOG="$setup_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  CTID=2200
+  CT_HOSTNAME=app.thesaints.home
+  get_ct_owner_node() { printf "pve02\n"; }
+  node_mkdir() { :; }
+  node_path_is_file() { [[ "$2" == */docker-compose.yaml ]]; }
+  update_env_file() { printf "KEY=value\n" > "$1"; }
+  get_ct_host_root_ids() { printf "100000 100000\n"; }
+  node_upload_file() { printf "node_upload_file %s\n" "$*" >> "$SETUP_LOG"; }
+  reconcile_ct_mountpoints() { printf "reconcile %s\n" "$*" >> "$SETUP_LOG"; }
+  setup_mountpoints >/dev/null
+'
+assert_contains "mount setup reconciles mounts" "$setup_log" \
+  "reconcile 2200 app.thesaints.home"
+assert_contains "mount setup publishes env with mapped CT ownership" "$setup_log" \
+  "node_upload_file pve02"
+assert_contains "mount setup targets the host Docker tree with mapped IDs" "$setup_log" \
+  "/mnt/docker/app.thesaints.home/.env 0600 100000 100000"
+if [[ "$(grep -nE '^(reconcile|node_upload_file)' "$setup_log" | cut -d: -f2- | paste -sd, -)" \
+  == reconcile\ 2200\ app.thesaints.home,node_upload_file\ pve02* ]]; then
+  pass "mount setup reconciles before mapped env publication"
+else
+  cat "$setup_log" >&2
+  fail "mount setup reconciles before mapped env publication"
+fi
 
 restore_guard_line=$(grep -n 'if ct_has_tag "$CTID" backup-restore-test' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
 storage_check_line=$(grep -n 'check_ct_storage_health "${CTID}" warn' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
@@ -265,64 +352,54 @@ assert_contains "second initializer completes" "$multiple_output" "Initializatio
 gpu_commands="${TEST_ROOT}/gpu-commands"
 get_ct_owner_node() { echo pve02; }
 get_ct_status() { echo stopped; }
-managed_gpu_marker=false
-node_path_is_file() {
-  [[ "$managed_gpu_marker" == true \
-    && "$1" == pve02 \
-    && "$2" == /mnt/docker/mqtt.thesaints.home/_config/disable-managed-gpu ]]
-}
 run_on_node() { printf 'run_on_node' >> "$gpu_commands"; printf ' %q' "$@" >> "$gpu_commands"; printf '\n' >> "$gpu_commands"; }
 run_node_shell() { printf 'run_node_shell' >> "$gpu_commands"; printf ' %q' "$@" >> "$gpu_commands"; printf '\n' >> "$gpu_commands"; }
 NODE_GPU_STATE=available
 NODE_GPU_RENDER_DEVICES=(/dev/dri/renderD128)
+NODE_GPU_NVIDIA_DEVICES=(/dev/nvidia0 /dev/nvidiactl)
+NODE_GPU_NVIDIA_MAJORS=(195 195)
+NODE_GPU_NVIDIA_MINORS=(0 255)
+NODE_GPU_NVIDIA_GIDS=(44 44)
 if reconcile_stopped_ct_gpu_config 3500 > /dev/null; then
   assert_contains "GPU config removal runs on owner node" "$gpu_commands" "run_on_node pve02 sed -i"
   assert_contains "GPU config append runs on owner node" "$gpu_commands" "run_node_shell pve02"
   assert_contains "GPU config targets owner-local LXC path" "$gpu_commands" "/etc/pve/lxc/3500.conf"
+  assert_contains "NVIDIA cgroup uses discovered major" "$gpu_commands" "c\\ 195:\*\\ rwm"
+  assert_contains "NVIDIA device bind uses stable guest path" "$gpu_commands" "/dev/nvidia0\\ dev/nvidia0"
 else
   fail "GPU config mutation is owner-routed"
 fi
 
 : > "$gpu_commands"
-CT_HOSTNAME=mqtt.thesaints.home
-managed_gpu_marker=true
+NODE_GPU_STATE=absent
 if reconcile_stopped_ct_gpu_config 2400 > /dev/null; then
-  assert_contains "marker GPU reconciliation removes managed DRM" "$gpu_commands" "run_on_node pve02 sed -i"
-  assert_not_contains "marker GPU reconciliation does not append DRM" "$gpu_commands" "run_node_shell"
+  assert_contains "irrelevant GPU reconciliation removes managed DRM" "$gpu_commands" "run_on_node pve02 sed -i"
+  assert_not_contains "irrelevant GPU reconciliation does not append DRM" "$gpu_commands" "run_node_shell"
 else
-  fail "marker GPU reconciliation removes managed DRM"
+  fail "irrelevant GPU reconciliation removes managed DRM"
 fi
 gpu_probe_called=false
 detect_node_gpu_capability() { gpu_probe_called=true; return 1; }
-if resolve_ct_gpu_capability 2400 pve02 \
+if resolve_ct_gpu_capability 2400 pve02 "" \
    && [[ "$NODE_GPU_STATE" == "absent" && "$gpu_probe_called" == false ]]; then
-  pass "marker GPU capability skips node probing"
+  pass "irrelevant GPU capability skips node probing"
 else
-  fail "marker GPU capability skips node probing"
+  fail "irrelevant GPU capability skips node probing"
 fi
 
-: > "$gpu_commands"
-CT_HOSTNAME=ca.thesaints.home
-managed_gpu_marker=false
-if reconcile_stopped_ct_gpu_config 2700 > /dev/null; then
-  assert_contains "CA GPU reconciliation removes managed DRM" "$gpu_commands" "run_on_node pve02 sed -i"
-  assert_not_contains "CA GPU reconciliation does not append DRM" "$gpu_commands" "run_node_shell"
+gpu_finalize_output=$(finalize_ct_gpu_capability 2700 pve02 "")
+if [[ "$gpu_finalize_output" == *"GPU profile group is not used"* ]]; then
+  pass "irrelevant GPU finalization is skipped"
 else
-  fail "CA GPU reconciliation removes managed DRM"
-fi
-gpu_finalize_output=$(finalize_ct_gpu_capability 2700 pve02)
-if [[ "$gpu_finalize_output" == *"managed GPU passthrough is disabled"* ]]; then
-  pass "CA GPU finalization is skipped"
-else
-  fail "CA GPU finalization is skipped"
+  fail "irrelevant GPU finalization is skipped"
 fi
 gpu_probe_called=false
 detect_node_gpu_capability() { gpu_probe_called=true; return 1; }
-if resolve_ct_gpu_capability 2700 pve02 \
-   && [[ "$NODE_GPU_STATE" == "absent" && "$gpu_probe_called" == false ]]; then
-  pass "CA GPU capability skips node probing"
+if ! resolve_ct_gpu_capability 2700 pve02 gpu \
+   && [[ "$gpu_probe_called" == true ]]; then
+  pass "relevant GPU capability probes the owner node"
 else
-  fail "CA GPU capability skips node probing"
+  fail "relevant GPU capability probes the owner node"
 fi
 CT_HOSTNAME=""
 
@@ -384,17 +461,9 @@ EOF
 
 optional_env=$(run_optional_env_case optional 'environment: ["CADDY_EMAIL=${CADDY_EMAIL}", "NEWT_ID=${NEWT_ID}", "NEWT_SECRET=${NEWT_SECRET}", "NEWT_ENDPOINT=${NEWT_ENDPOINT}"]')
 assert_contains "referenced Caddy email is retained" "$optional_env" "CADDY_EMAIL=admin@example.test"
-assert_contains "referenced Newt ID is retained" "$optional_env" "NEWT_ID=existing-id"
-assert_contains "referenced Newt secret is retained" "$optional_env" "NEWT_SECRET=existing-secret"
-assert_contains "referenced Newt endpoint is retained" "$optional_env" "NEWT_ENDPOINT=https://existing.example.test"
-
-config_get_newt_id() { echo configured-id; }
-config_get_newt_secret() { echo configured-secret; }
-config_get_newt_endpoint() { echo https://configured.example.test; }
-configured_optional_env=$(run_optional_env_case configured-optional 'environment: ["NEWT_ID=${NEWT_ID}", "NEWT_SECRET=${NEWT_SECRET}", "NEWT_ENDPOINT=${NEWT_ENDPOINT}"]')
-assert_contains "configured Newt ID replaces the existing value" "$configured_optional_env" "NEWT_ID=configured-id"
-assert_contains "configured Newt secret replaces the existing value" "$configured_optional_env" "NEWT_SECRET=configured-secret"
-assert_contains "configured Newt endpoint replaces the existing value" "$configured_optional_env" "NEWT_ENDPOINT=https://configured.example.test"
+assert_not_contains "referenced retired Newt ID is removed" "$optional_env" "NEWT_ID="
+assert_not_contains "referenced retired Newt secret is removed" "$optional_env" "NEWT_SECRET="
+assert_not_contains "referenced retired Newt endpoint is removed" "$optional_env" "NEWT_ENDPOINT="
 
 unused_optional_env=$(run_optional_env_case unused-optional 'services: {}')
 assert_not_contains "unreferenced Caddy email is removed" "$unused_optional_env" "CADDY_EMAIL="
@@ -405,10 +474,13 @@ assert_not_contains "unreferenced Newt comment is removed" "$unused_optional_env
 
 compose_up_source=$(declare -f compose_up)
 if [[ "$compose_up_source" == *'update_env_file "$stage_env"'* ]] \
+   && [[ "$compose_up_source" == *'get_ct_host_root_ids "$ctid"'* ]] \
+   && [[ "$compose_up_source" == *'node_upload_file "$node" "$stage_env" "$env_file" 0600 "$root_uid" "$root_gid"'* ]] \
+   && [[ "$compose_up_source" != *'ct_upload_file "$ctid" "$stage_env"'* ]] \
    && [[ "$compose_up_source" != *'set_or_add_env "NEWT_ID"'* ]]; then
-  pass "Compose startup reuses centralized environment reconciliation"
+  pass "Compose startup reuses centralized mapped environment publication"
 else
-  fail "Compose startup reuses centralized environment reconciliation"
+  fail "Compose startup reuses centralized mapped environment publication"
 fi
 
 http_env=$(run_otlp_env_case http 'environment: ["OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT}", "OTEL_EXPORTER_OTLP_PROTOCOL=${OTEL_EXPORTER_OTLP_PROTOCOL}"]')

@@ -1,6 +1,6 @@
 ---
 name: ct-compose
-description: Multi-step workflow to plan, confirm, and implement or remediate a Docker Compose application stack for a Proxmox CT identified by hostname or CTID. Use for new or updated CT workloads, image selection, health/readiness, Caddy/TLS exposure, Authentik authentication, initialization services, secrets, permissions, storage mapping, and portable GPU/Vulkan hardware profiles with automatic fallback.
+description: Multi-step workflow to plan, confirm, and implement or remediate a Docker Compose application stack for a Proxmox CT identified by hostname or CTID. Use for new or updated CT workloads, image selection, health/readiness, Caddy/TLS exposure, Authentik authentication, initialization services, secrets, permissions, and storage mapping. Route grouped hardware profile selection to ct-compose-profiles.
 ---
 
 # Configure CT Compose
@@ -24,7 +24,7 @@ When optimization context is supplied, verify it against the current workload an
 
 ## Ownership boundaries
 
-This skill owns Compose application structure and readiness, including portable profile variants and selectors. Full application telemetry reconciliation belongs to `ct-telemetry`; keep ordinary `container_name` and Compose compatibility work here, but split native OTLP, scrape-sidecar, telemetry migration, duplicate-shipping, and telemetry garbage-collection work into that skill.
+This skill owns ordinary Compose application structure and readiness. Grouped hardware service profiles, accelerator variants, central capability policy, and fallback remediation belong to `ct-compose-profiles`. Full application telemetry reconciliation belongs to `ct-telemetry`; keep ordinary `container_name` and Compose compatibility work here, but split native OTLP, scrape-sidecar, telemetry migration, duplicate-shipping, and telemetry garbage-collection work into that skill.
 
 Host or LXC device exposure, lifecycle-script changes, central Telegraf/Proxmox resource telemetry, and node preparation are outside this skill. Report them as separate prerequisites under their applicable repository instructions rather than editing them as part of a Compose remediation.
 

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/../lib/hook-common.sh"
+
+emit_entry() {
+  imds_emit_stat "$1" "$2" "$3" "$4" "$5"
+  printf '\0'
+}
+
+path="${1:-}"
+if [[ "$path" == / ]]; then
+  emit_entry 1 dr-xr-xr-x 2 0 .
+  emit_entry 1 dr-xr-xr-x 2 0 ..
+  local_ctids="$(imds_list_local_ctids)" || exit 5
+  while IFS= read -r ctid; do
+    [[ -n "$ctid" ]] || continue
+    emit_entry "$(imds_dir_inode "$ctid")" dr-xr-xr-x 2 0 "$ctid"
+  done <<<"$local_ctids"
+  exit 0
+fi
+
+if imds_parse_ct_path "$path"; then
+  imds_ct_is_local "$IMDS_CTID" || exit 2
+  emit_entry "$(imds_dir_inode "$IMDS_CTID")" dr-xr-xr-x 2 0 .
+  emit_entry 1 dr-xr-xr-x 2 0 ..
+  for kind in metadata profiles; do
+    output="$(mktemp)"
+    trap 'rm -f "$output"' EXIT
+    imds_generate_to_file "$kind" "$IMDS_CTID" "$output" || exit 5
+    size="$(stat -c %s "$output")"
+    emit_entry "$(imds_file_inode "$IMDS_CTID" "$kind")" -r--r--r-- 1 "$size" "${kind}.json"
+    rm -f "$output"
+    trap - EXIT
+  done
+  exit 0
+fi
+
+exit 2

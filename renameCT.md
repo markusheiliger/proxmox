@@ -53,6 +53,10 @@ Renaming rewrites textual occurrences in `commonCT.json` and every affected
 telemetry, and TLS identity; refreshing the rest propagates shared references.
 Backup workload history is renamed when present.
 
+While the CT is stopped, rename reconciles IMDS to read-only `mp0` using the
+unchanged CTID, the renamed Docker tree to `mp1`, and the renamed Docker-data
+tree to `mp2`. A successful rename removes unrelated `mpN` entries.
+
 ## Recovery
 
 This is a coordinated sequence, not a fully automatic rollback transaction. If

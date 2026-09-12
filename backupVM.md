@@ -33,9 +33,8 @@ its timer on every online node. Configure both jobs from one Proxmox host:
 ./backupVM.sh --verify
 ```
 
-Policy comes from `commonCT.json`. The QEMU job has its own ID, schedule, mode,
-and restore storage under `backup.vm`; storage, compression, bandwidth,
-notification, retention, and exclusion tags are shared.
+Policy comes from `commonCT.json`. `backup.vm` selects the QEMU destination and
+schedule, while `backup.exclude` lists tags omitted from both CT and VM jobs.
 
 Job configuration requires the configured backup storage to report active on
 every online cluster node. Immediate backups repeat that check for the VM's
@@ -61,8 +60,9 @@ recovery-key boot path has been explicitly accepted.
 ## Selection
 
 Both jobs use exact VMID lists. Eligible QEMU guests are cluster resources of
-type `qemu` without any configured exclusion tag. By default,
-`no-backup` and `backup-restore-test` are excluded.
+type `qemu` without any configured exclusion tag. `backup.exclude` defaults to
+`["no-backup"]`. The internal `backup-restore-test` safety tag is always
+excluded in addition to the configured list.
 
 The `reconcile-backup-jobs.timer` runs on every node every 15 minutes. The
 lexically first online node is elected to update both existing jobs, so VMs or

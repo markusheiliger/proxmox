@@ -65,7 +65,7 @@ flowchart TD
     Digest -->|No| Rollback
     Digest -->|Yes| Detach[Temporarily detach local bind mounts]
     Detach --> Migrate[Migrate CT configuration and rootfs]
-    Migrate --> Attach[Restore exact bind mounts on target]
+    Migrate --> Attach[Apply canonical bind mounts on target]
     Attach --> Verify{Compose and services valid on target?}
     Verify -->|No| Rollback[Reverse sync and migrate CT back]
     Verify -->|Yes| DNS{Target DNS valid?}
@@ -88,6 +88,13 @@ each node's `entities:` policy. It previews every NIC rewrite before target
 paths are created or the CT is stopped. Source drift is reconciled before the
 move; after migration, every target `netN` is switched to the target selection
 before the CT starts. All other NIC fields are preserved.
+
+The target receives exactly three bind mounts: node-local IMDS at read-only
+`mp0`, Docker at `mp1`, and Docker-data at `mp2`. Unrelated source `mpN` entries
+are reported and deleted on successful migration. If the transaction rolls
+back, the source receives its exact original mount set, including unrelated
+entries. Missing IMDS health or source data is advisory; mount operations and
+CT start failures remain fatal.
 Preflight evaluates the source node first and then the target node; each node is
 introduced by one `Contract validation '<node>'` header and checked in storage,
 and capacity order without repeating the node on every line. Network-policy
@@ -100,19 +107,28 @@ to the source node's selected bridge before the CT can start. This avoids asking
 the current node to validate a source-only bridge and does not rely on
 version-specific migration remapping options.
 
-Selector-enabled Compose stacks are stopped with every hardware profile before
-the final sync. After migration, startup selects hardware visible inside the CT
-on the destination; rollback reselects on the source. This permits automatic
-Vulkan-to-CPU fallback without persisting a node-specific render-device index.
+Profile-aware Compose stacks are structurally validated before transaction
+state is created and are stopped with every profile before the final sync.
+Arbitrary `x-profiles` requirements are not executed against the offline
+destination. After migration, the wrapper evaluates hardware visible inside the
+running CT; rollback reevaluates on the source. Target verification uses the
+selected long-running services, so variants may use different container names
+while preserving a stable application alias. This permits automatic
+accelerator-to-CPU fallback without persisting node or device identity.
 
 Preflight reads the effective datacenter migration bandwidth policy. For a
 finite limit it prints a lower-bound rootfs transfer estimate. An estimate over
 six hours requires separate confirmation; `--force` acknowledges the warning
 but never changes the cluster policy.
 
-The script migrates rootfs with `local-lvm:local-lvm`, validates passthrough GPU,
-device, and USB requirements before copying data. It
-captures expected Compose services and the CT's original running state. When a
+The script migrates rootfs with `local-lvm:local-lvm` and validates passthrough
+GPU and device requirements before copying data. A Compose `/dev/dri` mapping
+requires a usable destination DRM render device unless either declared
+`x-profiles` fallbacks or a legacy selector render a device-free Compose model.
+Fallback rendering runs inside the source CT; a stopped CT therefore fails
+closed when an unavailable destination device would require fallback proof.
+Broad `/dev/bus/usb` mappings are rejected because USB identity cannot be proven
+across nodes. It captures the CT's original running state. When a
 complete archive/workload pair no older than 26 hours is available, the target
 node first copies its `docker` and `docker-data` generation directly from the
 shared backup mount. This traffic flows from backup storage to the target and

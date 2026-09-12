@@ -75,7 +75,7 @@ hook_policy_content() {
   backup_ct_job_id=$(config_get_backup_job_id)
   backup_vm_job_id=$(config_get_backup_vm_job_id)
   backup_vm_enabled=$(config_get_backup_vm_enabled)
-  backup_exclude_tags=$(config_get_backup_exclude_tags | jq -r 'join(",")')
+  backup_exclude_tags=$(backup_effective_exclude_tags | jq -r 'join(",")')
   backup_prune_policy=$(config_get_backup_prune_policy)
   printf 'BACKUP_STORAGE=${BACKUP_STORAGE:-%q}\n' "$BACKUP_STORAGE"
   printf 'BACKUP_TMPDIR=${BACKUP_TMPDIR:-%q}\n' "$BACKUP_TMPDIR"
@@ -110,7 +110,7 @@ audit_cluster() {
 check_cluster_backup_locks() {
   local resources mount_path
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
-  mount_path="/mnt/pve/$(config_get_backup_storage)"
+  mount_path="/mnt/pve/$(config_get_backup_ct_storage)"
   check_stale_backup_locks "$resources" "$mount_path"
 }
 
@@ -265,7 +265,7 @@ calculate_temp_size_gib() {
   local resources="${1:-}" multiplier maximum_bytes exclude_tags
   [[ -n "$resources" ]] || resources=$(pvesh get /cluster/resources --type vm --output-format json)
   multiplier=$(config_get_backup_temp_size_multiplier)
-  exclude_tags=$(config_get_backup_exclude_tags)
+  exclude_tags=$(backup_effective_exclude_tags)
   maximum_bytes=$(jq -er --argjson excluded "$exclude_tags" '[.[]
     | select(.type == "lxc")
     | select(((.tags // "") | split(";")) as $tags
@@ -337,17 +337,16 @@ provision_temp_cluster() {
 }
 
 configure_job() {
-  local job_id storage schedule repeat_missed compress prune_policy
+  local job_id storage schedule repeat_missed compress
   local bwlimit ionice notification_mode hook_path tmpdir vmids enabled_value repeat_value
   prepare_backup_tmpdir_cluster
   audit_cluster
   verify_hook_cluster
   job_id=$(config_get_backup_job_id)
-  storage=$(config_get_backup_storage)
-  schedule=$(config_get_backup_schedule)
+  storage=$(config_get_backup_ct_storage)
+  schedule=$(config_get_backup_ct_schedule)
   repeat_missed=$(config_get_backup_repeat_missed)
   compress=$(config_get_backup_compress)
-  prune_policy=$(config_get_backup_prune_policy)
   bwlimit=$(config_get_backup_bwlimit_kib)
   ionice=$(config_get_backup_ionice)
   notification_mode=$(config_get_backup_notification_mode)
@@ -360,7 +359,6 @@ configure_job() {
   local arguments=(--storage "$storage" --mode suspend --compress "$compress" --schedule "$schedule"
     --repeat-missed "$repeat_value" --enabled "$enabled_value" --vmid "$vmids" --script "$hook_path"
     --tmpdir "$tmpdir"
-    --prune-backups "$prune_policy"
     --ionice "$ionice" --notification-mode "$notification_mode")
   (( bwlimit == 0 )) || arguments+=(--bwlimit "$bwlimit")
   if [[ "$DRY_RUN" == true ]]; then
@@ -378,7 +376,7 @@ configure_job() {
 
 verify_pairs() {
   local storage mount_path resources ctid hostname archive generation age_seconds failed=false now
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_ct_storage)
   mount_path="/mnt/pve/${storage}"
   [[ -d "${mount_path}/dump" ]] || { echo "ERROR: Backup dump is unavailable at ${mount_path}/dump." >&2; return 1; }
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
@@ -452,7 +450,7 @@ restore_test() {
   resolve_cluster_ct "$source"
   resources=$(pvesh get /cluster/resources --type vm --output-format json)
   resolve_restore_id "$resources" || return 1
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_ct_storage)
   mount_path="/mnt/pve/${storage}"
   archive=$(find "${mount_path}/dump" -maxdepth 1 -type f -name "vzdump-lxc-${CTID}-*.tar.zst" -print | sort -r | head -n 1 || true)
   [[ -n "$archive" ]] || { echo "ERROR: No zstd archive exists for CT ${CTID}." >&2; return 1; }
@@ -502,7 +500,10 @@ restore_test() {
   run_on_node "$node" pct set "$RESTORE_ID" -tags backup-restore-test -onboot 0
   command="for mp in \$(pct config '$RESTORE_ID' | awk -F: '/^mp[0-9]+:/ {print \$1}'); do pct set '$RESTORE_ID' -delete \"\$mp\"; done"
   run_node_shell "$node" "$command"
-  run_on_node "$node" pct set "$RESTORE_ID" -mp0 "${docker_temp},mp=/mnt/docker" -mp1 "${data_temp},mp=/mnt/docker-data"
+  run_on_node "$node" pct set "$RESTORE_ID" \
+    -mp0 "/run/pve-imds/${RESTORE_ID},mp=/mnt/pve-imds,ro=1,shared=1,backup=0" \
+    -mp1 "${docker_temp},mp=/mnt/docker" \
+    -mp2 "${data_temp},mp=/mnt/docker-data"
   bridge_policy_reconcile_guest "$node" CT "$RESTORE_ID" "$restore_bridge" false true
   run_on_node "$node" pct start "$RESTORE_ID"
   if ! run_node_shell "$node" "pct exec '$RESTORE_ID' -- sh -c 'cd /mnt/docker && docker compose config --quiet'"; then
@@ -516,7 +517,7 @@ restore_test() {
 
 run_backup() {
   local target="$1" storage hook_path tmpdir mode compress bwlimit ionice ctid node resources vmids
-  storage=$(config_get_backup_storage)
+  storage=$(config_get_backup_ct_storage)
   hook_path=$(config_get_backup_hook_path)
   tmpdir=$(config_get_backup_tmpdir)
   mode=$(config_get_backup_mode)

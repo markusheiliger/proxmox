@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ $# -eq 1 && "$1" == 0 ]] || {
+  echo "ERROR: pve-imds requires execfuse script API version 0 and no extra arguments" >&2
+  exit 22
+}

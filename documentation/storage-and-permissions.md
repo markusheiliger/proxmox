@@ -9,8 +9,15 @@ because mistakes at this boundary can affect unrelated workloads.
 | Storage | CT path | Intended use |
 | --- | --- | --- |
 | `local-lvm` (`pve/data`) | `/` | CT rootfs on the node's system disk |
+| `/run/pve-imds/<CTID>` | `/mnt/pve-imds` | Read-only node-local instance metadata |
 | `DATA`-backed `/mnt/docker/<hostname>` (`DOCKER`) | `/mnt/docker` | SSD-backed configuration and low-volume state |
 | `/mnt/docker-data/<hostname>` | `/mnt/docker-data` | HDD-backed media, recordings, backups, and large data |
+
+Lifecycle reconciliation assigns these bind mounts to `mp0`, `mp1`, and `mp2`
+respectively. A successful reconciliation deletes every other `mpN` entry;
+transaction rollback restores the exact original mount set and running state.
+Missing IMDS health or source data warns but does not block reconciliation,
+while mount configuration and CT restart failures remain fatal.
 
 The ZFS `DATA` pool remains required as the home of the `/mnt/docker` directory
 tree exposed through the `DOCKER` Proxmox directory storage. It is not a

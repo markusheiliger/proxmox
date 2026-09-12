@@ -1,45 +1,80 @@
 # Hardware-aware Compose profiles
 
-Portable CT workloads may select one hardware backend at runtime without storing node-specific device names in `.env`.
+Portable CT workloads use cluster-selected Compose profiles without persisting
+node or device identity in workload configuration. Capability policy lives in
+`commonCT.json`; workload support is declared with normal Compose service
+`profiles:` entries. The obsolete `x-profiles` extension is not used.
 
-## Contract
+## Policy contract
 
-A stack opts in by providing executable `/mnt/docker/_config/select-compose-profile.sh`. It must be POSIX `sh` and print exactly one line:
+The root `profiles` object in `commonCT.json` is keyed by group. Each group has
+one `default` and an ordered `profiles` array. Every candidate contains a name
+and non-empty argv tests. Lifecycle runs those tests inside the running target
+CT from `/mnt/docker`: all tests must exit 0, and the first matching candidate
+wins. If no candidate matches, the configured default wins.
 
-```text
-<profile>|<device>
+The authoritative owner-local Compose file opts into relevant groups through
+ordinary service profiles. Lifecycle evaluates only those groups and persists
+exactly one `profile-<group>-<name>` Proxmox tag per relevant group. IMDS
+removes only the `profile-` prefix, so `profile-gpu-drm_intel` is exposed as
+`gpu-drm_intel` in `/mnt/pve-imds/profiles.json`. If a group is removed from
+Compose, lifecycle removes its stale tag and managed device passthrough.
+
+GPU winners describe exposed kernel interfaces and vendors. Their tests use
+only `/dev` and `/sys`; they do not assert that CUDA, Vulkan, VA-API, or an
+application backend works inside a workload image.
+
+## Compose contract
+
+Compose files declare only supported sanitized values:
+
+```yaml
+services:
+  app-intel:
+    image: example.invalid/app:1.0
+    profiles: [gpu-drm_intel]
+    devices:
+      - /dev/dri:/dev/dri
+    networks:
+      default:
+        aliases: [app]
+
+  app-cpu:
+    image: example.invalid/app:1.0
+    profiles: [gpu-nvidia_compute, gpu-drm_nvidia, gpu-drm_amd, gpu-none]
+    networks:
+      default:
+        aliases: [app]
 ```
 
-Supported profiles are:
+Managed names use `<group>-<name>`, with lowercase alphanumeric or underscore
+components. `configure/resolve-compose-profile.py` discovers groups from those
+service profiles, reads IMDS, and requires exactly one supported winner for
+each declared group. An unsupported winner fails closed. Separate groups are
+combined in `COMPOSE_PROFILES`.
 
-- `no-discrete-gpu|` — CPU fallback.
-- `vulkan|/dev/dri/renderD<N>` — Vulkan through one accessible DRM render node.
-- `cuda` is reserved for future end-to-end NVIDIA Container Toolkit support.
+Compose remains responsible for service topology, devices, capabilities,
+environment, initialization, and stable aliases. It does not execute
+capability tests or choose a fallback. Workloads must implement the central
+default explicitly when they declare that group.
 
-The selector must discover hardware on every invocation. It must not persist `COMPOSE_PROFILES`, a render-node index, or node identity. NVIDIA Vulkan selectors verify PCI vendor `0x10de` through `/sys/class/drm/renderD<N>/device/vendor`; the mere presence of `/dev/dri` is insufficient because it may expose an Intel iGPU.
+## Lifecycle behavior
 
-## Compose integration
+Create and refresh parse relevant groups from the owner-local Compose file,
+expose only their lifecycle-managed devices, start the CT, evaluate central
+policy, reconcile profile tags, and then deploy Compose. Boot consumes the
+persisted IMDS winners. Move carries the relevant group set in transaction
+state, defers destination evaluation until the CT is running on the target,
+and restores source device configuration during rollback.
 
-The shared `configure/compose-profile.sh` wrapper validates selector output, exports process-local `COMPOSE_PROFILES` and `VULKAN_DEVICE`, and executes Docker Compose. If valid Newt credentials exist, it combines the independent `published` profile with the selected hardware profile.
+Selected operations use `ct_compose()` and consume IMDS. All-profile operations
+validate service declarations without requiring IMDS. A profile switch uses
+`up -d --remove-orphans` so services belonging only to the previous winner are
+removed while stable aliases remain available.
 
-Profile variants use workload-specific service and container names, but may share a network alias for a stable internal endpoint. Exactly one hardware variant is active. Pull and down operations intentionally enable every profile; validation, startup, status, initializer discovery, permission rendering, and post-deploy configuration select current hardware.
+## Legacy selector
 
-Lifecycle scripts synchronize the wrapper before Compose use. Selector-enabled Alpine CTs also receive an OpenRC service that reselects hardware and reconciles Compose after Docker starts. CTs without a selector retain direct Compose behavior.
-
-## CPU-only stacks
-
-A stack that never uses an accelerator may include an empty marker at
-`/mnt/docker/_config/disable-managed-gpu`. Lifecycle operations check the
-authoritative workload tree on the CT owner node and remove the managed DRM
-cgroup allow and `/dev/dri` bind entries when the marker exists.
-
-The marker moves with the stack's mp0 storage and must remain empty. It must not
-contain a node name, PCI identity, or render-device path. Without the marker,
-the existing node-capability behavior remains unchanged. Certificate authority
-CTs retain their existing implicit GPU-disable rule.
-
-## Moves and fallback
-
-Before moving a running selector-enabled CT, all profile variants are brought down before the final data sync. The destination selects its local profile only after migration and mount restoration. Rollback reselects on the source. A CT moved from an NVIDIA node to a node without a supported discrete GPU therefore starts the `no-discrete-gpu` variant automatically.
-
-Vulkan via the normal DRM render node permits GPU sharing between CTs, but does not provide hard VRAM or compute quotas. The RTX 3060 does not support MIG.
+`_config/select-compose-profile.sh` remains legacy compatibility only. A
+workload must not combine it with managed group-qualified service profiles.
+CPU-only stacks declare no managed GPU profiles and therefore receive no GPU
+tag, IMDS winner, predicate execution, or lifecycle-managed GPU passthrough.

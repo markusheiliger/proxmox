@@ -24,10 +24,11 @@
 #   - OTEL hosts (otel.*): Skip logging, syslog (would loop)
 #
 # USAGE:
-#   ./refreshCT.sh [CTID or hostname] [--size S|M|L | --cores N --memory MB] [--priority low|mid|high] [--vlan ID] [--monitor] [--reset]
+#   ./refreshCT.sh [CTID or hostname | --all] [--size S|M|L | --cores N --memory MB] [--priority low|mid|high] [--vlan ID] [--monitor] [--reset]
 #
 # EXAMPLES:
 #   ./refreshCT.sh                           # Interactive multi-select
+#   ./refreshCT.sh --all                     # Refresh every discovered CT
 #   ./refreshCT.sh 2100                      # Refresh by CTID
 #   ./refreshCT.sh app.thesaints.home        # Refresh by hostname
 #   ./refreshCT.sh 2100 --monitor            # Refresh and stream logs
@@ -94,10 +95,106 @@ CT_MEMORY=""
 CT_PRIORITY=""
 CT_VLAN=""
 RESET=false
+REFRESH_ALL=false
+REFRESH_CT_ARG=""
+REFRESH_HAS_OPTIONS=false
+REFRESH_SHOW_HELP=false
 
 # -----------------------------
 # FUNCTIONS
 # -----------------------------
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./refreshCT.sh [CTID|hostname] [options]
+  ./refreshCT.sh --all
+
+Selectors:
+  --all                      Refresh every discovered CT non-interactively
+
+Options for one CT:
+  --size, -s S|M|L           Apply a configured size
+  --cores N                  Set CPU cores
+  --memory MB                Set memory
+  --priority, -p LEVEL       Set low, mid, or high priority
+  --vlan ID                  Set VLAN 0-4094
+  --monitor, -m              Stream logs after refresh
+  --reset                    Select workload data folders to remove
+  --help, -h                 Show this help
+
+--all cannot be combined with a CT target or single-CT options.
+EOF
+}
+
+parse_refresh_args() {
+  REFRESH_ALL=false
+  REFRESH_CT_ARG=""
+  REFRESH_HAS_OPTIONS=false
+  REFRESH_SHOW_HELP=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --all)
+        REFRESH_ALL=true
+        shift
+        ;;
+      --help|-h)
+        REFRESH_SHOW_HELP=true
+        shift
+        ;;
+      --monitor|-m)
+        MONITOR_AFTER=true
+        REFRESH_HAS_OPTIONS=true
+        shift
+        ;;
+      --size|-s|--cores|--memory|--priority|-p|--vlan)
+        [[ $# -ge 2 ]] || {
+          echo "ERROR: $1 requires a value." >&2
+          return 2
+        }
+        case "$1" in
+          --size|-s) CT_SIZE="$2" ;;
+          --cores) CT_CORES="$2" ;;
+          --memory) CT_MEMORY="$2" ;;
+          --priority|-p) CT_PRIORITY="$2" ;;
+          --vlan)
+            if [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ ]] || (( $2 > 4094 )); then
+              echo "ERROR: --vlan must be an integer in range 0-4094 (got '$2')" >&2
+              return 2
+            fi
+            CT_VLAN="$2"
+            ;;
+        esac
+        REFRESH_HAS_OPTIONS=true
+        shift 2
+        ;;
+      --reset)
+        RESET=true
+        REFRESH_HAS_OPTIONS=true
+        shift
+        ;;
+      -*)
+        echo "ERROR: Unknown option: $1" >&2
+        return 2
+        ;;
+      *)
+        [[ -z "$REFRESH_CT_ARG" ]] || {
+          echo "ERROR: Specify only one CTID or hostname." >&2
+          return 2
+        }
+        REFRESH_CT_ARG="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$REFRESH_ALL" == true ]] \
+    && { [[ -n "$REFRESH_CT_ARG" ]] || [[ "$REFRESH_HAS_OPTIONS" == true ]]; }; then
+    echo "ERROR: --all cannot be combined with a CT target or single-CT options." >&2
+    return 2
+  fi
+}
 
 # Note: update_packages is now provided by ensure_packages_and_ca in commonCT.sh
 # This legacy function is kept for reference but is no longer called
@@ -464,61 +561,11 @@ apply_priority() {
 # -----------------------------
 main() {
   lifecycle_log_init "${BASH_SOURCE[0]}" "$@"
-  local ct_arg=""
-  local has_options=false
-  
-  # Parse arguments
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --monitor|-m)
-        MONITOR_AFTER=true
-        has_options=true
-        shift
-        ;;
-      --size|-s)
-        CT_SIZE="$2"
-        has_options=true
-        shift 2
-        ;;
-      --cores)
-        CT_CORES="$2"
-        has_options=true
-        shift 2
-        ;;
-      --memory)
-        CT_MEMORY="$2"
-        has_options=true
-        shift 2
-        ;;
-      --priority|-p)
-        CT_PRIORITY="$2"
-        has_options=true
-        shift 2
-        ;;
-      --vlan)
-        if [[ ! "$2" =~ ^(0|[1-9][0-9]*)$ ]] || (( $2 > 4094 )); then
-          echo "ERROR: --vlan must be an integer in range 0-4094 (got '$2')" >&2
-          exit 1
-        fi
-        CT_VLAN="$2"
-        has_options=true
-        shift 2
-        ;;
-      --reset)
-        RESET=true
-        has_options=true
-        shift
-        ;;
-      -*)
-        echo "Unknown option: $1"
-        exit 1
-        ;;
-      *)
-        ct_arg="$1"
-        shift
-        ;;
-    esac
-  done
+  parse_refresh_args "$@" || return 1
+  if [[ "$REFRESH_SHOW_HELP" == true ]]; then
+    usage
+    return 0
+  fi
   
   build_ct_list
   
@@ -531,8 +578,10 @@ main() {
   # Multi-select only when no arguments provided; single-select if any options given
   local cts_to_process=()
   
-  if [[ -z "$ct_arg" ]]; then
-    if [[ "$has_options" == "true" ]]; then
+  if [[ "$REFRESH_ALL" == true ]]; then
+    cts_to_process=("${CT_LIST[@]}")
+  elif [[ -z "$REFRESH_CT_ARG" ]]; then
+    if [[ "$REFRESH_HAS_OPTIONS" == "true" ]]; then
       select_ct_interactive_single "refresh" || exit 1
       cts_to_process=("$CTID")
     else
@@ -540,7 +589,7 @@ main() {
       cts_to_process=("${SELECTED_CTS[@]}")
     fi
   else
-    resolve_ct_from_input "$ct_arg" || exit 1
+    resolve_ct_from_input "$REFRESH_CT_ARG" || exit 1
     cts_to_process=("$CTID")
   fi
 
@@ -559,7 +608,7 @@ main() {
   for CTID in "${cts_to_process[@]}"; do
     current=$((current + 1))
     CT_HOSTNAME="${CT_MAP[$CTID]}"
-    local ct_node="${CT_NODE[$CTID]}"
+    local ct_node="${CT_NODE[$CTID]}" relevant_profile_groups
     local base_step=$(( (current - 1) * steps_per_ct ))
     
     echo ""
@@ -588,7 +637,8 @@ main() {
     fi
     echo "  [✓] Bridge policy selected ${BRIDGE_POLICY_SELECTED} (${BRIDGE_POLICY_REASON})"
 
-    if ! reconcile_ct_gpu_config "${CTID}" "$ct_node"; then
+    if ! relevant_profile_groups=$(ct_relevant_profile_groups "${CTID}" "$CT_HOSTNAME") \
+      || ! reconcile_ct_gpu_config "${CTID}" "$ct_node" "$relevant_profile_groups"; then
       echo "  [✗] FATAL: GPU reconciliation failed for CT ${CTID} — skipping remaining steps"
       failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU reconciliation")
       overall_step=$((base_step + steps_per_ct))
@@ -615,13 +665,24 @@ main() {
     apply_priority
     
     overall_step=$((base_step + 3)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Verifying mountpoints..."
-    setup_mountpoints
+    if ! setup_mountpoints; then
+      echo "  [✗] FATAL: Mountpoint reconciliation failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): mountpoint reconciliation")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
     
     overall_step=$((base_step + 4)); status_progress "$overall_step" "$total_steps" "CT ${CTID}: Applying configuration..."
     apply_ct_configuration "${CTID}" "${CT_HOSTNAME}"
-    if ! finalize_ct_gpu_capability "${CTID}" "$ct_node"; then
+    if ! finalize_ct_gpu_capability "${CTID}" "$ct_node" "$relevant_profile_groups"; then
       echo "  [✗] FATAL: GPU verification failed for CT ${CTID} — skipping remaining steps"
       failed_cts+=("${CTID} (${CT_HOSTNAME}): GPU verification")
+      overall_step=$((base_step + steps_per_ct))
+      continue
+    fi
+    if ! evaluate_and_reconcile_ct_profiles "${CTID}" "$relevant_profile_groups"; then
+      echo "  [✗] FATAL: profile evaluation failed for CT ${CTID} — skipping remaining steps"
+      failed_cts+=("${CTID} (${CT_HOSTNAME}): profile evaluation")
       overall_step=$((base_step + steps_per_ct))
       continue
     fi

@@ -82,7 +82,7 @@ Known defaults must be reverified at runtime:
 | Authentik server | sidecar, `:9300/metrics` |
 | Frigate | sidecar, `:5000/api/metrics` |
 | Glances | sidecar after Prometheus export is enabled |
-| Stirling PDF OSS, RustDesk, Homepage, whoami, newt | none unless current docs prove support |
+| Stirling PDF OSS, RustDesk, Homepage, whoami | none unless current docs prove support |
 | PostgreSQL/Redis base images | none; dedicated exporters are out of scope |
 
 CoreDNS trace output is Zipkin/Datadog, not OTLP, so it remains a Prometheus-sidecar case.

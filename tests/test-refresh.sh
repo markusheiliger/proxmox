@@ -11,7 +11,7 @@ fail() { echo "not ok - $1" >&2; FAIL=$((FAIL + 1)); }
 
 assert_contains() {
   local name="$1" file="$2" expected="$3"
-  if grep -Fq "$expected" "$file"; then pass "$name"; else cat "$file" >&2; fail "$name"; fi
+  if grep -Fq -- "$expected" "$file"; then pass "$name"; else cat "$file" >&2; fail "$name"; fi
 }
 
 assert_not_contains() {
@@ -122,6 +122,35 @@ if [[ "$(grep -nE '^(reconcile|node_upload_file)' "$setup_log" | cut -d: -f2- | 
 else
   cat "$setup_log" >&2
   fail "mount setup reconciles before mapped env publication"
+fi
+
+compose_image_log="${TEST_ROOT}/compose-images.log"
+SCRIPT_DIR="$SCRIPT_DIR" COMPOSE_IMAGE_LOG="$compose_image_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  CTID=2700
+  ct_compose() {
+    printf "%s\n" "$*" >> "$COMPOSE_IMAGE_LOG"
+    [[ "$*" == *"config --profiles"* ]] && printf "gpu-drm_intel\n"
+    return 0
+  }
+  compose_pull 2700 >/dev/null
+  compose_build 2700 >/dev/null
+'
+assert_contains "Compose pull ignores locally buildable images" "$compose_image_log" \
+  "--all-profiles 2700 --profile gpu-drm_intel pull --ignore-buildable"
+assert_contains "Compose build routes through the selected CT" "$compose_image_log" \
+  "--timeout 1800 2700 build"
+
+pull_line=$(grep -n 'if ! compose_pull "${CTID}"' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
+build_line=$(grep -n 'if ! compose_build "${CTID}"' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
+reset_line=$(awk -v build_line="$build_line" \
+  'NR > build_line && /if \[\[ "\$\{RESET:-false\}" == "true" \]\]/ { print NR; exit }' \
+  "${SCRIPT_DIR}/refreshCT.sh")
+permission_line=$(grep -n 'if ! reconcile_compose_permissions "${CTID}"' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
+if [[ "$pull_line" -lt "$build_line" && "$build_line" -lt "$reset_line" && "$reset_line" -lt "$permission_line" ]]; then
+  pass "local images build before reset and permission reconciliation"
+else
+  fail "local images build before reset and permission reconciliation"
 fi
 
 restore_guard_line=$(grep -n 'if ct_has_tag "$CTID" backup-restore-test' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)

@@ -348,6 +348,12 @@ reset_docker() {
     echo "  [!] Warning: image pull failed; continuing with cached images."
   fi
 
+  # Build selected local images before permission reconciliation inspects image users.
+  if ! compose_build "${CTID}"; then
+    echo "  [!] Failed to build local Compose images; NOT wiping data."
+    return 1
+  fi
+
   # Optional reset: with Compose down (bind mounts released) and images cached,
   # wipe data subfolders so the next 'compose up' reinitializes from scratch.
   if [[ "${RESET:-false}" == "true" ]]; then

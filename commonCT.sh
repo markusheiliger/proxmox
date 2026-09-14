@@ -2854,7 +2854,7 @@ compose_pull() {
   for profile in "${profiles[@]}"; do
     [[ -n "$profile" ]] && pull_args+=(--profile "$profile")
   done
-  pull_args+=(pull)
+  pull_args+=(pull --ignore-buildable)
 
   local max_attempts=5
   local attempt output backoff
@@ -2898,6 +2898,25 @@ compose_pull() {
   done
 
   echo "  [!] Image pull failed after ${max_attempts} attempts."
+  return 1
+}
+
+# Build local images for the selected Compose profiles before permission
+# reconciliation needs to inspect their runtime users.
+# Args:
+#   $1 - CTID (optional, defaults to global CTID)
+# Returns: exit code from docker compose build
+compose_build() {
+  local ctid="${1:-${CTID}}"
+  local output
+
+  echo "  Building local images..."
+  if output=$(ct_compose --timeout 1800 "${ctid}" build 2>&1); then
+    [[ -n "$output" ]] && echo "$output"
+    return 0
+  fi
+
+  [[ -n "$output" ]] && echo "$output"
   return 1
 }
 

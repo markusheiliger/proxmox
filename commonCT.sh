@@ -627,6 +627,18 @@ config_get_dns_account_id() {
   jq -r --arg d "$domain" '.ssl[$d].dns_account_id // empty' "${CONFIG_FILE}"
 }
 
+# Get the DNS zone configured for a hostname's DDNS updater.
+# Args: $1 = CT hostname
+# Returns: zone string or empty when the workload is not opted in
+config_get_ddns_updater_zone() {
+  local hostname="${1:-}"
+  [[ -n "$hostname" ]] || return 1
+  if ! config_exists; then
+    return 1
+  fi
+  jq -r --arg h "$hostname" '.ddns_updaters[$h].zone // empty' "${CONFIG_FILE}"
+}
+
 # Get CA name for domain
 # Args: $1 = domain name
 # Returns: ca.<domain>
@@ -1103,6 +1115,87 @@ config_udmpro_configured() {
   host=$(config_get_udmpro_host)
   apikey=$(config_get_udmpro_apikey)
   [[ -n "$host" && -n "$apikey" ]]
+}
+
+# Materialize a DDNS updater's raw secret env file on its authoritative owner.
+# Args: $1 = CTID, $2 = hostname, $3 = owner-local Docker directory
+reconcile_ddns_updater_secret_env() {
+  local ctid="${1:-}" hostname="${2:-}" docker_dir="${3:-}"
+  local zone provider udm_apikey dns_token account_id node root_uid root_gid
+  local secret_dir secret_file stage_dir stage_file current_file changed=true
+
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && -n "$hostname" && "$docker_dir" == /mnt/docker/* ]] || {
+    echo "ERROR: Invalid DDNS updater secret reconciliation arguments." >&2
+    return 1
+  }
+
+  zone=$(config_get_ddns_updater_zone "$hostname") || return 1
+  [[ -n "$zone" ]] || return 0
+
+  provider=$(config_get_dns_provider "$zone") || return 1
+  udm_apikey=$(config_get_udmpro_apikey) || return 1
+  dns_token=$(config_get_dns_api_token "$zone") || return 1
+  account_id=$(config_get_dns_account_id "$zone") || return 1
+
+  if [[ "$provider" != dnsimple || -z "$udm_apikey" || -z "$dns_token" \
+    || "$udm_apikey" == *$'\n'* || "$udm_apikey" == *$'\r'* \
+    || "$dns_token" == *$'\n'* || "$dns_token" == *$'\r'* \
+    || "$account_id" == *$'\n'* || "$account_id" == *$'\r'* \
+    || ( -n "$account_id" && ! "$account_id" =~ ^[0-9]+$ ) ]]; then
+    echo "ERROR: Incomplete or invalid DDNS updater credentials for ${hostname}." >&2
+    return 1
+  fi
+
+  node=$(get_ct_owner_node "$ctid") || return 1
+  read -r root_uid root_gid < <(get_ct_host_root_ids "$ctid") || return 1
+  secret_dir="${docker_dir}/_secrets"
+  secret_file="${secret_dir}/ddns-updater.env"
+  stage_dir=$(mktemp -d)
+  stage_file="${stage_dir}/ddns-updater.env"
+  current_file="${stage_dir}/current.env"
+
+  (
+    umask 077
+    {
+      printf 'UDM_API_KEY=%s\n' "$udm_apikey"
+      printf 'DNSIMPLE_API_ACCESS_TOKEN=%s\n' "$dns_token"
+      if [[ -n "$account_id" ]]; then
+        printf 'DNSIMPLE_ACCOUNT_ID=%s\n' "$account_id"
+      fi
+    } > "$stage_file"
+  )
+
+  if node_path_is_file "$node" "$secret_file"; then
+    if ! node_download_file "$node" "$secret_file" "$current_file"; then
+      rm -rf "$stage_dir"
+      return 1
+    fi
+    if cmp -s "$stage_file" "$current_file"; then
+      changed=false
+    fi
+  fi
+
+  if ! node_mkdir "$node" "$secret_dir" \
+    || ! run_on_node "$node" chown "${root_uid}:${root_gid}" "$secret_dir" \
+    || ! run_on_node "$node" chmod 0700 "$secret_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if [[ "$changed" == true ]] \
+    && ! node_upload_file "$node" "$stage_file" "$secret_file" 0400 "$root_uid" "$root_gid"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if [[ "$changed" == false ]] \
+    && { ! run_on_node "$node" chown "${root_uid}:${root_gid}" "$secret_file" \
+      || ! run_on_node "$node" chmod 0400 "$secret_file"; }; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  rm -rf "$stage_dir"
 }
 
 # Get split DNS CT hostname
@@ -5285,6 +5378,7 @@ setup_mountpoints() {
     return 1
   fi
   if ! read -r root_uid root_gid < <(get_ct_host_root_ids "$CTID") \
+    || ! reconcile_ddns_updater_secret_env "$CTID" "$hostname_lower" "$DIR_DOCKER" \
     || ! node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600 "$root_uid" "$root_gid"; then
     rm -rf "$stage_dir"
     return 1

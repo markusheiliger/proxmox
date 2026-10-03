@@ -10,6 +10,37 @@ on:
     - cron: '17 6 * * 1'
 
 jobs:
+  ddns-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify DDNS updater release pin
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version=$(cat containers/ddns-update-version)
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "containers/ddns-update-version must contain one stable semantic version" >&2
+            exit 1
+          fi
+
+          {
+            echo '## DDNS updater release'
+            echo
+            echo "- Repository pin: \`$version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   caddy-release:
     runs-on: ubuntu-latest
     permissions:
@@ -159,4 +190,108 @@ jobs:
             echo "- Caddy: \`$version\`"
             echo "- Version label: \`$label\`"
             echo '- Version status: **verified**'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-ddns-update:
+    needs: ddns-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Audit current image
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/ddns-update:latest
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo '## ddns-update'
+            echo
+            echo '### Current published image'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if docker pull "$IMAGE" >/dev/null 2>&1; then
+            digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+            version=$(docker run --rm "$IMAGE" --version)
+            {
+              echo "- Digest: \`$digest\`"
+              echo "- Version: \`$version\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '- No previously published image.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ddns-update
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.ddns-release.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.ddns-release.outputs.version }}
+            type=semver,pattern={{major}},value=${{ needs.ddns-release.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.ddns-release.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: containers/ddns-update
+          build-args: DDNS_UPDATE_VERSION=${{ needs.ddns-release.outputs.version }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+      - name: Verify published image
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          EXPECTED_VERSION: ${{ needs.ddns-release.outputs.version }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/ddns-update@${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker pull "$IMAGE"
+
+          version=$(docker run --rm "$IMAGE" --version)
+          label_version=$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")
+          label_revision=$(docker image inspect \
+            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
+          runtime_user=$(docker image inspect --format '{{.Config.User}}' "$IMAGE")
+
+          [[ "$version" == "$EXPECTED_VERSION" ]]
+          [[ "$label_version" == "$EXPECTED_VERSION" ]]
+          [[ "$label_revision" == "$EXPECTED_REVISION" ]]
+          [[ -n "$runtime_user" && "$runtime_user" != 0 && "$runtime_user" != root ]]
+          docker run --rm "$IMAGE" --help >/dev/null
+
+          {
+            echo
+            echo '### Published image'
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- Version: \`$version\`"
+            echo "- Revision: \`$label_revision\`"
+            echo "- Runtime user: \`$runtime_user\`"
+            echo '- Publication status: **verified**'
           } >> "$GITHUB_STEP_SUMMARY"

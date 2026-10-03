@@ -108,6 +108,7 @@ SCRIPT_DIR="$SCRIPT_DIR" SETUP_LOG="$setup_log" bash -c '
   get_ct_host_root_ids() { printf "100000 100000\n"; }
   node_upload_file() { printf "node_upload_file %s\n" "$*" >> "$SETUP_LOG"; }
   reconcile_ct_mountpoints() { printf "reconcile %s\n" "$*" >> "$SETUP_LOG"; }
+  reconcile_ddns_updater_secret_env() { printf "ddns %s\n" "$*" >> "$SETUP_LOG"; }
   setup_mountpoints >/dev/null
 '
 assert_contains "mount setup reconciles mounts" "$setup_log" \
@@ -116,12 +117,142 @@ assert_contains "mount setup publishes env with mapped CT ownership" "$setup_log
   "node_upload_file pve02"
 assert_contains "mount setup targets the host Docker tree with mapped IDs" "$setup_log" \
   "/mnt/docker/app.thesaints.home/.env 0600 100000 100000"
-if [[ "$(grep -nE '^(reconcile|node_upload_file)' "$setup_log" | cut -d: -f2- | paste -sd, -)" \
-  == reconcile\ 2200\ app.thesaints.home,node_upload_file\ pve02* ]]; then
-  pass "mount setup reconciles before mapped env publication"
+if [[ "$(grep -nE '^(reconcile|ddns|node_upload_file)' "$setup_log" | cut -d: -f2- | paste -sd, -)" \
+  == reconcile\ 2200\ app.thesaints.home,ddns\ 2200\ app.thesaints.home\ /mnt/docker/app.thesaints.home,node_upload_file\ pve02* ]]; then
+  pass "mount setup publishes DDNS secrets before the Compose environment"
 else
   cat "$setup_log" >&2
-  fail "mount setup reconciles before mapped env publication"
+  fail "mount setup publishes DDNS secrets before the Compose environment"
+fi
+
+ddns_config="${TEST_ROOT}/ddns-config.json"
+cat > "$ddns_config" <<'EOF'
+{"ddns_updaters":{"worker.thesaints.home":{"zone":"thesaints.de"}}}
+EOF
+ddns_zone=$(SCRIPT_DIR="$SCRIPT_DIR" CONFIG_FILE="$ddns_config" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone worker.thesaints.home
+')
+if [[ "$ddns_zone" == thesaints.de ]]; then
+  pass "DDNS updater opt-in resolves by hostname"
+else
+  fail "DDNS updater opt-in resolves by hostname"
+fi
+
+ddns_noop_log="${TEST_ROOT}/ddns-noop.log"
+SCRIPT_DIR="$SCRIPT_DIR" DDNS_LOG="$ddns_noop_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone() { :; }
+  get_ct_owner_node() { printf "unexpected owner lookup\n" >> "$DDNS_LOG"; return 1; }
+  reconcile_ddns_updater_secret_env 2200 app.thesaints.home /mnt/docker/app.thesaints.home
+'
+if [[ ! -s "$ddns_noop_log" ]]; then
+  pass "DDNS secret reconciliation is a no-op without opt-in"
+else
+  cat "$ddns_noop_log" >&2
+  fail "DDNS secret reconciliation is a no-op without opt-in"
+fi
+
+ddns_publish_log="${TEST_ROOT}/ddns-publish.log"
+ddns_published="${TEST_ROOT}/ddns-published.env"
+SCRIPT_DIR="$SCRIPT_DIR" DDNS_LOG="$ddns_publish_log" DDNS_PUBLISHED="$ddns_published" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone() { printf "thesaints.de\n"; }
+  config_get_dns_provider() { printf "dnsimple\n"; }
+  config_get_udmpro_apikey() { printf "test-udm-key\n"; }
+  config_get_dns_api_token() { printf "test-dns-token\n"; }
+  config_get_dns_account_id() { printf "12345\n"; }
+  get_ct_owner_node() { printf "pve02\n"; }
+  get_ct_host_root_ids() { printf "200000 300000\n"; }
+  node_path_is_file() { return 1; }
+  node_mkdir() { printf "node_mkdir %s\n" "$*" >> "$DDNS_LOG"; }
+  run_on_node() { printf "run_on_node %s\n" "$*" >> "$DDNS_LOG"; }
+  node_upload_file() {
+    cp "$2" "$DDNS_PUBLISHED"
+    printf "node_upload_file %s %s %s %s %s\n" "$1" "$3" "$4" "$5" "$6" >> "$DDNS_LOG"
+  }
+  reconcile_ddns_updater_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+'
+assert_contains "DDNS secret is routed to the remote CT owner" "$ddns_publish_log" \
+  "node_upload_file pve02 /mnt/docker/worker.thesaints.home/_secrets/ddns-updater.env 0400 200000 300000"
+assert_contains "DDNS secret directory uses mapped root ownership" "$ddns_publish_log" \
+  "run_on_node pve02 chown 200000:300000 /mnt/docker/worker.thesaints.home/_secrets"
+assert_contains "DDNS secret contains the UDM API key" "$ddns_published" "UDM_API_KEY=test-udm-key"
+assert_contains "DDNS secret contains the DNSimple token" "$ddns_published" "DNSIMPLE_API_ACCESS_TOKEN=test-dns-token"
+assert_contains "DDNS secret contains the optional account ID" "$ddns_published" "DNSIMPLE_ACCOUNT_ID=12345"
+assert_not_contains "DDNS lifecycle logs do not expose the UDM API key" "$ddns_publish_log" "test-udm-key"
+assert_not_contains "DDNS lifecycle logs do not expose the DNSimple token" "$ddns_publish_log" "test-dns-token"
+
+ddns_without_account="${TEST_ROOT}/ddns-without-account.env"
+SCRIPT_DIR="$SCRIPT_DIR" DDNS_PUBLISHED="$ddns_without_account" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone() { printf "thesaints.de\n"; }
+  config_get_dns_provider() { printf "dnsimple\n"; }
+  config_get_udmpro_apikey() { printf "test-udm-key\n"; }
+  config_get_dns_api_token() { printf "test-dns-token\n"; }
+  config_get_dns_account_id() { :; }
+  get_ct_owner_node() { printf "pve02\n"; }
+  get_ct_host_root_ids() { printf "100000 100000\n"; }
+  node_path_is_file() { return 1; }
+  node_mkdir() { :; }
+  run_on_node() { :; }
+  node_upload_file() { cp "$2" "$DDNS_PUBLISHED"; }
+  reconcile_ddns_updater_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+'
+assert_not_contains "DDNS account ID remains optional" "$ddns_without_account" "DNSIMPLE_ACCOUNT_ID="
+
+ddns_unchanged="${TEST_ROOT}/ddns-unchanged.env"
+ddns_unchanged_log="${TEST_ROOT}/ddns-unchanged.log"
+cat > "$ddns_unchanged" <<'EOF'
+UDM_API_KEY=test-udm-key
+DNSIMPLE_API_ACCESS_TOKEN=test-dns-token
+EOF
+SCRIPT_DIR="$SCRIPT_DIR" DDNS_CURRENT="$ddns_unchanged" DDNS_LOG="$ddns_unchanged_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone() { printf "thesaints.de\n"; }
+  config_get_dns_provider() { printf "dnsimple\n"; }
+  config_get_udmpro_apikey() { printf "test-udm-key\n"; }
+  config_get_dns_api_token() { printf "test-dns-token\n"; }
+  config_get_dns_account_id() { :; }
+  get_ct_owner_node() { printf "pve02\n"; }
+  get_ct_host_root_ids() { printf "100000 100000\n"; }
+  node_path_is_file() { return 0; }
+  node_download_file() { cp "$DDNS_CURRENT" "$3"; }
+  node_mkdir() { :; }
+  run_on_node() { printf "%s\n" "$*" >> "$DDNS_LOG"; }
+  node_upload_file() { printf "unexpected upload\n" >> "$DDNS_LOG"; return 1; }
+  reconcile_ddns_updater_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+'
+assert_not_contains "unchanged DDNS content is not uploaded" "$ddns_unchanged_log" "unexpected upload"
+assert_contains "unchanged DDNS secret permissions are reconciled" "$ddns_unchanged_log" \
+  "pve02 chmod 0400 /mnt/docker/worker.thesaints.home/_secrets/ddns-updater.env"
+
+ddns_invalid_log="${TEST_ROOT}/ddns-invalid.log"
+if SCRIPT_DIR="$SCRIPT_DIR" DDNS_LOG="$ddns_invalid_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_ddns_updater_zone() { printf "thesaints.de\n"; }
+  config_get_dns_provider() { printf "dnsimple\n"; }
+  config_get_udmpro_apikey() { printf "test-udm-key\n"; }
+  config_get_dns_api_token() { :; }
+  config_get_dns_account_id() { :; }
+  node_upload_file() { printf "unexpected upload\n" >> "$DDNS_LOG"; }
+  reconcile_ddns_updater_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+' > "${TEST_ROOT}/ddns-invalid.out" 2>&1; then
+  fail "invalid DDNS credentials fail closed"
+elif [[ ! -s "$ddns_invalid_log" ]] \
+  && grep -Fq "Incomplete or invalid DDNS updater credentials" "${TEST_ROOT}/ddns-invalid.out"; then
+  pass "invalid DDNS credentials fail closed without replacing the secret"
+else
+  cat "${TEST_ROOT}/ddns-invalid.out" "$ddns_invalid_log" >&2
+  fail "invalid DDNS credentials fail closed without replacing the secret"
+fi
+
+setup_line=$(grep -n 'if ! setup_mountpoints' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
+reset_docker_line=$(grep -n 'if ! reset_docker' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
+if [[ -n "$setup_line" && -n "$reset_docker_line" && "$setup_line" -lt "$reset_docker_line" ]]; then
+  pass "DDNS secret generation occurs before the first Compose render"
+else
+  fail "DDNS secret generation occurs before the first Compose render"
 fi
 
 compose_image_log="${TEST_ROOT}/compose-images.log"

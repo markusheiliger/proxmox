@@ -11,7 +11,7 @@ Usage:
   ./testCT.sh --all
   ./testCT.sh
 
-Run root-level test-*.sh workload tests on each CT's current owner node.
+Run direct _tests/test-*.sh workload tests on each CT's current owner node.
 Without arguments, select one or more containers interactively.
 EOF
 }
@@ -23,7 +23,8 @@ discover_workload_tests() {
     return 1
   }
   workload_dir="/mnt/docker/${hostname}"
-  output=$(run_on_node "$node" find "$workload_dir" -maxdepth 1 -type f -name 'test-*.sh' -printf '%f\n') || {
+  output=$(run_on_node "$node" find "$workload_dir" -mindepth 2 -maxdepth 2 \
+    -path "${workload_dir}/_tests/test-*.sh" -type f -printf '%f\n') || {
     echo "ERROR: Cannot discover workload tests for ${hostname} on ${node}." >&2
     return 1
   }
@@ -53,7 +54,7 @@ run_ct_tests() {
 
   if [[ ${#tests[@]} -eq 0 ]]; then
     if [[ "$explicit" == "true" ]]; then
-      echo "ERROR: No root-level test-*.sh files found for CT ${ctid} (${hostname}) on ${node}." >&2
+      echo "ERROR: No _tests/test-*.sh files found for CT ${ctid} (${hostname}) on ${node}." >&2
       return 1
     fi
     echo "skip - CT ${ctid} (${hostname}) has no workload tests on ${node}"
@@ -64,11 +65,11 @@ run_ct_tests() {
   echo "CT ${ctid} (${hostname}) on ${node}: ${#tests[@]} test(s)"
   for test_name in "${tests[@]}"; do
     TEST_CT_TOTAL=$((TEST_CT_TOTAL + 1))
-    echo "==> ${hostname}/${test_name}"
-    if run_on_node "$node" bash "/mnt/docker/${hostname}/${test_name}"; then
+    echo "==> ${hostname}/_tests/${test_name}"
+    if run_on_node "$node" bash "/mnt/docker/${hostname}/_tests/${test_name}"; then
       TEST_CT_PASSED=$((TEST_CT_PASSED + 1))
     else
-      echo "not ok - ${hostname}/${test_name}" >&2
+      echo "not ok - ${hostname}/_tests/${test_name}" >&2
       TEST_CT_FAILED=$((TEST_CT_FAILED + 1))
     fi
   done

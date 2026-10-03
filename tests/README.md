@@ -1,8 +1,8 @@
 # Tests
 
 This directory contains focused Bash regression suites for lifecycle and shared
-infrastructure behavior. Workload-owned contracts live beside each workload's
-`docker-compose.yaml` as root-level `test-*.sh` files.
+infrastructure behavior. Workload-owned contracts are direct
+`/mnt/docker/<hostname>/_tests/test-*.sh` children.
 
 Run every suite from the repository root:
 

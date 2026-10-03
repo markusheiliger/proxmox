@@ -1,11 +1,24 @@
 ---
-applyTo: "**/docker-compose.yaml"
-description: "Use when creating or editing CT Docker Compose stacks under /mnt/docker: mount paths, storage rationale, permissions, deterministic container names, telemetry identity, initialization services, networking, and raw secrets."
+applyTo: "**/{docker-compose.yaml,docker-compose.md}"
+description: "Use when creating or editing CT Docker Compose stacks or their companion documentation under /mnt/docker: documentation placement, mount paths, storage rationale, permissions, deterministic container names, telemetry identity, initialization services, networking, and raw secrets."
 ---
 
 # CT Docker Compose authoring
 
 Each `/mnt/docker/<hostname>/docker-compose.yaml` defines a stack running inside one Proxmox LXC CT.
+
+## Workload-local documentation
+
+When a workload needs documentation for non-obvious Compose intent, architecture,
+profiles or devices, storage, initialization, exposure, migration, acceptance,
+rollback, or troubleshooting, use exactly `docker-compose.md` directly beside
+that workload's `docker-compose.yaml`.
+
+The companion is optional; do not create an empty file when the Compose stack is
+self-explanatory. Keep repository-wide architecture under
+`/root/scripts/documentation`. Generated `_config/shared/README.md` mirrors and
+unrelated service documentation are outside this convention and must not be
+renamed or edited as Compose companions.
 
 ## Image versioning
 

@@ -63,7 +63,7 @@ Each user-facing lifecycle script has a matching operator guide. Cross-cutting a
 ## Testing
 
 - Shared lifecycle and infrastructure tests live under `/root/scripts/tests`.
-- Workload-owned tests live directly beside `/mnt/docker/<hostname>/docker-compose.yaml` as root-level `test-*.sh` files and run through `testCT.sh`.
+- Workload-owned tests are direct `/mnt/docker/<hostname>/_tests/test-*.sh` children and run through `testCT.sh`.
 - Tests of CT-specific behavior must prove owner-node routing with at least one non-local owner fixture; a local-only mock is insufficient.
 - Node-local hooks may use local `pct` and host paths only when the test establishes that Proxmox invokes the hook on the CT owner node.
 
@@ -76,6 +76,8 @@ Follow `testing.instructions.md` for cluster-aware fixtures, workload-test owner
 - Shared POSIX configure helpers live in `/root/scripts/configure/` and are mirrored into CTs at `/mnt/docker/_config/shared/` during refresh. Never edit the mirrored copy.
 
 ## Docker service conventions
+
+- Optional workload-local documentation that explains non-obvious Compose intent or operation must be named `docker-compose.md` and live directly beside `/mnt/docker/<hostname>/docker-compose.yaml`. Do not create an empty companion file when no additional explanation is needed.
 
 - Each CT uses Caddy for reverse proxying and automatic TLS through exactly one mandatory project image: primary/internal domains use `ghcr.io/markusheiliger/caddy-stepca:latest`, and public domains use `ghcr.io/markusheiliger/caddy-dnsimple:latest`.
 - Do not replace these images with official Caddy, another Caddy implementation, a fork, or a digest/version deployment reference. Security and version updates must rebuild the applicable project image and continue deploying its mandatory `:latest` reference.

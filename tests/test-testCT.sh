@@ -8,7 +8,7 @@ MOCK_WORKLOADS="${TEST_ROOT}/workloads"
 MOCK_CALLS="${TEST_ROOT}/calls"
 PASS=0
 FAIL=0
-mkdir -p "$MOCK_WORKLOADS"/{alpha.test,beta.test,empty.test}
+mkdir -p "$MOCK_WORKLOADS"/{alpha.test/_tests,beta.test/_tests,empty.test}
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 pass() { echo "ok - $1"; PASS=$((PASS + 1)); }
@@ -79,12 +79,12 @@ run_on_node() {
       if [[ "$hostname" == "${MOCK_DISCOVERY_FAIL_HOST:-}" ]]; then
         return 6
       fi
-      find "$MOCK_WORKLOADS/$hostname" -maxdepth 1 -type f -name 'test-*.sh' -printf '%f\n'
+      find "$MOCK_WORKLOADS/$hostname" -mindepth 2 -maxdepth 2 \
+        -path '*/_tests/test-*.sh' -type f -printf '%f\n'
       ;;
     bash)
-      local hostname="${path%/*}"
-      hostname="${hostname##*/}"
-      bash "$MOCK_WORKLOADS/$hostname/${path##*/}"
+      local relative_path="${path#/mnt/docker/}"
+      bash "$MOCK_WORKLOADS/$relative_path"
       ;;
     *) return 1 ;;
   esac
@@ -95,30 +95,31 @@ status_progress() { :; }
 status_bar_cleanup() { :; }
 EOF
 
-cat > "$MOCK_WORKLOADS/alpha.test/test-20-second.sh" <<'EOF'
+cat > "$MOCK_WORKLOADS/alpha.test/_tests/test-20-second.sh" <<'EOF'
 #!/usr/bin/env bash
 echo second
 EOF
-cat > "$MOCK_WORKLOADS/alpha.test/test-10-first.sh" <<'EOF'
+cat > "$MOCK_WORKLOADS/alpha.test/_tests/test-10-first.sh" <<'EOF'
 #!/usr/bin/env bash
 echo first
 EOF
-cat > "$MOCK_WORKLOADS/beta.test/test-fail.sh" <<'EOF'
+cat > "$MOCK_WORKLOADS/beta.test/_tests/test-fail.sh" <<'EOF'
 #!/usr/bin/env bash
 echo intentional failure
 exit 4
 EOF
-cat > "$MOCK_WORKLOADS/beta.test/test-pass.sh" <<'EOF'
+cat > "$MOCK_WORKLOADS/beta.test/_tests/test-pass.sh" <<'EOF'
 #!/usr/bin/env bash
 echo continued
 EOF
-cat > "$MOCK_WORKLOADS/alpha.test/nested-test.sh" <<'EOF'
+cat > "$MOCK_WORKLOADS/alpha.test/test-root-hidden.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 99
 EOF
-mkdir -p "$MOCK_WORKLOADS/alpha.test/nested"
-touch "$MOCK_WORKLOADS/alpha.test/nested/test-hidden.sh"
-ln -s "$MOCK_WORKLOADS/alpha.test/test-10-first.sh" "$MOCK_WORKLOADS/alpha.test/test-link.sh"
+mkdir -p "$MOCK_WORKLOADS/alpha.test/_tests/nested"
+touch "$MOCK_WORKLOADS/alpha.test/_tests/nested/test-hidden.sh"
+ln -s "$MOCK_WORKLOADS/alpha.test/_tests/test-10-first.sh" \
+  "$MOCK_WORKLOADS/alpha.test/_tests/test-link.sh"
 
 run_runner() {
   : > "$MOCK_CALLS"
@@ -129,21 +130,21 @@ run_runner() {
 }
 
 assert_success_contains "hostname target runs workload tests" "2 passed, 0 failed, 0 skipped" run_runner alpha.test
-if [[ "$(grep '|bash|' "$MOCK_CALLS" | cut -d'|' -f3 | paste -sd ',')" == "/mnt/docker/alpha.test/test-10-first.sh,/mnt/docker/alpha.test/test-20-second.sh" ]]; then
+if [[ "$(grep '|bash|' "$MOCK_CALLS" | cut -d'|' -f3 | paste -sd ',')" == "/mnt/docker/alpha.test/_tests/test-10-first.sh,/mnt/docker/alpha.test/_tests/test-20-second.sh" ]]; then
   pass "tests run lexically from owner-node workload paths"
 else
   cat "$MOCK_CALLS" >&2
   fail "tests run lexically from owner-node workload paths"
 fi
 assert_failure_contains "numeric CTID resolves remote owner" "CT 200 (beta.test) on pve02" run_runner 200
-if grep -Fq 'pve02|bash|/mnt/docker/beta.test/test-pass.sh' "$MOCK_CALLS"; then
+if grep -Fq 'pve02|bash|/mnt/docker/beta.test/_tests/test-pass.sh' "$MOCK_CALLS"; then
   pass "failed tests do not prevent later tests"
 else
   cat "$MOCK_CALLS" >&2
   fail "failed tests do not prevent later tests"
 fi
 assert_failure_contains "failed workload test controls aggregate status" "1 passed, 1 failed, 0 skipped" run_runner beta.test
-assert_failure_contains "explicit CT without tests fails" "No root-level test-*.sh files found" run_runner empty.test
+assert_failure_contains "explicit CT without tests fails" "No _tests/test-*.sh files found" run_runner empty.test
 MOCK_DISCOVERY_FAIL_HOST="alpha.test" assert_failure_contains "owner discovery failures are reported" "Cannot discover workload tests" run_runner alpha.test
 MOCK_SELECTION="100 300" assert_success_contains "interactive selection skips untested CTs" "2 passed, 0 failed, 1 skipped" run_runner
 assert_failure_contains "all mode continues and aggregates failures" "3 passed, 1 failed, 1 skipped" run_runner --all

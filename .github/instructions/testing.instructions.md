@@ -38,13 +38,13 @@ fixtures when they perform no CT-specific operation.
 - Shared lifecycle, generator, policy, and mocked infrastructure tests belong in
   `/root/scripts/tests`.
 - A test that reads one workload's real Compose, configuration, migration, or
-  state files belongs directly in `/mnt/docker/<hostname>/` beside
-  `docker-compose.yaml`.
+  state files belongs directly in `/mnt/docker/<hostname>/_tests/`.
 - Name workload tests `test-*.sh`, such as `test-compose.sh`,
-  `test-permissions.sh`, or `test-readiness.sh`. Do not add `_tests/`, `tests/`,
-  or a metadata manifest.
-- Derive `WORKLOAD_ROOT` from `BASH_SOURCE[0]`. Do not embed a CTID, owner node,
-  or absolute hostname-qualified source root.
+  `test-permissions.sh`, or `test-readiness.sh`. Tests must be direct children
+  of `_tests/`; do not add nested test directories or a metadata manifest.
+- Derive `WORKLOAD_ROOT` as the parent of the test script's `_tests/` directory
+  from `BASH_SOURCE[0]`. Do not embed a CTID, owner node, or absolute
+  hostname-qualified source root.
 - A workload test must not read a sibling workload tree or depend on
   `/root/scripts` existing on a worker node. Move shared policy and generator
   assertions into `/root/scripts/tests`.
@@ -54,7 +54,7 @@ fixtures when they perform no CT-specific operation.
 ## Execution and validation
 
 - Run workload tests through `/root/scripts/testCT.sh`; it resolves current CT
-  ownership and executes root-level tests against authoritative owner-node
+  ownership and executes direct `_tests/test-*.sh` files against authoritative owner-node
   storage in lexical order.
 - Workload tests execute on the owner host, not inside the CT. They must work
   when invoked from an unrelated current directory and when the CT is stopped.

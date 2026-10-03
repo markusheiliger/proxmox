@@ -27,8 +27,8 @@ For each selected CT, the runner:
 
 1. Resolves the CTID and hostname from cluster inventory.
 2. Resolves the CT's current owner node.
-3. Discovers regular root-level `/mnt/docker/<hostname>/test-*.sh` files on that
-   node.
+3. Discovers regular direct `/mnt/docker/<hostname>/_tests/test-*.sh` files on
+   that node.
 4. Sorts test basenames lexically.
 5. Runs each test with Bash on the owner host.
 
@@ -38,29 +38,31 @@ resolution also avoids reading stale or absent workload trees after migration.
 
 ## Workload test contract
 
-Place tests directly beside `docker-compose.yaml`:
+Place tests directly under `_tests/` beside the workload's `docker-compose.yaml`:
 
 ```text
 /mnt/docker/example.thesaints.home/
 ├── docker-compose.yaml
-├── test-compose.sh
-├── test-permissions.sh
-└── test-readiness.sh
+└── _tests/
+   ├── test-compose.sh
+   ├── test-permissions.sh
+   └── test-readiness.sh
 ```
 
-Each script must use Bash strict mode and derive its workload root from its own
-location:
+Each script must use Bash strict mode and derive its workload root from the
+parent of its `_tests/` directory:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
-WORKLOAD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKLOAD_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${WORKLOAD_ROOT}/docker-compose.yaml"
 ```
 
-Do not embed a CTID, owner node, or sibling workload path. Keep shared lifecycle
-and generator tests under `/root/scripts/tests`.
+Only direct regular `test-*.sh` children are discovered; nested files and
+symlinks are ignored. Do not embed a CTID, owner node, or sibling workload path.
+Keep shared lifecycle and generator tests under `/root/scripts/tests`.
 
 ## Related
 

@@ -4,9 +4,9 @@ Shared tests under `../tests/` are executable Bash programs with TAP-like `ok`
 and `not ok` output. They source production functions where practical and
 replace external commands with shell functions or fixture executables.
 
-Workload-specific contracts live directly beside their `docker-compose.yaml` as
-root-level `test-*.sh` files. They derive the workload root from
-`BASH_SOURCE[0]` and must not read another workload's tree.
+Workload-specific contracts are direct `_tests/test-*.sh` children below their
+workload root. They derive that root as the parent of the script's `_tests/`
+directory from `BASH_SOURCE[0]` and must not read another workload's tree.
 
 ## Run the suites
 
@@ -35,9 +35,10 @@ Run workload contracts from the administrative node through `testCT.sh`:
 ```
 
 With no arguments, `testCT.sh` opens a multi-select checklist. It resolves each
-CT's current owner node, discovers `/mnt/docker/<hostname>/test-*.sh` on that
-node, and executes regular root-level files in lexical order. Tests run on the
-owner host rather than inside the CT, so stopped CTs and host-only workload files
+CT's current owner node, discovers direct regular
+`/mnt/docker/<hostname>/_tests/test-*.sh` files on that node, and executes them
+in lexical order. Nested files and symlinks are ignored. Tests run on the owner
+host rather than inside the CT, so stopped CTs and host-only workload files
 remain testable. An explicitly selected CT without tests fails; batch modes skip
 untested CTs.
 
@@ -66,8 +67,8 @@ Tests create temporary fixtures and clean them with traps.
 - Test policy before mutation.
 - Mock Proxmox, SSH, Docker, LVM, ZFS, and network calls at process boundaries.
 - Assert both success and fail-closed behavior.
-- Keep shared lifecycle tests under `tests/` and workload contracts beside the
-  workload they protect.
+- Keep shared lifecycle tests under `tests/` and workload contracts directly
+  under the protected workload's `_tests/` directory.
 - Treat CTIDs and hostnames used only inside isolated fixtures as test data, not
   workload ownership.
 - Keep cross-workload guarantees local where possible; test shared generators

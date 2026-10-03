@@ -639,6 +639,18 @@ config_get_ddns_updater_zone() {
   jq -r --arg h "$hostname" '.ddns_updaters[$h].zone // empty' "${CONFIG_FILE}"
 }
 
+# Get the WUNS credential object configured for a hostname.
+# Args: $1 = CT hostname
+# Returns: compact JSON object or empty when the workload is not opted in
+config_get_wuns_credentials() {
+  local hostname="${1:-}"
+  [[ -n "$hostname" ]] || return 1
+  if ! config_exists; then
+    return 1
+  fi
+  jq -c --arg h "$hostname" '.wuns_credentials[$h] // empty' "${CONFIG_FILE}"
+}
+
 # Get CA name for domain
 # Args: $1 = domain name
 # Returns: ca.<domain>
@@ -1162,6 +1174,98 @@ reconcile_ddns_updater_secret_env() {
       if [[ -n "$account_id" ]]; then
         printf 'DNSIMPLE_ACCOUNT_ID=%s\n' "$account_id"
       fi
+    } > "$stage_file"
+  )
+
+  if node_path_is_file "$node" "$secret_file"; then
+    if ! node_download_file "$node" "$secret_file" "$current_file"; then
+      rm -rf "$stage_dir"
+      return 1
+    fi
+    if cmp -s "$stage_file" "$current_file"; then
+      changed=false
+    fi
+  fi
+
+  if ! node_mkdir "$node" "$secret_dir" \
+    || ! run_on_node "$node" chown "${root_uid}:${root_gid}" "$secret_dir" \
+    || ! run_on_node "$node" chmod 0700 "$secret_dir"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if [[ "$changed" == true ]] \
+    && ! node_upload_file "$node" "$stage_file" "$secret_file" 0400 "$root_uid" "$root_gid"; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  if [[ "$changed" == false ]] \
+    && { ! run_on_node "$node" chown "${root_uid}:${root_gid}" "$secret_file" \
+      || ! run_on_node "$node" chmod 0400 "$secret_file"; }; then
+    rm -rf "$stage_dir"
+    return 1
+  fi
+
+  rm -rf "$stage_dir"
+}
+
+# Materialize WUNS credentials as a raw secret env file on its authoritative owner.
+# Args: $1 = CTID, $2 = hostname, $3 = owner-local Docker directory
+reconcile_wuns_secret_env() {
+  local ctid="${1:-}" hostname="${2:-}" docker_dir="${3:-}"
+  local credentials username password smtp_username smtp_password
+  local node root_uid root_gid secret_dir secret_file stage_dir stage_file current_file
+  local changed=true
+
+  [[ "$ctid" =~ ^[1-9][0-9]*$ && -n "$hostname" && "$docker_dir" == /mnt/docker/* ]] || {
+    echo "ERROR: Invalid WUNS secret reconciliation arguments." >&2
+    return 1
+  }
+
+  credentials=$(config_get_wuns_credentials "$hostname") || return 1
+  [[ -n "$credentials" ]] || return 0
+
+  if ! jq -e '
+    type == "object"
+    and (. as $credentials
+      | ["WUNS_USERNAME", "WUNS_PASSWORD", "WUNS_SMTP_USERNAME", "WUNS_SMTP_PASSWORD"]
+      | all(. as $key
+        | $credentials[$key]
+        | type == "string" and length > 0 and (test("[\\r\\n]") | not)))
+  ' <<< "$credentials" >/dev/null 2>&1; then
+    echo "ERROR: Incomplete or invalid WUNS credentials for ${hostname}." >&2
+    return 1
+  fi
+
+  username=$(jq -r '.WUNS_USERNAME // empty' <<< "$credentials")
+  password=$(jq -r '.WUNS_PASSWORD // empty' <<< "$credentials")
+  smtp_username=$(jq -r '.WUNS_SMTP_USERNAME // empty' <<< "$credentials")
+  smtp_password=$(jq -r '.WUNS_SMTP_PASSWORD // empty' <<< "$credentials")
+  if [[ -z "$username" || -z "$password" || -z "$smtp_username" || -z "$smtp_password" \
+    || "$username" == *$'\n'* || "$username" == *$'\r'* \
+    || "$password" == *$'\n'* || "$password" == *$'\r'* \
+    || "$smtp_username" == *$'\n'* || "$smtp_username" == *$'\r'* \
+    || "$smtp_password" == *$'\n'* || "$smtp_password" == *$'\r'* ]]; then
+    echo "ERROR: Incomplete or invalid WUNS credentials for ${hostname}." >&2
+    return 1
+  fi
+
+  node=$(get_ct_owner_node "$ctid") || return 1
+  read -r root_uid root_gid < <(get_ct_host_root_ids "$ctid") || return 1
+  secret_dir="${docker_dir}/_secrets"
+  secret_file="${secret_dir}/wuns.env"
+  stage_dir=$(mktemp -d)
+  stage_file="${stage_dir}/wuns.env"
+  current_file="${stage_dir}/current.env"
+
+  (
+    umask 077
+    {
+      printf 'WUNS_USERNAME=%s\n' "$username"
+      printf 'WUNS_PASSWORD=%s\n' "$password"
+      printf 'WUNS_SMTP_USERNAME=%s\n' "$smtp_username"
+      printf 'WUNS_SMTP_PASSWORD=%s\n' "$smtp_password"
     } > "$stage_file"
   )
 
@@ -5379,6 +5483,7 @@ setup_mountpoints() {
   fi
   if ! read -r root_uid root_gid < <(get_ct_host_root_ids "$CTID") \
     || ! reconcile_ddns_updater_secret_env "$CTID" "$hostname_lower" "$DIR_DOCKER" \
+    || ! reconcile_wuns_secret_env "$CTID" "$hostname_lower" "$DIR_DOCKER" \
     || ! node_upload_file "$node" "$stage_env" "$ENV_FILE" 0600 "$root_uid" "$root_gid"; then
     rm -rf "$stage_dir"
     return 1

@@ -109,6 +109,7 @@ SCRIPT_DIR="$SCRIPT_DIR" SETUP_LOG="$setup_log" bash -c '
   node_upload_file() { printf "node_upload_file %s\n" "$*" >> "$SETUP_LOG"; }
   reconcile_ct_mountpoints() { printf "reconcile %s\n" "$*" >> "$SETUP_LOG"; }
   reconcile_ddns_updater_secret_env() { printf "ddns %s\n" "$*" >> "$SETUP_LOG"; }
+  reconcile_wuns_secret_env() { printf "wuns %s\n" "$*" >> "$SETUP_LOG"; }
   setup_mountpoints >/dev/null
 '
 assert_contains "mount setup reconciles mounts" "$setup_log" \
@@ -117,12 +118,12 @@ assert_contains "mount setup publishes env with mapped CT ownership" "$setup_log
   "node_upload_file pve02"
 assert_contains "mount setup targets the host Docker tree with mapped IDs" "$setup_log" \
   "/mnt/docker/app.thesaints.home/.env 0600 100000 100000"
-if [[ "$(grep -nE '^(reconcile|ddns|node_upload_file)' "$setup_log" | cut -d: -f2- | paste -sd, -)" \
-  == reconcile\ 2200\ app.thesaints.home,ddns\ 2200\ app.thesaints.home\ /mnt/docker/app.thesaints.home,node_upload_file\ pve02* ]]; then
-  pass "mount setup publishes DDNS secrets before the Compose environment"
+if [[ "$(grep -nE '^(reconcile|ddns|wuns|node_upload_file)' "$setup_log" | cut -d: -f2- | paste -sd, -)" \
+  == reconcile\ 2200\ app.thesaints.home,ddns\ 2200\ app.thesaints.home\ /mnt/docker/app.thesaints.home,wuns\ 2200\ app.thesaints.home\ /mnt/docker/app.thesaints.home,node_upload_file\ pve02* ]]; then
+  pass "mount setup publishes workload secrets before the Compose environment"
 else
   cat "$setup_log" >&2
-  fail "mount setup publishes DDNS secrets before the Compose environment"
+  fail "mount setup publishes workload secrets before the Compose environment"
 fi
 
 ddns_config="${TEST_ROOT}/ddns-config.json"
@@ -247,12 +248,116 @@ else
   fail "invalid DDNS credentials fail closed without replacing the secret"
 fi
 
+wuns_config="${TEST_ROOT}/wuns-config.json"
+cat > "$wuns_config" <<'EOF'
+{"wuns_credentials":{"worker.thesaints.home":{"WUNS_USERNAME":"test-user","WUNS_PASSWORD":"test-password","WUNS_SMTP_USERNAME":"test-smtp-user","WUNS_SMTP_PASSWORD":"test-smtp-password"}}}
+EOF
+wuns_keys=$(SCRIPT_DIR="$SCRIPT_DIR" CONFIG_FILE="$wuns_config" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_wuns_credentials worker.thesaints.home | jq -r "keys_unsorted[]"
+' | paste -sd, -)
+if [[ "$wuns_keys" == "WUNS_USERNAME,WUNS_PASSWORD,WUNS_SMTP_USERNAME,WUNS_SMTP_PASSWORD" ]]; then
+  pass "WUNS credentials opt in by hostname with the exact key set"
+else
+  fail "WUNS credentials opt in by hostname with the exact key set"
+fi
+
+wuns_noop_log="${TEST_ROOT}/wuns-noop.log"
+SCRIPT_DIR="$SCRIPT_DIR" WUNS_LOG="$wuns_noop_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_wuns_credentials() { :; }
+  get_ct_owner_node() { printf "unexpected owner lookup\n" >> "$WUNS_LOG"; return 1; }
+  reconcile_wuns_secret_env 2200 app.thesaints.home /mnt/docker/app.thesaints.home
+'
+if [[ ! -s "$wuns_noop_log" ]]; then
+  pass "WUNS secret reconciliation is a no-op without opt-in"
+else
+  cat "$wuns_noop_log" >&2
+  fail "WUNS secret reconciliation is a no-op without opt-in"
+fi
+
+wuns_publish_log="${TEST_ROOT}/wuns-publish.log"
+wuns_published="${TEST_ROOT}/wuns-published.env"
+SCRIPT_DIR="$SCRIPT_DIR" WUNS_LOG="$wuns_publish_log" WUNS_PUBLISHED="$wuns_published" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_wuns_credentials() {
+    printf "%s\n" "{\"WUNS_USERNAME\":\"test-user\",\"WUNS_PASSWORD\":\"test-password\",\"WUNS_SMTP_USERNAME\":\"test-smtp-user\",\"WUNS_SMTP_PASSWORD\":\"test-smtp-password\"}"
+  }
+  get_ct_owner_node() { printf "pve02\n"; }
+  get_ct_host_root_ids() { printf "200000 300000\n"; }
+  node_path_is_file() { return 1; }
+  node_mkdir() { printf "node_mkdir %s\n" "$*" >> "$WUNS_LOG"; }
+  run_on_node() { printf "run_on_node %s\n" "$*" >> "$WUNS_LOG"; }
+  node_upload_file() {
+    cp "$2" "$WUNS_PUBLISHED"
+    printf "node_upload_file %s %s %s %s %s\n" "$1" "$3" "$4" "$5" "$6" >> "$WUNS_LOG"
+  }
+  reconcile_wuns_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+'
+assert_contains "WUNS secret is routed to the remote CT owner" "$wuns_publish_log" \
+  "node_upload_file pve02 /mnt/docker/worker.thesaints.home/_secrets/wuns.env 0400 200000 300000"
+assert_contains "WUNS secret directory uses mapped root ownership" "$wuns_publish_log" \
+  "run_on_node pve02 chown 200000:300000 /mnt/docker/worker.thesaints.home/_secrets"
+if [[ "$(cut -d= -f1 "$wuns_published" | paste -sd, -)" \
+  == "WUNS_USERNAME,WUNS_PASSWORD,WUNS_SMTP_USERNAME,WUNS_SMTP_PASSWORD" ]]; then
+  pass "WUNS secret contains exactly the four credential keys"
+else
+  fail "WUNS secret contains exactly the four credential keys"
+fi
+assert_not_contains "WUNS lifecycle logs do not expose the WebUntis password" \
+  "$wuns_publish_log" "test-password"
+assert_not_contains "WUNS lifecycle logs do not expose the SMTP password" \
+  "$wuns_publish_log" "test-smtp-password"
+
+wuns_unchanged_log="${TEST_ROOT}/wuns-unchanged.log"
+SCRIPT_DIR="$SCRIPT_DIR" WUNS_CURRENT="$wuns_published" WUNS_LOG="$wuns_unchanged_log" bash -c '
+  source "$SCRIPT_DIR/commonCT.sh"
+  config_get_wuns_credentials() {
+    printf "%s\n" "{\"WUNS_USERNAME\":\"test-user\",\"WUNS_PASSWORD\":\"test-password\",\"WUNS_SMTP_USERNAME\":\"test-smtp-user\",\"WUNS_SMTP_PASSWORD\":\"test-smtp-password\"}"
+  }
+  get_ct_owner_node() { printf "pve02\n"; }
+  get_ct_host_root_ids() { printf "100000 100000\n"; }
+  node_path_is_file() { return 0; }
+  node_download_file() { cp "$WUNS_CURRENT" "$3"; }
+  node_mkdir() { :; }
+  run_on_node() { printf "%s\n" "$*" >> "$WUNS_LOG"; }
+  node_upload_file() { printf "unexpected upload\n" >> "$WUNS_LOG"; return 1; }
+  reconcile_wuns_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+'
+assert_not_contains "unchanged WUNS content is not uploaded" "$wuns_unchanged_log" "unexpected upload"
+assert_contains "unchanged WUNS secret permissions are reconciled" "$wuns_unchanged_log" \
+  "pve02 chmod 0400 /mnt/docker/worker.thesaints.home/_secrets/wuns.env"
+
+for invalid_case in incomplete multiline; do
+  wuns_invalid_log="${TEST_ROOT}/wuns-${invalid_case}.log"
+  if SCRIPT_DIR="$SCRIPT_DIR" WUNS_LOG="$wuns_invalid_log" WUNS_INVALID_CASE="$invalid_case" bash -c '
+    source "$SCRIPT_DIR/commonCT.sh"
+    config_get_wuns_credentials() {
+      if [[ "$WUNS_INVALID_CASE" == incomplete ]]; then
+        printf "%s\n" "{\"WUNS_USERNAME\":\"test-user\",\"WUNS_PASSWORD\":\"test-password\",\"WUNS_SMTP_USERNAME\":\"test-smtp-user\"}"
+      else
+        printf "%s\n" "{\"WUNS_USERNAME\":\"test-user\\nsecond-line\",\"WUNS_PASSWORD\":\"test-password\",\"WUNS_SMTP_USERNAME\":\"test-smtp-user\",\"WUNS_SMTP_PASSWORD\":\"test-smtp-password\"}"
+      fi
+    }
+    node_upload_file() { printf "unexpected upload\n" >> "$WUNS_LOG"; }
+    reconcile_wuns_secret_env 3100 worker.thesaints.home /mnt/docker/worker.thesaints.home
+  ' > "${TEST_ROOT}/wuns-${invalid_case}.out" 2>&1; then
+    fail "${invalid_case} WUNS credentials fail closed"
+  elif [[ ! -s "$wuns_invalid_log" ]] \
+    && grep -Fq "Incomplete or invalid WUNS credentials" "${TEST_ROOT}/wuns-${invalid_case}.out"; then
+    pass "${invalid_case} WUNS credentials fail closed without replacing the secret"
+  else
+    cat "${TEST_ROOT}/wuns-${invalid_case}.out" "$wuns_invalid_log" >&2
+    fail "${invalid_case} WUNS credentials fail closed without replacing the secret"
+  fi
+done
+
 setup_line=$(grep -n 'if ! setup_mountpoints' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
 reset_docker_line=$(grep -n 'if ! reset_docker' "${SCRIPT_DIR}/refreshCT.sh" | cut -d: -f1)
 if [[ -n "$setup_line" && -n "$reset_docker_line" && "$setup_line" -lt "$reset_docker_line" ]]; then
-  pass "DDNS secret generation occurs before the first Compose render"
+  pass "workload secret generation occurs before the first Compose render"
 else
-  fail "DDNS secret generation occurs before the first Compose render"
+  fail "workload secret generation occurs before the first Compose render"
 fi
 
 compose_image_log="${TEST_ROOT}/compose-images.log"

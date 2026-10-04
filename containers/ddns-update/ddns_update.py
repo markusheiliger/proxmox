@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -39,7 +41,7 @@ class Config:
     unifi_site: str
     udm_tls_verify: bool
     dnsimple_zone: str
-    dnsimple_record: str
+    dnsimple_record: str | None
     dnsimple_token: str
     dnsimple_account_id: str | None
     dns_ttl: int
@@ -62,10 +64,11 @@ class Config:
             raise ConfigurationError("UDM_URL must be an https URL")
 
         zone = required("DNSIMPLE_ZONE").rstrip(".").lower()
-        record = required("DNSIMPLE_RECORD").rstrip(".").lower()
+        record_value = values.get("DNSIMPLE_RECORD", "").strip()
+        record = record_value.rstrip(".").lower() if record_value else None
         if not RECORD_RE.fullmatch(zone):
             raise ConfigurationError("DNSIMPLE_ZONE is invalid")
-        if not RECORD_RE.fullmatch(record):
+        if record is not None and not RECORD_RE.fullmatch(record):
             raise ConfigurationError("DNSIMPLE_RECORD is invalid")
 
         ttl = parse_integer(values.get("DNS_TTL", "300"), "DNS_TTL", 60)
@@ -185,14 +188,74 @@ def select_global_ipv6(payload: dict[str, Any]) -> str:
     return str(next(iter(addresses)))
 
 
-def discover_udm_ipv6(config: Config, requester: RequestJson = request_json) -> str:
+@dataclass(frozen=True)
+class UdmDiscovery:
+    address: str
+    site_id: str | None
+    device_id: str | None
+
+
+def discover_udm(config: Config, requester: RequestJson = request_json) -> UdmDiscovery:
     site = urllib.parse.quote(config.unifi_site, safe="")
     url = f"{config.udm_url}/proxy/network/api/s/{site}/stat/device"
     context = None if config.udm_tls_verify else ssl._create_unverified_context()
     payload = requester(
         "GET", url, {"X-API-KEY": config.udm_api_key}, context=context
     )
-    return select_global_ipv6(payload)
+    devices = payload.get("data")
+    if not isinstance(devices, list):
+        raise ApiError("UDM response contains no device list")
+
+    gateways: list[tuple[dict[str, Any], set[ipaddress.IPv6Address]]] = []
+    for device in devices:
+        if not isinstance(device, dict) or not isinstance(device.get("wan1"), dict):
+            continue
+        addresses: set[ipaddress.IPv6Address] = set()
+        for candidate in collect_wan_ipv6({"wan1": device["wan1"]}):
+            try:
+                address = ipaddress.ip_address(candidate.split("/", 1)[0])
+            except ValueError:
+                continue
+            if isinstance(address, ipaddress.IPv6Address) and address in GLOBAL_UNICAST:
+                addresses.add(address)
+        if addresses:
+            gateways.append((device, addresses))
+
+    if not gateways:
+        raise ApiError("UDM response contains no gateway with a global WAN IPv6 address")
+    if len(gateways) != 1:
+        raise ApiError("UDM response contains multiple gateways with global WAN IPv6 addresses")
+
+    gateway, addresses = gateways[0]
+    if len(addresses) != 1:
+        raise ApiError("UDM gateway contains multiple global WAN IPv6 addresses")
+
+    raw_site_id = gateway.get("site_id")
+    raw_device_id = gateway.get("device_id")
+    site_id = raw_site_id.strip().lower() if isinstance(raw_site_id, str) else ""
+    device_id = raw_device_id.strip().lower() if isinstance(raw_device_id, str) else ""
+    return UdmDiscovery(
+        address=str(next(iter(addresses))),
+        site_id=site_id or None,
+        device_id=device_id or None,
+    )
+
+
+def derive_dns_record(site_id: str, device_id: str) -> str:
+    normalized_site_id = site_id.strip().lower()
+    normalized_device_id = device_id.strip().lower()
+    if not normalized_site_id:
+        raise ApiError("UDM gateway contains no site_id")
+    if not normalized_device_id:
+        raise ApiError("UDM gateway contains no device_id")
+    record = hmac.new(
+        normalized_site_id.encode(),
+        normalized_device_id.encode(),
+        hashlib.sha256,
+    ).hexdigest()[:16]
+    if not RECORD_RE.fullmatch(record):
+        raise ApiError("derived DNS record is invalid")
+    return record
 
 
 def resolve_account_id(config: Config, requester: RequestJson) -> str:
@@ -217,14 +280,18 @@ def dnsimple_headers(config: Config) -> dict[str, str]:
 def reconcile_dns(
     config: Config,
     address: str,
+    record: str | None = None,
     dry_run: bool = False,
     requester: RequestJson = request_json,
 ) -> str:
+    effective_record = record or config.dnsimple_record
+    if effective_record is None:
+        raise ApiError("DNS record has not been resolved")
     account_id = urllib.parse.quote(resolve_account_id(config, requester), safe="")
     zone = urllib.parse.quote(config.dnsimple_zone, safe="")
     base_url = f"https://api.dnsimple.com/v2/{account_id}/zones/{zone}/records"
     query = urllib.parse.urlencode(
-        {"type": "AAAA", "name": config.dnsimple_record}
+        {"type": "AAAA", "name": effective_record}
     )
     payload = requester(
         "GET", f"{base_url}?{query}", dnsimple_headers(config)
@@ -237,7 +304,7 @@ def reconcile_dns(
         for record in records
         if isinstance(record, dict)
         and record.get("type") == "AAAA"
-        and record.get("name") == config.dnsimple_record
+        and record.get("name") == effective_record
     ]
     if len(exact) > 1:
         raise ApiError("DNSimple contains multiple matching AAAA records")
@@ -248,7 +315,7 @@ def reconcile_dns(
                 base_url,
                 dnsimple_headers(config),
                 payload={
-                    "name": config.dnsimple_record,
+                    "name": effective_record,
                     "type": "AAAA",
                     "content": address,
                     "ttl": config.dns_ttl,
@@ -292,12 +359,21 @@ def reconcile_once(
     config: Config,
     dry_run: bool = False,
     requester: RequestJson = request_json,
-) -> tuple[str, str]:
-    address = discover_udm_ipv6(config, requester)
-    action = reconcile_dns(config, address, dry_run, requester)
+) -> tuple[str, str, str]:
+    discovery = discover_udm(config, requester)
+    record = config.dnsimple_record
+    if record is None:
+        record = derive_dns_record(discovery.site_id or "", discovery.device_id or "")
+    action = reconcile_dns(
+        config,
+        discovery.address,
+        record=record,
+        dry_run=dry_run,
+        requester=requester,
+    )
     if not dry_run:
         write_health(config.health_file)
-    return action, address
+    return action, discovery.address, record
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -328,13 +404,13 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         try:
-            action, address = reconcile_once(config, args.dry_run)
+            action, address, record = reconcile_once(config, args.dry_run)
             qualifier = "would " if args.dry_run and action != "noop" else ""
             LOGGER.info(
-                "%s%s gateway %s.%s -> %s",
+                "%s%s record %s.%s -> %s",
                 qualifier,
                 action,
-                config.dnsimple_record,
+                record,
                 config.dnsimple_zone,
                 address,
             )

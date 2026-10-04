@@ -83,10 +83,27 @@ docker run --rm ddns-update:verify --version
 ```
 
 The GitHub workflow publishes full, minor, major, and `latest` tags and verifies
-the result by immutable digest. For version `1.0.0`, these are `1.0.0`, `1.0`,
+the result by immutable digest. For version `1.1.0`, these are `1.1.0`, `1.1`,
 `1`, and `latest`. Compose deployments use the explicit stable tag
-`ghcr.io/markusheiliger/ddns-update:1.0.0`; `latest` is only a registry
+`ghcr.io/markusheiliger/ddns-update:1.1.0`; `latest` is only a registry
 convenience tag.
+
+`DNSIMPLE_RECORD` is an optional explicit override. When it is absent, the
+updater selects the one UniFi gateway that owns the global `wan1.ipv6` address,
+reads `site_id` and `device_id` from that same API object, normalizes both by
+trimming and lowercasing, and derives the record as:
+
+```text
+HMAC-SHA256(key=site_id, message=device_id).hexdigest()[0:16]
+```
+
+`UNIFI_SITE` remains the API path selector (commonly `default`); it is not the
+opaque `site_id`. The generated lowercase hexadecimal label is a deterministic,
+non-semantic fleet naming convention, not a security boundary. Persist the
+resulting DNS identity in the operator inventory. A UniFi database reset or
+readoption may change either source ID, but the updater never deletes the old
+record automatically; use an explicit `DNSIMPLE_RECORD` during migration or
+rollback when a stable prior name must be retained.
 
 ## Documentation
 

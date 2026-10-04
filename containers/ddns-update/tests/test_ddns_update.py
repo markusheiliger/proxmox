@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -11,6 +12,8 @@ from ddns_update import (  # noqa: E402
     ApiError,
     Config,
     ConfigurationError,
+    derive_dns_record,
+    discover_udm,
     health_is_fresh,
     reconcile_dns,
     reconcile_once,
@@ -40,6 +43,11 @@ class ConfigTests(unittest.TestCase):
         config = Config.from_env(valid_env())
         self.assertFalse(config.udm_tls_verify)
         self.assertEqual(config.dns_ttl, 300)
+
+    def test_record_override_is_optional(self):
+        env = valid_env()
+        env.pop("DNSIMPLE_RECORD")
+        self.assertIsNone(Config.from_env(env).dnsimple_record)
 
     def test_rejects_invalid_values(self):
         cases = {
@@ -82,6 +90,70 @@ class AddressTests(unittest.TestCase):
                     ]
                 }
             )
+
+    def test_discovers_gateway_address_and_identifiers(self):
+        config = Config.from_env(valid_env())
+
+        def requester(method, url, headers, payload=None, context=None):
+            return {
+                "data": [
+                    {"type": "uap"},
+                    {
+                        "site_id": " Site-123 ",
+                        "device_id": " Device-456 ",
+                        "wan1": {"ipv6": ["fe80::1", "2a00:6020::1/64"]},
+                    },
+                ]
+            }
+
+        discovery = discover_udm(config, requester)
+        self.assertEqual(discovery.address, "2a00:6020::1")
+        self.assertEqual(discovery.site_id, "site-123")
+        self.assertEqual(discovery.device_id, "device-456")
+
+    def test_rejects_ambiguous_gateway_discovery(self):
+        config = Config.from_env(valid_env())
+
+        for devices in (
+            [
+                {"site_id": "site", "device_id": "one", "wan1": {"ipv6": ["2a00:6020::1"]}},
+                {"site_id": "site", "device_id": "two", "wan1": {"ipv6": ["2a00:6020::2"]}},
+            ],
+            [
+                {
+                    "site_id": "site",
+                    "device_id": "one",
+                    "wan1": {"ipv6": ["2a00:6020::1", "2a00:6020::2"]},
+                }
+            ],
+        ):
+            with self.subTest(devices=devices):
+                with self.assertRaises(ApiError):
+                    discover_udm(config, lambda *args, **kwargs: {"data": devices})
+
+
+class RecordDerivationTests(unittest.TestCase):
+    def test_fixed_vector_is_normalized_and_dns_safe(self):
+        record = derive_dns_record(" Site-123 ", " Device-456 ")
+        self.assertEqual(record, "61012d9014491598")
+        self.assertRegex(record, r"^[a-f0-9]{16}$")
+        self.assertEqual(record, derive_dns_record("site-123", "device-456"))
+
+    def test_changes_when_either_identifier_changes(self):
+        baseline = derive_dns_record("site-123", "device-456")
+        self.assertNotEqual(baseline, derive_dns_record("site-124", "device-456"))
+        self.assertNotEqual(baseline, derive_dns_record("site-123", "device-457"))
+
+    def test_rejects_missing_identifiers(self):
+        for site_id, device_id in (
+            ("", "device"),
+            (" ", "device"),
+            ("site", ""),
+            ("site", " "),
+        ):
+            with self.subTest(site_id=site_id, device_id=device_id):
+                with self.assertRaises(ApiError):
+                    derive_dns_record(site_id, device_id)
 
 
 class DnsTests(unittest.TestCase):
@@ -166,9 +238,24 @@ class DnsTests(unittest.TestCase):
             return {"data": []}
 
         self.assertEqual(
-            reconcile_dns(config, "2a00:6020::1", True, requester), "create"
+            reconcile_dns(config, "2a00:6020::1", dry_run=True, requester=requester),
+            "create",
         )
         self.assertIn("/v2/456/zones/", calls[-1])
+
+    def test_uses_derived_record_in_dnsimple_requests(self):
+        requester, calls = self.requester_for_records([])
+        self.assertEqual(
+            reconcile_dns(
+                replace(self.config, dnsimple_record=None),
+                "2a00:6020::1",
+                record="a683ccfdf49cbf1e",
+                requester=requester,
+            ),
+            "create",
+        )
+        self.assertIn("name=a683ccfdf49cbf1e", calls[0][1])
+        self.assertEqual(calls[-1][2]["name"], "a683ccfdf49cbf1e")
 
 
 class HealthTests(unittest.TestCase):
@@ -179,14 +266,65 @@ class HealthTests(unittest.TestCase):
 
             def requester(method, url, headers, payload=None, context=None):
                 if "stat/device" in url:
-                    return {"data": [{"wan1": {"ipv6": ["2a00:6020::1"]}}]}
+                    return {
+                        "data": [
+                            {
+                                "site_id": "site-123",
+                                "device_id": "device-456",
+                                "wan1": {"ipv6": ["2a00:6020::1"]},
+                            }
+                        ]
+                    }
                 return {"data": []}
 
-            action, _ = reconcile_once(config, True, requester)
+            action, _, record = reconcile_once(config, True, requester)
             self.assertEqual(action, "create")
+            self.assertEqual(record, "gateway")
             self.assertFalse(health_file.exists())
             reconcile_once(config, False, requester)
             self.assertTrue(health_file.exists())
+
+    def test_automatic_mode_fails_before_dnsimple_without_identifiers(self):
+        config = Config.from_env({key: value for key, value in valid_env().items() if key != "DNSIMPLE_RECORD"})
+        for gateway in (
+            {"device_id": "device-456", "wan1": {"ipv6": ["2a00:6020::1"]}},
+            {"site_id": "site-123", "wan1": {"ipv6": ["2a00:6020::1"]}},
+        ):
+            calls = []
+
+            def requester(method, url, headers, payload=None, context=None):
+                calls.append(url)
+                return {"data": [gateway]}
+
+            with self.subTest(gateway=gateway):
+                with self.assertRaises(ApiError):
+                    reconcile_once(config, requester=requester)
+                self.assertEqual(len(calls), 1)
+
+    def test_automatic_mode_derives_and_returns_effective_record(self):
+        config = Config.from_env({key: value for key, value in valid_env().items() if key != "DNSIMPLE_RECORD"})
+        calls = []
+
+        def requester(method, url, headers, payload=None, context=None):
+            calls.append((method, url, payload))
+            if "stat/device" in url:
+                return {
+                    "data": [
+                        {
+                            "site_id": "site-123",
+                            "device_id": "device-456",
+                            "wan1": {"ipv6": ["2a00:6020::1"]},
+                        }
+                    ]
+                }
+            return {"data": []}
+
+        action, address, record = reconcile_once(
+            config, dry_run=True, requester=requester
+        )
+        self.assertEqual((action, address, record), ("create", "2a00:6020::1", "61012d9014491598"))
+        self.assertEqual([call[0] for call in calls], ["GET", "GET"])
+        self.assertIn("name=61012d9014491598", calls[-1][1])
 
     def test_health_freshness(self):
         with tempfile.TemporaryDirectory() as directory:

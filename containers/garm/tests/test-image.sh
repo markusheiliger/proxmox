@@ -20,5 +20,18 @@ docker run --rm --entrypoint /bin/sh "$IMAGE" -ec '
   test -x /usr/local/bin/healthcheck
 '
 
+docker run --rm --entrypoint /bin/sh "$IMAGE" -ec '
+  mkdir /tmp/bin
+  cat > /tmp/bin/wget <<'EOF'
+#!/bin/sh
+printf "%s\n" \
+  "  HTTP/1.1 409 Conflict" \
+  "wget: server returned error: HTTP/1.1 409 Conflict" >&2
+exit 1
+EOF
+  chmod 0755 /tmp/bin/wget
+  PATH=/tmp/bin:$PATH /usr/local/bin/healthcheck
+'
+
 entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")
 [[ "$entrypoint" == '["/bin/garm","-config","/etc/garm/config.toml"]' ]]

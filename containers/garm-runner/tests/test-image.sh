@@ -2,7 +2,7 @@
 set -euo pipefail
 
 IMAGE="${1:?usage: test-image.sh <image>}"
-EXPECTED_RUNNER_VERSION="${EXPECTED_RUNNER_VERSION:-2.338.0}"
+EXPECTED_RUNNER_VERSION="${EXPECTED_VERSION:-${EXPECTED_RUNNER_VERSION:-2.338.0}}"
 EXPECTED_COMPOSE_VERSION="${EXPECTED_COMPOSE_VERSION:-5.6.0}"
 
 label_version=$(docker image inspect \

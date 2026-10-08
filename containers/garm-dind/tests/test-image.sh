@@ -2,7 +2,7 @@
 set -euo pipefail
 
 IMAGE="${1:?usage: test-image.sh <image>}"
-EXPECTED_DIND_VERSION="${EXPECTED_DIND_VERSION:-29.8.2}"
+EXPECTED_DIND_VERSION="${EXPECTED_VERSION:-${EXPECTED_DIND_VERSION:-29.8.2}}"
 
 label_version=$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")

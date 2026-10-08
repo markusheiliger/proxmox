@@ -14,14 +14,19 @@ Each image directory owns its `Dockerfile` and entrypoint. Build context is the
 image directory; deployment references belong in Compose files rather than in
 this source folder.
 
+The container workflow discovers every direct `containers/*/Dockerfile` and
+requires a matching `image-version.json` entry plus an executable
+`tests/test-image.sh`. Every discovered image follows the same build, local
+contract test, publication, and immutable-digest verification path. It
+publishes the configured full version, minor, major, and `latest` tags.
+
 ## Caddy release lifecycle
 
 `image-version.json` is the authoritative map from each project image name to
 its reviewed base or application version. The `caddy-dnsimple` and
 `caddy-stepca` entries must contain the same bare stable semantic version, such
 as `2.11.4`. To adopt a new stable release, review its upstream release notes
-and update both entries. The container workflow verifies that the pins match
-the latest stable Caddy release before publishing either image.
+and update both entries.
 
 Build both variants locally with the same release input used by CI:
 
@@ -43,12 +48,10 @@ docker run --rm --entrypoint caddy caddy-dnsimple:verify version
 docker run --rm --entrypoint caddy caddy-dnsimple:verify list-modules --packages
 ```
 
-The GitHub Actions workflow can also be dispatched manually and runs weekly to
-detect an outdated release pin. The shared release job fails before either
-variant starts building unless the pin equals the latest stable upstream Caddy
-release. For each variant, its job summary records the previous `latest` digest
-and Caddy version status, then verifies the newly published image by the
-immutable digest returned from the build.
+The GitHub Actions workflow can be dispatched manually and also runs weekly.
+For each variant, its job summary records the previous `latest` digest and then
+verifies the newly published image by the immutable digest returned from the
+build.
 
 Each successful build publishes the same image digest under tags matching the
 official Caddy release family. For Caddy `2.11.4`, these are `2.11.4`, `2.11`,
@@ -113,8 +116,9 @@ rollback when a stable prior name must be retained.
 
 The `garm`, `garm-runner`, and `garm-dind` entries in `image-version.json`
 select the exact upstream application versions used by the build runner
-appliance. CI publishes only those exact tags; it does not publish moving or
-abbreviated aliases. Each workflow run records the immutable resulting digest.
+appliance. CI publishes the configured full version together with minor,
+major, and `latest` aliases through the same matrix path as every other image.
+Each workflow run records the immutable resulting digest.
 
 Build and test all three images locally with the same inputs used by CI:
 

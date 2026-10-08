@@ -10,148 +10,91 @@ on:
     - cron: '17 6 * * 1'
 
 jobs:
-  garm-release:
+  discover-images:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
-      dind-version: ${{ steps.release.outputs.dind-version }}
-      garm-version: ${{ steps.release.outputs.garm-version }}
-      runner-version: ${{ steps.release.outputs.runner-version }}
+      matrix: ${{ steps.discover.outputs.matrix }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Verify GARM image release pins
-        id: release
+      - name: Discover image build contracts
+        id: discover
         shell: bash
         run: |
           set -euo pipefail
 
-          garm_version=$(jq --exit-status --raw-output '.garm' containers/image-version.json)
-          runner_version=$(jq --exit-status --raw-output '."garm-runner"' containers/image-version.json)
-          dind_version=$(jq --exit-status --raw-output '."garm-dind"' containers/image-version.json)
+          mapfile -t image_dirs < <(
+            find containers -mindepth 2 -maxdepth 2 -name Dockerfile -printf '%h\n' |
+              sort
+          )
+          mapfile -t version_images < <(jq --exit-status --raw-output 'keys[]' containers/image-version.json)
+          mapfile -t dockerfile_images < <(printf '%s\n' "${image_dirs[@]##*/}")
 
-          [[ "$garm_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "garm must be a stable semantic version prefixed with v" >&2
+          [[ ${#image_dirs[@]} -gt 0 ]] || {
+            echo 'No containers/*/Dockerfile files found' >&2
             exit 1
           }
-          for version in "$runner_version" "$dind_version"; do
-            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-              echo "garm-runner and garm-dind must be stable semantic versions" >&2
+
+          mismatch=$(
+            comm -3 \
+              <(printf '%s\n' "${dockerfile_images[@]}") \
+              <(printf '%s\n' "${version_images[@]}")
+          )
+          if [[ -n "$mismatch" ]]; then
+            echo 'Dockerfile directories and image-version.json keys differ:' >&2
+            printf '%s\n' "$mismatch" >&2
+            exit 1
+          fi
+
+          matrix='[]'
+          for image_dir in "${image_dirs[@]}"; do
+            image=${image_dir##*/}
+            dockerfile=$image_dir/Dockerfile
+            test_script=$image_dir/tests/test-image.sh
+            version=$(jq --exit-status --raw-output --arg image "$image" '.[$image]' containers/image-version.json)
+            build_arg=$(
+              sed -nE \
+                's/^LABEL org\.opencontainers\.image\.version="\$\{([A-Z0-9_]+)\}".*/\1/p' \
+                "$dockerfile"
+            )
+
+            [[ "$version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "$image has invalid stable version: $version" >&2
               exit 1
             }
+            [[ -n "$build_arg" ]] || {
+              echo "$dockerfile must label its version from one build argument" >&2
+              exit 1
+            }
+            [[ -x "$test_script" ]] || {
+              echo "$test_script must exist and be executable" >&2
+              exit 1
+            }
+
+            entry=$(jq --null-input --compact-output \
+              --arg image "$image" \
+              --arg version "$version" \
+              --arg build_arg "$build_arg" \
+              '{image: $image, version: $version, build_arg: $build_arg}')
+            matrix=$(jq --compact-output --argjson entry "$entry" '. + [$entry]' <<< "$matrix")
           done
 
-          {
-            echo '## GARM appliance image releases'
-            echo
-            echo "- GARM: \`$garm_version\`"
-            echo "- Actions runner: \`$runner_version\`"
-            echo "- DinD: \`$dind_version\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
 
-          {
-            echo "garm-version=$garm_version"
-            echo "runner-version=$runner_version"
-            echo "dind-version=$dind_version"
-          } >> "$GITHUB_OUTPUT"
-
-  ddns-release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.release.outputs.version }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Verify DDNS updater release pin
-        id: release
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          version=$(jq --exit-status --raw-output '."ddns-update"' containers/image-version.json)
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "containers/image-version.json must define ddns-update as one stable semantic version" >&2
-            exit 1
-          fi
-
-          {
-            echo '## DDNS updater release'
-            echo
-            echo "- Repository pin: \`$version\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-  caddy-release:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      version: ${{ steps.release.outputs.version }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Verify Caddy release pin
-        id: release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          dnsimple_version=$(jq --exit-status --raw-output '."caddy-dnsimple"' containers/image-version.json)
-          stepca_version=$(jq --exit-status --raw-output '."caddy-stepca"' containers/image-version.json)
-          if [[ "$dnsimple_version" != "$stepca_version" ]]; then
-            echo "caddy-dnsimple and caddy-stepca must use the same Caddy release" >&2
-            exit 1
-          fi
-          version=$dnsimple_version
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "containers/image-version.json must define Caddy images as one stable semantic version" >&2
-            exit 1
-          fi
-
-          upstream=$(curl --fail --silent --show-error \
-            --header "Authorization: Bearer $GH_TOKEN" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            https://api.github.com/repos/caddyserver/caddy/releases/latest |
-            jq --raw-output '.tag_name | ltrimstr("v")')
-
-          {
-            echo '## Caddy release'
-            echo
-            echo "- Repository pin: \`$version\`"
-            echo "- Latest upstream stable: \`$upstream\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [[ "$version" != "$upstream" ]]; then
-            echo "Caddy release pin $version is stale; latest stable is $upstream" >&2
-            exit 1
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-  build:
-    needs: caddy-release
+  build-images:
+    needs: discover-images
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     strategy:
-      matrix:
-        image:
-          - caddy-dnsimple
-          - caddy-stepca
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover-images.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -169,198 +112,21 @@ jobs:
 
       - name: Audit current image
         env:
-          CADDY_RELEASE: ${{ needs.caddy-release.outputs.version }}
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
         shell: bash
         run: |
           set -euo pipefail
 
           {
-            echo "## ${{ matrix.image }}"
+            echo '## ${{ matrix.image }}'
             echo
             echo '### Current published image'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          docker pull "$IMAGE"
-
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
-          version=$(docker run --rm --entrypoint caddy "$IMAGE" version | cut -d' ' -f1)
-          status=current
-
-          [[ "$version" == "v$CADDY_RELEASE" ]] || status=stale
-
-          {
-            echo "- Digest: \`$digest\`"
-            echo "- Caddy: \`$version\`"
-            echo "- Version status: **$status**"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Generate image metadata
-        id: metadata
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.caddy-release.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.caddy-release.outputs.version }}
-            type=semver,pattern={{major}},value=${{ needs.caddy-release.outputs.version }}
-            type=raw,value=latest
-          labels: |
-            org.opencontainers.image.version=${{ needs.caddy-release.outputs.version }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: containers/${{ matrix.image }}
-          build-args: CADDY_RELEASE=${{ needs.caddy-release.outputs.version }}
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-
-      - name: Verify published image
-        env:
-          CADDY_RELEASE: ${{ needs.caddy-release.outputs.version }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          docker pull "$IMAGE"
-
-          version=$(docker run --rm --entrypoint caddy "$IMAGE" version | cut -d' ' -f1)
-          label=$(docker image inspect \
-            --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")
-
-          [[ "$version" == "v$CADDY_RELEASE" ]]
-          [[ "$label" == "$CADDY_RELEASE" ]]
-
-          {
-            echo
-            echo '### Published image'
-            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
-            echo "- Caddy: \`$version\`"
-            echo "- Version label: \`$label\`"
-            echo '- Version status: **verified**'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  build-ddns-update:
-    needs: ddns-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Audit current image
-        env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/ddns-update:latest
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          {
-            echo '## ddns-update'
-            echo
-            echo '### Current published image'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  build-garm-images:
-    needs: garm-release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    strategy:
-      matrix:
-        include:
-          - image: garm
-            version: ${{ needs.garm-release.outputs.garm-version }}
-            build-arg: GARM_VERSION
-          - image: garm-runner
-            version: ${{ needs.garm-release.outputs.runner-version }}
-            build-arg: RUNNER_VERSION
-          - image: garm-dind
-            version: ${{ needs.garm-release.outputs.dind-version }}
-            build-arg: DIND_VERSION
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Generate image metadata
-        id: metadata
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          tags: type=raw,value=${{ matrix.version }}
-          labels: |
-            org.opencontainers.image.version=${{ matrix.version }}
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-
-      - name: Build test image
-        uses: docker/build-push-action@v7
-        with:
-          context: containers/${{ matrix.image }}
-          build-args: ${{ matrix.build-arg }}=${{ matrix.version }}
-          load: true
-          tags: local/${{ matrix.image }}:test
-
-      - name: Test image contract
-        shell: bash
-        run: containers/${{ matrix.image }}/tests/test-image.sh local/${{ matrix.image }}:test
-
-      - name: Build and push
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: containers/${{ matrix.image }}
-          build-args: ${{ matrix.build-arg }}=${{ matrix.version }}
-          push: true
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-
-      - name: Record published digest
-        shell: bash
-        run: |
-          {
-            echo
-            echo "### ${{ matrix.image }}"
-            echo "- Tag: \`${{ matrix.version }}\`"
-            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
-            echo '- Publication status: **tested and published**'
           } >> "$GITHUB_STEP_SUMMARY"
 
           if docker pull "$IMAGE" >/dev/null 2>&1; then
             digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
-            version=$(docker run --rm "$IMAGE" --version)
+            version=$(docker image inspect \
+              --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")
             {
               echo "- Digest: \`$digest\`"
               echo "- Version: \`$version\`"
@@ -373,57 +139,56 @@ jobs:
         id: metadata
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository_owner }}/ddns-update
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.ddns-release.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.ddns-release.outputs.version }}
-            type=semver,pattern={{major}},value=${{ needs.ddns-release.outputs.version }}
+            type=raw,value=${{ matrix.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ matrix.version }}
+            type=semver,pattern={{major}},value=${{ matrix.version }}
             type=raw,value=latest
           labels: |
-            org.opencontainers.image.version=${{ needs.ddns-release.outputs.version }}
+            org.opencontainers.image.version=${{ matrix.version }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: containers/${{ matrix.image }}
+          build-args: ${{ matrix.build_arg }}=${{ matrix.version }}
+          load: true
+          tags: local/${{ matrix.image }}:test
+
+      - name: Test image contract
+        env:
+          EXPECTED_VERSION: ${{ matrix.version }}
+        shell: bash
+        run: containers/${{ matrix.image }}/tests/test-image.sh local/${{ matrix.image }}:test
 
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7
         with:
-          context: containers/ddns-update
-          build-args: DDNS_UPDATE_VERSION=${{ needs.ddns-release.outputs.version }}
+          context: containers/${{ matrix.image }}
+          build-args: ${{ matrix.build_arg }}=${{ matrix.version }}
           push: true
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
 
       - name: Verify published image
         env:
-          EXPECTED_REVISION: ${{ github.sha }}
-          EXPECTED_VERSION: ${{ needs.ddns-release.outputs.version }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/ddns-update@${{ steps.build.outputs.digest }}
+          EXPECTED_VERSION: ${{ matrix.version }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}
         shell: bash
         run: |
           set -euo pipefail
 
           docker pull "$IMAGE"
-
-          version=$(docker run --rm "$IMAGE" --version)
-          label_version=$(docker image inspect \
-            --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")
-          label_revision=$(docker image inspect \
-            --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
-          runtime_user=$(docker image inspect --format '{{.Config.User}}' "$IMAGE")
-
-          [[ "$version" == "$EXPECTED_VERSION" ]]
-          [[ "$label_version" == "$EXPECTED_VERSION" ]]
-          [[ "$label_revision" == "$EXPECTED_REVISION" ]]
-          [[ -n "$runtime_user" && "$runtime_user" != 0 && "$runtime_user" != root ]]
-          docker run --rm "$IMAGE" --help >/dev/null
+          containers/${{ matrix.image }}/tests/test-image.sh "$IMAGE"
 
           {
             echo
             echo '### Published image'
+            echo "- Version: \`${{ matrix.version }}\`"
             echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
-            echo "- Version: \`$version\`"
-            echo "- Revision: \`$label_revision\`"
-            echo "- Runtime user: \`$runtime_user\`"
             echo '- Publication status: **verified**'
           } >> "$GITHUB_STEP_SUMMARY"

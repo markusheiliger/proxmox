@@ -2,7 +2,7 @@
 set -euo pipefail
 
 IMAGE="${1:?usage: test-image.sh <image>}"
-EXPECTED_GARM_VERSION="${EXPECTED_GARM_VERSION:-v0.2.1}"
+EXPECTED_GARM_VERSION="${EXPECTED_VERSION:-${EXPECTED_GARM_VERSION:-v0.2.1}}"
 EXPECTED_PROVIDER_VERSION="${EXPECTED_PROVIDER_VERSION:-v0.2.0}"
 
 label_version=$(docker image inspect \

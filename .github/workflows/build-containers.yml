@@ -11,6 +11,7 @@ on:
 
 jobs:
   discover-images:
+    name: Discover Container Images
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -86,6 +87,7 @@ jobs:
           echo "matrix={\"include\":$matrix}" >> "$GITHUB_OUTPUT"
 
   build-images:
+    name: Build and Publish ${{ matrix.image }} (${{ matrix.version }})
     needs: discover-images
     runs-on: ubuntu-latest
     permissions:

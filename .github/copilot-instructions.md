@@ -71,8 +71,9 @@ Follow `testing.instructions.md` for cluster-aware fixtures, workload-test owner
 
 ## Configuration sources
 
-- `/root/scripts/commonCT.json` is the lifecycle configuration source and contains secrets; it is gitignored.
+- `/root/scripts/commonCT.json` is the infrastructure lifecycle configuration source and contains secrets; it is gitignored. Do not add service-specific credentials or workload desired state to it.
 - The per-CT `/mnt/docker/<hostname>/.env` is the source consumed by Compose and CT `configure.sh` scripts.
+- Workload raw env files below `/mnt/docker/<hostname>/_secrets/` are operator-managed workload state. Lifecycle scripts preserve existing files and may reconcile Compose-derived ownership and modes, but must not generate, rotate, validate, or repair their contents.
 - Shared POSIX configure helpers live in `/root/scripts/configure/` and are mirrored into CTs at `/mnt/docker/_config/shared/` during refresh. Never edit the mirrored copy.
 
 ## Docker service conventions

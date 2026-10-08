@@ -10,6 +10,54 @@ on:
     - cron: '17 6 * * 1'
 
 jobs:
+  garm-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      dind-version: ${{ steps.release.outputs.dind-version }}
+      garm-version: ${{ steps.release.outputs.garm-version }}
+      runner-version: ${{ steps.release.outputs.runner-version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify GARM image release pins
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          garm_version=$(jq --exit-status --raw-output '.garm' containers/image-version.json)
+          runner_version=$(jq --exit-status --raw-output '."garm-runner"' containers/image-version.json)
+          dind_version=$(jq --exit-status --raw-output '."garm-dind"' containers/image-version.json)
+
+          [[ "$garm_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "garm must be a stable semantic version prefixed with v" >&2
+            exit 1
+          }
+          for version in "$runner_version" "$dind_version"; do
+            [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "garm-runner and garm-dind must be stable semantic versions" >&2
+              exit 1
+            }
+          done
+
+          {
+            echo '## GARM appliance image releases'
+            echo
+            echo "- GARM: \`$garm_version\`"
+            echo "- Actions runner: \`$runner_version\`"
+            echo "- DinD: \`$dind_version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "garm-version=$garm_version"
+            echo "runner-version=$runner_version"
+            echo "dind-version=$dind_version"
+          } >> "$GITHUB_OUTPUT"
+
   ddns-release:
     runs-on: ubuntu-latest
     permissions:
@@ -27,9 +75,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          version=$(cat containers/ddns-update-version)
+          version=$(jq --exit-status --raw-output '."ddns-update"' containers/image-version.json)
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "containers/ddns-update-version must contain one stable semantic version" >&2
+            echo "containers/image-version.json must define ddns-update as one stable semantic version" >&2
             exit 1
           fi
 
@@ -60,9 +108,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          version=$(cat containers/caddy-version)
+          dnsimple_version=$(jq --exit-status --raw-output '."caddy-dnsimple"' containers/image-version.json)
+          stepca_version=$(jq --exit-status --raw-output '."caddy-stepca"' containers/image-version.json)
+          if [[ "$dnsimple_version" != "$stepca_version" ]]; then
+            echo "caddy-dnsimple and caddy-stepca must use the same Caddy release" >&2
+            exit 1
+          fi
+          version=$dnsimple_version
           if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "containers/caddy-version must contain one stable semantic version" >&2
+            echo "containers/image-version.json must define Caddy images as one stable semantic version" >&2
             exit 1
           fi
 
@@ -224,6 +278,84 @@ jobs:
             echo '## ddns-update'
             echo
             echo '### Current published image'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-garm-images:
+    needs: garm-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      matrix:
+        include:
+          - image: garm
+            version: ${{ needs.garm-release.outputs.garm-version }}
+            build-arg: GARM_VERSION
+          - image: garm-runner
+            version: ${{ needs.garm-release.outputs.runner-version }}
+            build-arg: RUNNER_VERSION
+          - image: garm-dind
+            version: ${{ needs.garm-release.outputs.dind-version }}
+            build-arg: DIND_VERSION
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: type=raw,value=${{ matrix.version }}
+          labels: |
+            org.opencontainers.image.version=${{ matrix.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build test image
+        uses: docker/build-push-action@v7
+        with:
+          context: containers/${{ matrix.image }}
+          build-args: ${{ matrix.build-arg }}=${{ matrix.version }}
+          load: true
+          tags: local/${{ matrix.image }}:test
+
+      - name: Test image contract
+        shell: bash
+        run: containers/${{ matrix.image }}/tests/test-image.sh local/${{ matrix.image }}:test
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: containers/${{ matrix.image }}
+          build-args: ${{ matrix.build-arg }}=${{ matrix.version }}
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+      - name: Record published digest
+        shell: bash
+        run: |
+          {
+            echo
+            echo "### ${{ matrix.image }}"
+            echo "- Tag: \`${{ matrix.version }}\`"
+            echo "- Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo '- Publication status: **tested and published**'
           } >> "$GITHUB_STEP_SUMMARY"
 
           if docker pull "$IMAGE" >/dev/null 2>&1; then

@@ -94,6 +94,7 @@ GW=""
 TEMPLATE_PREFIX=""
 TEMPLATE_STORE="local"
 TEMPLATE_PATH=""
+TEMPLATE_ARCH=""
 DIR_DOCKER=""
 DIR_DOCKER_DATA=""
 COMPOSE_FILE=""
@@ -186,23 +187,53 @@ set_defaults() {
   echo "Template prefix: ${TEMPLATE_PREFIX}"
 }
 
-# Find and download template
+# Normalize kernel architecture names to Proxmox template architecture names.
+normalize_template_arch() {
+  case "$1" in
+    x86_64|amd64)
+      echo "amd64"
+      ;;
+    aarch64|arm64)
+      echo "arm64"
+      ;;
+    *)
+      echo "ERROR: Unsupported template architecture '$1'." >&2
+      return 1
+      ;;
+  esac
+}
+
+select_latest_template() {
+  local prefix="$1"
+  local architecture="$2"
+
+  awk -v prefix="$prefix" -v architecture="$architecture" '
+    index($0, prefix) == 1 && $0 ~ ("_" architecture "\\.tar\\.(xz|zst|gz)$")
+  ' | sort -V | tail -n 1
+}
+
+# Find and download the latest template matching the target node architecture.
 prepare_template() {
-  echo "Searching for latest template matching prefix '${TEMPLATE_PREFIX}'..."
+  local node_arch
+  if ! node_arch=$(run_on_node "$CREATE_NODE" uname -m); then
+    echo "ERROR: Could not determine architecture of target node '${CREATE_NODE}'." >&2
+    return 1
+  fi
+  TEMPLATE_ARCH=$(normalize_template_arch "$node_arch") || return 1
+
+  echo "Searching for latest ${TEMPLATE_ARCH} template matching prefix '${TEMPLATE_PREFIX}'..."
   run_on_node "$CREATE_NODE" pveam update >/dev/null
 
   local latest_template
   latest_template=$(run_on_node "$CREATE_NODE" pveam available | awk '{print $2}' \
-    | grep "^${TEMPLATE_PREFIX}" \
-    | sort -V \
-    | tail -n 1)
+    | select_latest_template "$TEMPLATE_PREFIX" "$TEMPLATE_ARCH")
 
   if [[ -z "${latest_template}" ]]; then
-    echo "ERROR: No template found matching prefix '${TEMPLATE_PREFIX}'"
-    exit 1
+    echo "ERROR: No ${TEMPLATE_ARCH} template found matching prefix '${TEMPLATE_PREFIX}' on node '${CREATE_NODE}'." >&2
+    return 1
   fi
 
-  echo "Latest matching template: ${latest_template}"
+  echo "Latest matching template: ${latest_template} (${TEMPLATE_ARCH})"
   TEMPLATE_PATH="${TEMPLATE_STORE}:vztmpl/${latest_template}"
 
   if ! run_on_node "$CREATE_NODE" pveam list "${TEMPLATE_STORE}" | awk '{print $2}' | grep -qx "${latest_template}"; then
@@ -231,6 +262,7 @@ create_ct() {
   
   run_on_node "$CREATE_NODE" pct create "${CTID}" "${TEMPLATE_PATH}" \
     --hostname "${HOSTNAME}" \
+    --arch "${TEMPLATE_ARCH}" \
     --cores "${CORES}" \
     --memory "${MEMORY}" \
     --swap "$((MEMORY / 2))" \
@@ -617,4 +649,6 @@ main() {
   fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

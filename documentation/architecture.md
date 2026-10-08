@@ -34,6 +34,13 @@ The scripts separate orchestration from reusable behavior:
   does not yet have its own Compose file.
 - `containers/` contains source for custom Caddy images.
 
+The lifecycle layer is infrastructure-only. It may render generic Compose state
+and reconcile permissions derived from that state, but it does not own
+service-specific credential schemas, files, or desired state. Existing raw env
+files below a workload's `_secrets/` directory are workload state: refresh
+preserves them and may normalize their metadata, but never creates or repairs
+their contents.
+
 ## Execution boundaries
 
 Commands issued by these scripts run on the Proxmox host unless a shared helper
@@ -51,10 +58,10 @@ flowchart LR
 
 ## Configuration flow
 
-`commonCT.json` is the cluster-level source of truth. Lifecycle scripts derive a
-per-container `.env`, Docker Compose consumes that environment, and an optional
-`_config/configure.sh` performs idempotent API-level setup after the workload is
-running.
+`commonCT.json` is the cluster-level infrastructure source of truth. Lifecycle
+scripts derive a per-container `.env`, Docker Compose consumes that environment,
+and an optional `_config/configure.sh` performs idempotent API-level setup after
+the workload is running. Service-specific credentials remain outside this flow.
 
 ```mermaid
 flowchart TD

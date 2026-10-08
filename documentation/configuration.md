@@ -1,8 +1,9 @@
 # Configuration
 
-`commonCT.json` is the cluster-level configuration source used by the lifecycle
-scripts. It is intentionally ignored by Git because it contains credentials and
-environment-specific values.
+`commonCT.json` is the cluster-level infrastructure configuration source used by
+the lifecycle scripts. It is intentionally ignored by Git because it contains
+infrastructure credentials and environment-specific values. It is not a store
+for service-specific credentials or workload desired state.
 
 ## Data flow
 
@@ -45,6 +46,9 @@ Upstream product variables are reserved for the product that defines them.
 The `.env` file is shared by Compose interpolation and `configure.sh`. Secrets
 with characters that Compose interpolation can alter belong in raw files below
 the CT's `_secrets/` directory and must not be duplicated in `environment:`.
+Those raw files are operator-managed workload state. Lifecycle operations
+preserve existing files and reconcile only generic Compose-derived ownership and
+modes; they do not create, rotate, validate, or repair the file contents.
 
 Bridge placement is deliberately not configured in `commonCT.json` or through
 a `BRIDGE` override. It is derived from each Proxmox node's Linux bridge
@@ -64,6 +68,8 @@ priority to Proxmox CPU units.
 - Document configuration keys and semantics, not live values.
 - Make configuration changes through the existing getters and validators.
 - Keep generated per-CT environment updates idempotent.
+- Keep service-specific credentials and raw secret content out of lifecycle
+  configuration and code.
 
 ## Related documentation
 

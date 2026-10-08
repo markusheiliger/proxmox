@@ -1,0 +1,8 @@
+{
+  "caddy-dnsimple": "2.11.4",
+  "caddy-stepca": "2.11.4",
+  "ddns-update": "1.1.0",
+  "garm": "v0.2.1",
+  "garm-dind": "29.8.2",
+  "garm-runner": "2.338.0"
+}

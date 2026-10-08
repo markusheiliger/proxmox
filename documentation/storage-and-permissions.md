@@ -74,7 +74,14 @@ UID and GID. Unsafe, ambiguous, overlapping, or conflicting paths abort startup.
 
 File-backed Compose secrets live below `/mnt/docker/_secrets/`. The parent is
 kept root-only at mode `0700`; explicitly mounted secret files are exposed
-read-only at mode `0444`.
+read-only at mode `0444`. Raw env files are read by CT-root Compose and are kept
+CT-root-owned at mode `0400`.
+
+Permission reconciliation owns only filesystem metadata derived generically from
+Compose. Raw secret contents remain operator-managed workload state: lifecycle
+operations preserve existing files and never generate, rotate, validate, or
+repair their values. Missing or malformed workload secrets must be handled using
+the workload's documented operator procedure.
 
 ## Backup staging
 

@@ -24,6 +24,19 @@ Configuration and reconciliation functions must be idempotent:
 - Re-running an already-converged operation must succeed without destructive side effects.
 - Distinguish fatal failures from explicit non-fatal warnings.
 
+## Workload boundary
+
+Lifecycle scripts own Proxmox, CT, storage, network, generic Compose deployment,
+and Compose-derived permission state. They must not contain service names,
+service credential schemas, service-specific files, or workload-specific desired
+state. In particular, they must never generate, rotate, validate, or repair the
+contents of workload raw env files below `_secrets/`.
+
+Generic permission reconciliation may normalize ownership and modes for existing
+Compose-discovered files. That does not transfer content ownership to the
+lifecycle layer. Keep workload configuration and operator procedures beside the
+workload unless a separately designed mechanism explicitly owns them.
+
 ## Interactive CT selection
 
 Shared selectors in `commonCT.sh` are:

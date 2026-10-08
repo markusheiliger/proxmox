@@ -58,6 +58,7 @@ Lifecycle scripts run `reconcile_compose_permissions` before startup.
 - Shared writable sources are valid only when all writers resolve to the same UID/GID.
 - File-backed secrets must live below `/mnt/docker/_secrets`; reconciliation keeps the parent CT-root-only.
 - Raw `env_file` sources are read by CT-root Compose before container launch. Reconciliation makes these files CT-root-owned and mode `0400`.
+- Raw `env_file` contents are operator-managed workload state. Lifecycle scripts preserve existing files but never generate, rotate, validate, or repair their values.
 - Top-level Compose secret sources mounted into containers remain mode `0444` unless the runtime user contract proves a stricter mode is compatible.
 
 ## Container and telemetry identity

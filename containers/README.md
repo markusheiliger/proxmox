@@ -6,6 +6,9 @@ workloads.
 - `caddy-dnsimple/`: Caddy with the DNSimple DNS provider plugin.
 - `caddy-stepca/`: Caddy with Step CA support for private-domain certificates.
 - `ddns-update/`: Reconciles a DNSimple AAAA record with a UniFi WAN IPv6 address.
+- `garm/`: GARM with the external Docker provider installed.
+- `garm-dind/`: Project-tagged Docker-in-Docker sidecar for isolated jobs.
+- `garm-runner/`: GitHub Actions runner with Docker CLI, Buildx, and Compose.
 
 Each image directory owns its `Dockerfile` and entrypoint. Build context is the
 image directory; deployment references belong in Compose files rather than in
@@ -13,16 +16,17 @@ this source folder.
 
 ## Caddy release lifecycle
 
-`caddy-version` is the reviewed Caddy core version used by both custom images.
-It contains a bare stable semantic version, such as `2.11.4`. To adopt a new
-stable release, review its upstream release notes and update this file. The
-container workflow verifies that the pin matches the latest stable Caddy
-release before publishing either image.
+`image-version.json` is the authoritative map from each project image name to
+its reviewed base or application version. The `caddy-dnsimple` and
+`caddy-stepca` entries must contain the same bare stable semantic version, such
+as `2.11.4`. To adopt a new stable release, review its upstream release notes
+and update both entries. The container workflow verifies that the pins match
+the latest stable Caddy release before publishing either image.
 
 Build both variants locally with the same release input used by CI:
 
 ```bash
-CADDY_RELEASE=$(cat containers/caddy-version)
+CADDY_RELEASE=$(jq --exit-status --raw-output '."caddy-stepca"' containers/image-version.json)
 docker build --build-arg CADDY_RELEASE="$CADDY_RELEASE" \
 	--tag caddy-stepca:verify containers/caddy-stepca
 docker build --build-arg CADDY_RELEASE="$CADDY_RELEASE" \
@@ -58,10 +62,10 @@ new digest.
 
 ## DDNS updater release lifecycle
 
-`ddns-update-version` is the independently reviewed application version for
-`ghcr.io/markusheiliger/ddns-update`. The image uses only the Python standard
-library and receives all site-specific configuration at runtime; credentials
-must never be included in the image.
+The `ddns-update` entry in `image-version.json` is the independently reviewed
+application version for `ghcr.io/markusheiliger/ddns-update`. The image uses
+only the Python standard library and receives all site-specific configuration
+at runtime; credentials must never be included in the image.
 
 Run the source tests locally:
 
@@ -75,7 +79,7 @@ python3 -m py_compile \
 Build the same tested image locally:
 
 ```bash
-DDNS_UPDATE_VERSION=$(cat containers/ddns-update-version)
+DDNS_UPDATE_VERSION=$(jq --exit-status --raw-output '."ddns-update"' containers/image-version.json)
 docker build \
 	--build-arg DDNS_UPDATE_VERSION="$DDNS_UPDATE_VERSION" \
 	--tag ddns-update:verify containers/ddns-update
@@ -104,6 +108,39 @@ resulting DNS identity in the operator inventory. A UniFi database reset or
 readoption may change either source ID, but the updater never deletes the old
 record automatically; use an explicit `DNSIMPLE_RECORD` during migration or
 rollback when a stable prior name must be retained.
+
+## GARM appliance image lifecycle
+
+The `garm`, `garm-runner`, and `garm-dind` entries in `image-version.json`
+select the exact upstream application versions used by the build runner
+appliance. CI publishes only those exact tags; it does not publish moving or
+abbreviated aliases. Each workflow run records the immutable resulting digest.
+
+Build and test all three images locally with the same inputs used by CI:
+
+```bash
+GARM_VERSION=$(jq --exit-status --raw-output '.garm' containers/image-version.json)
+RUNNER_VERSION=$(jq --exit-status --raw-output '."garm-runner"' containers/image-version.json)
+DIND_VERSION=$(jq --exit-status --raw-output '."garm-dind"' containers/image-version.json)
+
+docker build --build-arg GARM_VERSION="$GARM_VERSION" \
+	--tag garm:verify containers/garm
+containers/garm/tests/test-image.sh garm:verify
+
+docker build --build-arg RUNNER_VERSION="$RUNNER_VERSION" \
+	--tag garm-runner:verify containers/garm-runner
+containers/garm-runner/tests/test-image.sh garm-runner:verify
+
+docker build --build-arg DIND_VERSION="$DIND_VERSION" \
+	--tag garm-dind:verify containers/garm-dind
+containers/garm-dind/tests/test-image.sh garm-dind:verify
+```
+
+The runner image deliberately contains Docker client tooling but removes
+`dockerd`, `containerd`, `runc`, and `docker-proxy`. GARM's Docker provider
+creates one privileged `garm-dind` sidecar per job and shares only that job's
+private socket with its runner. Neither dynamic container receives the host
+Docker socket.
 
 ## Documentation
 

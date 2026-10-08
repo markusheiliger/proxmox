@@ -65,6 +65,10 @@ the `/mnt/docker` tree; only rootfs allocation has moved away from `DATA`.
 The script creates the CT rootfs on `local-lvm`, creates `/mnt/docker/<hostname>`
 and `/mnt/docker-data/<hostname>`, and reconciles exactly three bind mounts:
 node-local IMDS at read-only `mp0`, Docker at `mp1`, and Docker-data at `mp2`.
+Template discovery queries the selected node and only considers archives matching
+its normalized architecture (`x86_64`/`amd64` or `aarch64`/`arm64`). An
+unsupported node architecture or missing matching template fails before the CT
+rootfs is allocated.
 It writes the CT `.env` and uses the matching fallback Compose template when no
 per-CT Compose file exists. An existing CT is refreshed instead of duplicated.
 

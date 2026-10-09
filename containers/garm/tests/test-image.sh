@@ -9,9 +9,12 @@ label_version=$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")
 label_provider=$(docker image inspect \
   --format '{{index .Config.Labels "org.opencontainers.image.garm-provider-docker.version"}}' "$IMAGE")
+label_list_instances_patch=$(docker image inspect \
+  --format '{{index .Config.Labels "org.opencontainers.image.garm.patch.list-instances-v011"}}' "$IMAGE")
 
 [[ "$label_version" == "$EXPECTED_GARM_VERSION" ]]
 [[ "$label_provider" == "$EXPECTED_PROVIDER_VERSION" ]]
+[[ "$label_list_instances_patch" == "true" ]]
 
 docker run --rm --entrypoint /bin/sh "$IMAGE" -ec '
   test -x /bin/garm
@@ -25,12 +28,15 @@ docker run --rm --entrypoint /bin/sh "$IMAGE" -ec '
   cat > /tmp/bin/wget <<'EOF'
 #!/bin/sh
 printf "%s\n" \
-  "  HTTP/1.1 409 Conflict" \
-  "wget: server returned error: HTTP/1.1 409 Conflict" >&2
+  "  HTTP/1.1 \${MOCK_STATUS} Expected" \
+  "wget: server returned error: HTTP/1.1 \${MOCK_STATUS} Expected" >&2
 exit 1
 EOF
   chmod 0755 /tmp/bin/wget
-  PATH=/tmp/bin:$PATH /usr/local/bin/healthcheck
+  for status in 401 409; do
+    export MOCK_STATUS="$status"
+    PATH=/tmp/bin:$PATH /usr/local/bin/healthcheck
+  done
 '
 
 entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "$IMAGE")

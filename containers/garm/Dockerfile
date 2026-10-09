@@ -1,5 +1,45 @@
 ARG GARM_VERSION=v0.2.1
 
+FROM alpine:3.22 AS garm-source
+
+ARG GARM_VERSION
+
+RUN apk add --no-cache curl patch \
+    && mkdir -p /build/garm \
+    && curl --fail --location --show-error \
+        "https://github.com/cloudbase/garm/archive/refs/tags/${GARM_VERSION}.tar.gz" \
+        | tar --extract --gzip --strip-components=1 --directory /build/garm
+
+COPY list-instances-v011.patch /tmp/list-instances-v011.patch
+
+RUN patch --directory /build/garm --strip=1 < /tmp/list-instances-v011.patch \
+    && grep -Fq 'if err != nil {' /build/garm/runner/providers/v0.1.1/external.go
+
+FROM node:22-alpine3.22 AS webapp
+
+WORKDIR /build/webapp
+
+COPY --from=garm-source /build/garm/webapp/package.json /build/garm/webapp/package-lock.json ./
+RUN npm ci --ignore-scripts \
+    && chmod +x node_modules/@esbuild/linux-x64/bin/esbuild
+COPY --from=garm-source /build/garm/webapp/ ./
+RUN ESBUILD_BINARY_PATH=/build/webapp/node_modules/@esbuild/linux-x64/bin/esbuild npm run build
+
+FROM golang:1.26-alpine3.22 AS garm-builder
+
+ARG GARM_VERSION
+
+RUN apk add --no-cache gcc g++ git libtool linux-headers m4 make musl-dev util-linux-dev
+
+COPY --from=garm-source /build/garm/ /build/garm/
+COPY --from=webapp /build/webapp/build/ /build/garm/webapp/assets/
+
+RUN cd /build/garm \
+    && go build -o /garm \
+        -tags osusergo,netgo,sqlite_omit_load_extension \
+        -ldflags "-linkmode external -extldflags '-static' -s -w -X github.com/cloudbase/garm/util/appdefaults.Version=${GARM_VERSION}" \
+        ./cmd/garm
+
 FROM alpine:3.22 AS provider
 
 ARG TARGETARCH
@@ -26,8 +66,10 @@ ARG GARM_VERSION
 ARG PROVIDER_VERSION=v0.2.0
 
 LABEL org.opencontainers.image.version="${GARM_VERSION}" \
-      org.opencontainers.image.garm-provider-docker.version="${PROVIDER_VERSION}"
+    org.opencontainers.image.garm-provider-docker.version="${PROVIDER_VERSION}" \
+    org.opencontainers.image.garm.patch.list-instances-v011="true"
 
+COPY --from=garm-builder /garm /bin/garm
 COPY --from=provider /garm-provider-docker /opt/garm/providers.d/garm-provider-docker
 COPY --chmod=0755 healthcheck.sh /usr/local/bin/healthcheck
 

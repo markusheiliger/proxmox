@@ -1,0 +1,12 @@
+diff --git a/runner/providers/v0.1.1/external.go b/runner/providers/v0.1.1/external.go
+--- a/runner/providers/v0.1.1/external.go
++++ b/runner/providers/v0.1.1/external.go
+@@ -215,7 +215,7 @@ func (e *external) ListInstances(ctx context.Context, poolID string, listInstance
+ 	).Inc()
+ 
+ 	out, err := garmExec.Exec(ctx, e.execPath, nil, asEnv)
+-	if err == nil {
++	if err != nil {
+ 		metrics.InstanceOperationFailedCount.WithLabelValues(
+ 			"ListInstances", // label: operation
+ 			e.cfg.Name,      // label: provider

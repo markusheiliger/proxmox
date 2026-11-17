@@ -191,6 +191,48 @@ if resolve_ct_from_input 2700 && [[ "$CTID" == 2700 ]]; then
 else
   test_fail "numeric CTID remains unambiguous"
 fi
+if (
+  CT_LIST=(100 2700)
+  CT_MAP[100]=other.thesaints.home
+  CT_MAP[2700]=evExpense.thesaints.home
+  CT_NODE[100]=pve01
+  CT_NODE[2700]=pve02
+  resolve_ct_from_input evexpense.thesaints.home \
+    && [[ "$CTID" == 2700 && "$CT_HOSTNAME" == evexpense.thesaints.home ]] \
+    && [[ "$(get_ct_owner_node "$CTID")" == pve02 ]]
+); then
+  pass "hostname lookup normalizes identity to lowercase and preserves remote owner"
+else
+  test_fail "hostname lookup normalizes identity to lowercase and preserves remote owner"
+fi
+if (
+  CT_LIST=(100 2700)
+  CT_MAP[100]=evexpense.thesaints.home
+  CT_MAP[2700]=evExpense.thesaints.home
+  if resolve_ct_from_input EVEXPENSE.THESAINTS.HOME >"${TEST_ROOT}/case-duplicate-hostname" 2>&1; then
+    exit 1
+  fi
+  grep -Fq 'matches multiple CTs: 100 2700. Use a numeric CTID.' "${TEST_ROOT}/case-duplicate-hostname" \
+    && resolve_ct_from_input 2700 \
+    && [[ "$CT_HOSTNAME" == evexpense.thesaints.home ]]
+); then
+  pass "case-only duplicate hostnames require a numeric CTID"
+else
+  test_fail "case-only duplicate hostnames require a numeric CTID"
+fi
+if (
+  pvesh() {
+    printf '%s\n' '[{"type":"lxc","vmid":100,"name":"Other.Thesaints.Home","node":"pve01"},{"type":"lxc","vmid":2700,"name":"evExpense.Thesaints.Home","node":"pve02"}]'
+  }
+  build_ct_list \
+    && [[ "${CT_MAP[100]}" == other.thesaints.home && "${CT_MAP[2700]}" == evexpense.thesaints.home ]] \
+    && resolve_ct_from_input EVEXPENSE.THESAINTS.HOME \
+    && [[ "$CT_HOSTNAME" == evexpense.thesaints.home && "$(get_ct_owner_node "$CTID")" == pve02 ]]
+); then
+  pass "cluster inventory normalizes hostnames before selection"
+else
+  test_fail "cluster inventory normalizes hostnames before selection"
+fi
 CT_TAGS[100]='backup-restore-test;temporary'
 CT_TAGS[2700]='production'
 if ct_has_tag 100 backup-restore-test && ! ct_has_tag 2700 backup-restore-test; then

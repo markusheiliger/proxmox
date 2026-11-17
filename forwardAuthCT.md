@@ -41,7 +41,12 @@ flowchart TD
 
 Run as root on a Proxmox host. Authentik settings must be configured in
 `commonCT.json`, selected CTs must be running, and target Compose services need a
-`caddy.reverse_proxy` label.
+non-empty `caddy` site label and an application reverse-proxy route.
+
+The eligibility check reads Compose on the CT's resolved owner node. A first
+enable does not require existing forward-auth labels: the command provisions
+the application, provider and outpost assignment before injecting those labels.
+Missing Compose files or site labels fail before registration.
 
 The script manages only its known Caddy route labels and the matching per-host
 Authentik objects. It references `${AUTH_HOSTNAME}` in Compose so the CT `.env`
@@ -62,6 +67,16 @@ The operations are idempotent. If Authentik succeeds but Compose restart fails,
 fix the Compose or service error and rerun the same mode. Before removing or
 resetting, confirm that the per-host Authentik slug is not intentionally owned by
 a native OIDC integration.
+
+If the application returns an Authentik 404, verify that its application and
+proxy provider exist and that the provider is assigned to the configured
+outpost. Rerunning enable can provision missing objects even when the Caddy
+labels are already current.
+
+If login redirects to an obsolete Authentik hostname, check the outpost's
+`authentik_host` and optional `authentik_host_browser` settings. They must use
+reachable endpoints consistent with the current Authentik deployment; changing
+the lifecycle configuration alone does not rewrite existing outpost settings.
 
 ## Related
 

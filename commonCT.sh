@@ -653,7 +653,7 @@ config_get_compose_template() {
 # Returns: domain (e.g., thesaints.home)
 extract_domain_from_hostname() {
   local hostname="$1"
-  echo "${hostname}" | sed 's/^[^.]*\.//'
+  echo "${hostname,,}" | sed 's/^[^.]*\.//'
 }
 
 # Check if size is defined in config
@@ -999,7 +999,7 @@ validate_priority() {
 #   - CA hosts (ca.*): must be fully qualified (at least 3 parts: ca.domain.tld)
 #   - Regular hosts: domain must exist in commonCT.json
 validate_hostname() {
-  local hostname="$1"
+  local hostname="${1,,}"
   
   if [[ -z "$hostname" ]]; then
     echo "ERROR: No hostname provided"
@@ -2132,8 +2132,37 @@ rc-update add docker-watchdog default 2>/dev/null || true'
   echo "  [✓] Docker boot watchdog configured"
 }
 
+reconcile_ct_hostname() {
+  local ctid="$1" expected="${2,,}" config current
+  if ! config=$(pct_config "$ctid"); then
+    echo "ERROR: Cannot read CT ${ctid} hostname." >&2
+    return 1
+  fi
+  current=$(sed -n 's/^hostname: //p' <<<"$config")
+  if [[ -z "$expected" || -z "$current" || "${current,,}" != "$expected" ]]; then
+    echo "ERROR: Refusing to normalize CT ${ctid}: configured and selected hostnames differ." >&2
+    return 1
+  fi
+  [[ "$current" != "$expected" ]] || return 0
+
+  if ! pct_set "$ctid" -hostname "$expected"; then
+    echo "ERROR: Cannot normalize CT ${ctid} hostname." >&2
+    return 1
+  fi
+  if ! config=$(pct_config "$ctid"); then
+    echo "ERROR: Cannot verify CT ${ctid} hostname." >&2
+    return 1
+  fi
+  current=$(sed -n 's/^hostname: //p' <<<"$config")
+  if [[ "$current" != "$expected" ]]; then
+    echo "ERROR: CT ${ctid} hostname normalization could not be verified." >&2
+    return 1
+  fi
+  echo "  [✓] CT ${ctid}: hostname normalized to ${expected}"
+}
+
 # Apply the standard CT configuration sequence.
-# Consolidates the 8 idempotent config steps shared by createCT and refreshCT
+# Consolidates the 9 idempotent config steps shared by createCT and refreshCT
 # into a single call.  Each step prints its own [✓] output.
 # Args:
 #   $1 - CTID (defaults to global $CTID)
@@ -2141,7 +2170,9 @@ rc-update add docker-watchdog default 2>/dev/null || true'
 apply_ct_configuration() {
   local ctid="${1:-${CTID}}"
   local hostname="${2:-${CT_HOSTNAME:-${HOSTNAME}}}"
+  hostname="${hostname,,}"
 
+  reconcile_ct_hostname "$ctid" "$hostname" || return 1
   ensure_packages_and_ca "${ctid}"
   configure_timezone
   ensure_docker_runlevel "${ctid}"
@@ -2259,8 +2290,8 @@ delete_authentik_forward_auth() {
 }
 
 # Configure Authentik forward auth for a CT
-# Detects caddy.forward_auth labels in the CT's docker-compose.yaml and
-# auto-provisions a per-host forward auth setup in Authentik via REST API:
+# Verifies a Caddy site on the selected CT's owner node, then provisions
+# a per-host forward auth setup in Authentik via REST API:
 #   1. Proxy Provider (mode: forward_single, external_host = https://<hostname>)
 #   2. Application (linked to the provider)
 #   3. Outpost assignment (adds provider to the configured outpost)
@@ -2271,6 +2302,8 @@ delete_authentik_forward_auth() {
 # Idempotent: skips if the host application already exists with a provider attached
 # Args:
 #   $1 - CT hostname (e.g., rust.thesaints.home)
+#   $2 - Whether to reset an existing registration (default: false)
+# Requires CTID to identify the selected CT and resolve its owner.
 # Returns: 0 on success or skip, 1 on error
 configure_authentik_forward_auth() {
   local ct_hostname="${1:-${CT_HOSTNAME:-${HOSTNAME}}}"
@@ -2282,17 +2315,20 @@ configure_authentik_forward_auth() {
     return 0
   fi
 
-  # Check if docker-compose.yaml has forward_auth labels
   local hostname_lower
   hostname_lower=$(echo "$ct_hostname" | tr '[:upper:]' '[:lower:]')
   local compose_file="/mnt/docker/${hostname_lower}/docker-compose.yaml"
+  local node
+  node=$(get_ct_owner_node "$CTID") || return 1
 
-  if [[ ! -f "$compose_file" ]]; then
-    return 0
+  if ! node_path_is_file "$node" "$compose_file"; then
+    echo "  [!] No Compose file found at ${node}:${compose_file}"
+    return 1
   fi
 
-  if ! grep -qE 'caddy\.(route\.[0-9]+_)?forward_auth' "$compose_file" 2>/dev/null; then
-    return 0
+  if ! run_on_node "$node" grep -qE '^[[:space:]]+caddy:[[:space:]]*[^[:space:]]' "$compose_file"; then
+    echo "  [!] Unable to verify a Caddy site label at ${node}:${compose_file}"
+    return 1
   fi
 
   echo "Configuring Authentik forward auth..."
@@ -3848,7 +3884,7 @@ build_ct_list() {
   }
   while IFS=$'\t' read -r id status name node tags; do
     [[ "$id" =~ ^[1-9][0-9]*$ && -n "$name" && -n "$node" ]] || continue
-    CT_MAP["$id"]="$name"
+    CT_MAP["$id"]="${name,,}"
     CT_STATUS["$id"]="${status:-unknown}"
     CT_NODE["$id"]="$node"
     CT_TAGS["$id"]="$tags"
@@ -4008,7 +4044,7 @@ select_ct_interactive_single() {
   fi
   
   CTID="$selection"
-  CT_HOSTNAME="${CT_MAP[$CTID]}"
+  CT_HOSTNAME="${CT_MAP[$CTID],,}"
   return 0
 }
 
@@ -4101,12 +4137,12 @@ select_ct_interactive_multi() {
   return 0
 }
 
-# Resolve container from CTID or hostname argument
+# Resolve container from CTID or case-insensitive hostname argument
 # Args: $1 = CTID or hostname
 # Sets: CTID, CT_HOSTNAME
 # Returns: 0 on success, 1 on failure
 resolve_ct_from_input() {
-  local input="$1" id
+  local input="${1,,}" id
   local matches=()
   
   if [[ -z "$input" ]]; then
@@ -4121,12 +4157,12 @@ resolve_ct_from_input() {
       echo "ERROR: CT ${CTID} does not exist."
       return 1
     fi
-    CT_HOSTNAME="${CT_MAP[$CTID]}"
+    CT_HOSTNAME="${CT_MAP[$CTID],,}"
   else
     # Input is a hostname
     CT_HOSTNAME="$input"
     for id in "${CT_LIST[@]}"; do
-      if [[ "${CT_MAP[$id]}" == "$CT_HOSTNAME" ]]; then
+      if [[ "${CT_MAP[$id],,}" == "${input,,}" ]]; then
         matches+=("$id")
       fi
     done
@@ -4140,6 +4176,7 @@ resolve_ct_from_input() {
       return 1
     fi
     CTID="${matches[0]}"
+    CT_HOSTNAME="${CT_MAP[$CTID],,}"
   fi
   
   return 0
@@ -4866,7 +4903,7 @@ run_configure_script() {
 # Merges values from commonCT.json while preserving user-defined variables
 #
 # Values and their sources:
-#   HOSTNAME            - Argument passed to createCT.sh (e.g., app.thesaints.home)
+#   HOSTFQDN            - CT FQDN (e.g., app.thesaints.home)
 #   STEP_CA_URL         - Constructed from domain: https://ca.<domain>/acme/acme/directory
 #   STEP_CA_FINGERPRINT - From commonCT.json: ssl.<domain>.fingerprint
 #   CADDY_EMAIL         - From commonCT.json: ssl.<domain>.email
@@ -4882,6 +4919,7 @@ update_env_file() {
     echo "ERROR: No hostname available for update_env_file"
     return 1
   fi
+  target_hostname="${target_hostname,,}"
   local domain
   domain=$(extract_domain_from_hostname "${target_hostname}")
   local ssl_type

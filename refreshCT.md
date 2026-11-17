@@ -16,6 +16,13 @@ permission, and Compose configuration to one or more existing CTs.
 ./refreshCT.sh --all
 ```
 
+Hostnames are normalized to lowercase in inventory, selection and generated
+configuration. Refresh also corrects the actual CT hostname on its owner node
+when the only difference is letter case. Workload directory names and bind
+sources below `/mnt/docker` and `/mnt/docker-data` use lowercase names. If
+multiple CTs match, including names that differ only in case, use a numeric CTID
+to disambiguate.
+
 Without arguments, the script opens a multi-select dialog. Options without a CT
 open a single-select dialog because resize, VLAN, reset, and monitoring choices
 apply to one CT. `--all` non-interactively refreshes every CT returned by the

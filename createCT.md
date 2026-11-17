@@ -25,6 +25,10 @@ the bridge from the local node's `entities:` policy after the CTID and hostname
 are final. Rootfs storage is fixed to `local-lvm`;
 `STORAGE` overrides are rejected.
 
+Hostnames are normalized to lowercase before validation and duplicate detection.
+The created CT, generated `HOSTFQDN`, and workload directories below
+`/mnt/docker` and `/mnt/docker-data` all use that lowercase hostname.
+
 ## Flow
 
 ```mermaid

@@ -137,5 +137,24 @@ CREATE_NODE=pve02
 assert_failure_contains "missing target architecture template fails closed" \
   "No amd64 template found" prepare_template
 
+if (
+  lifecycle_log_init() { :; }
+  status_bar_init() { :; }
+  status_progress() { :; }
+  validate_hostname() {
+    printf '%s\n' "$1" >"${TEST_ROOT}/creation-hostname"
+    return 1
+  }
+  main Build.Thesaints.Home --node pve02
+) >"${TEST_ROOT}/creation-output" 2>&1; then
+  fail "creation stops at the mocked validation boundary"
+elif [[ -f "${TEST_ROOT}/creation-hostname" ]]; then
+  assert_equals "creation normalizes hostname before validation" \
+    build.thesaints.home "$(cat "${TEST_ROOT}/creation-hostname")"
+else
+  cat "${TEST_ROOT}/creation-output" >&2
+  fail "creation normalizes hostname before validation"
+fi
+
 echo "${PASS} passed, ${FAIL} failed"
 [[ "$FAIL" -eq 0 ]]

@@ -50,6 +50,17 @@ pct_set() {
 
 desired=$(canonical_ct_mounts 2100 app.thesaints.home)
 
+if (
+  get_ct_dirs App.Thesaints.Home
+  [[ "$DIR_DOCKER" == /mnt/docker/app.thesaints.home \
+    && "$DIR_DOCKER_DATA" == /mnt/docker-data/app.thesaints.home \
+    && "$(canonical_ct_mounts 2100 App.Thesaints.Home)" == "$desired" ]]
+); then
+  pass "mixed-case input produces lowercase workload directories and bind sources"
+else
+  fail "mixed-case input produces lowercase workload directories and bind sources"
+fi
+
 reordered=$'mp0: /run/pve-imds/2100,shared=1,backup=0,mp=/mnt/pve-imds,ro=1\nmp1: /mnt/docker/app.thesaints.home,mp=/mnt/docker\nmp2: /mnt/docker-data/app.thesaints.home,mp=/mnt/docker-data'
 if ct_mounts_match "$reordered" "$desired"; then
   pass "mount comparison accepts Proxmox option reordering"

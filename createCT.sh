@@ -518,6 +518,8 @@ main() {
     esac
   done
 
+  HOSTNAME="${HOSTNAME,,}"
+
   # Execute provisioning steps
   local total_steps=11
   local step=0

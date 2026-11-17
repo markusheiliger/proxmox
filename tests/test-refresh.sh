@@ -76,6 +76,69 @@ assert_contains "CT upload stages remote source privately" "$upload_log" "node_u
 assert_contains "CT upload creates mapped root-owned file" "$upload_log" "pct push 2700 /tmp/ct-upload-2700-"
 assert_contains "CT upload atomically replaces destination" "$upload_log" "pct exec 2700 -- mv -f -- /mnt/docker/.env.tmp."
 
+run_hostname_reconciliation_case() (
+  local scenario="$1"
+  local mock_hostname=App.Thesaints.Home
+  local calls="${TEST_ROOT}/hostname-${scenario}.log"
+  hostname() { echo pve01; }
+  get_ct_owner_node() { echo pve02; }
+  run_on_node() {
+    local node="$1"
+    shift
+    printf '%s %s\n' "$node" "$*" >>"$calls"
+    [[ "$node" == pve02 && "$1" == pct && "$3" == 2200 ]] || return 1
+    case "$2" in
+      config) printf 'hostname: %s\n' "$mock_hostname" ;;
+      set)
+        [[ "$scenario" != failure ]] || return 1
+        [[ "$4" == -hostname ]] || return 1
+        [[ "$scenario" == unverified ]] || mock_hostname="$5"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  if [[ "$scenario" == success ]]; then
+    reconcile_ct_hostname 2200 APP.THESAINTS.HOME >/dev/null \
+      && reconcile_ct_hostname 2200 app.thesaints.home >/dev/null \
+      && [[ "$mock_hostname" == app.thesaints.home ]] \
+      && [[ "$(grep -Fc 'pve02 pct set 2200 -hostname app.thesaints.home' "$calls")" == 1 ]]
+  elif [[ "$scenario" == mismatch ]]; then
+    mock_hostname=other.thesaints.home
+    if reconcile_ct_hostname 2200 app.thesaints.home >"${calls}.output" 2>&1; then
+      return 1
+    fi
+    ! grep -Fq 'pct set' "$calls" \
+      && grep -Fq 'configured and selected hostnames differ' "${calls}.output"
+  else
+    if reconcile_ct_hostname 2200 app.thesaints.home >"${calls}.output" 2>&1; then
+      return 1
+    fi
+    grep -Fq 'pve02 pct set 2200 -hostname app.thesaints.home' "$calls" \
+      && grep -Fq 'ERROR:' "${calls}.output"
+  fi
+)
+
+if run_hostname_reconciliation_case success; then
+  pass "actual CT hostname is lowercased idempotently on its remote owner"
+else
+  fail "actual CT hostname is lowercased idempotently on its remote owner"
+fi
+if run_hostname_reconciliation_case mismatch; then
+  pass "hostname normalization refuses an unrelated configured identity"
+else
+  fail "hostname normalization refuses an unrelated configured identity"
+fi
+if run_hostname_reconciliation_case failure; then
+  pass "hostname update failure is propagated"
+else
+  fail "hostname update failure is propagated"
+fi
+if run_hostname_reconciliation_case unverified; then
+  pass "hostname update must be verified against stored CT configuration"
+else
+  fail "hostname update must be verified against stored CT configuration"
+fi
+
 pct_config() { printf '%s\n' 'unprivileged: 1'; }
 if [[ "$(get_ct_host_root_ids 2200)" == "100000 100000" ]]; then
   pass "default unprivileged root IDs map to 100000"
@@ -453,6 +516,41 @@ update_env_file "$remote_env" /mnt/docker/ai.thesaints.home/_config pve02
 assert_contains "remote configure script retains Authentik API token" "$remote_env" "AUTH_API_TOKEN=test-api-token"
 assert_contains "remote configure script retains authorization flow" "$remote_env" "AUTH_AUTHORIZATION_FLOW=authorization-flow"
 assert_contains "remote configure script retains invalidation flow" "$remote_env" "AUTH_INVALIDATION_FLOW=invalidation-flow"
+
+for domain in thesaints.home thesaints.de; do
+  template_dir="${TEST_ROOT}/template-${domain}"
+  mkdir -p "${template_dir}/_config"
+  cp "${SCRIPT_DIR}/compose/${domain}.yaml" "${template_dir}/docker-compose.yaml"
+  printf 'HOSTNAME=stale.example.test\n' > "${template_dir}/.env"
+  (
+    CT_HOSTNAME="APP.${domain^^}"
+    update_env_file "${template_dir}/.env" "${template_dir}/_config"
+  )
+  if python3 - "$template_dir" "app.${domain}" <<'PY'
+import pathlib
+import re
+import string
+import sys
+
+root = pathlib.Path(sys.argv[1])
+values = dict(
+    line.split("=", 1)
+    for line in (root / ".env").read_text().splitlines()
+    if line and not line.startswith("#") and "=" in line
+)
+assert "HOSTNAME" not in values, "legacy HOSTNAME must be removed"
+compose = (root / "docker-compose.yaml").read_text()
+site = re.search(r"^\s+caddy:\s*(\S+)\s*$", compose, re.MULTILINE)
+assert site, "template must expose a Caddy site"
+rendered = string.Template(site.group(1).strip("\"'")).substitute(values)
+assert rendered == sys.argv[2], f"Caddy site resolved to {rendered!r}"
+PY
+  then
+    pass "${domain} template resolves its site from the generated environment"
+  else
+    fail "${domain} template resolves its site from the generated environment"
+  fi
+done
 
 config_get_telemetry_hostname() { echo telemetry.example.test; }
 config_get_telemetry_otlp_http_port() { echo 4318; }

@@ -5,7 +5,7 @@ services:
     restart: always
     image: traefik/whoami:latest
     labels:
-      caddy: ${HOSTNAME}
+      caddy: ${HOSTFQDN}
       caddy.reverse_proxy: "{{upstreams 80}}"
 
   # Caddy reverse proxy with automatic SSL via Step CA
